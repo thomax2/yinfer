@@ -1,0 +1,30 @@
+find_package(GTest REQUIRED)
+
+include_directories(
+    ${GTEST_INCLUDE_DIRS}
+    ../include
+    ../src           # 添加这一行，让测试能找到 src 下的头文件
+)
+
+add_executable(test_tensor
+    test_tensor.cpp
+)
+
+target_link_libraries(test_tensor
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+add_executable(test_math_ref
+    test_math_ref.cpp
+)
+
+target_link_libraries(test_math_ref
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+add_test(NAME tensor_test COMMAND test_tensor)
+add_test(NAME math_ref_test COMMAND test_math_ref)
