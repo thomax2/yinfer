@@ -26,5 +26,15 @@ target_link_libraries(test_math_ref
     GTest::Main
 )
 
+add_executable(test_graph test_graph.cpp)
+
+target_link_libraries(test_graph
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+
 add_test(NAME tensor_test COMMAND test_tensor)
 add_test(NAME math_ref_test COMMAND test_math_ref)
+add_test(NAME graph_test COMMAND test_graph)
