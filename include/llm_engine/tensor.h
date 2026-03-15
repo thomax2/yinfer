@@ -66,13 +66,14 @@ public:
         return size() * dtype_size(dtype);
     }
 
-    /*
-    
-
-    */
     template<typename T>    // T 是一个占位符，代表任意类型。
     T* ptr() {
-        return  reinterpret_cast<T*>(data);
+        return reinterpret_cast<T*>(data);
+    }
+
+    template<typename T>
+    const T* ptr() const {
+        return reinterpret_cast<const T*>(data);
     }
 
 private:
