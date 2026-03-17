@@ -9,7 +9,8 @@ namespace arm_neon {
 Status matmul_neon(
     const Tensor& A,
     const Tensor& B,
-    Tensor& C
+    Tensor& C,
+    float* workspace
 );
 
 }

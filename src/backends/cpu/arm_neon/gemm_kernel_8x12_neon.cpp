@@ -93,7 +93,7 @@ extern "c" void gemm_kernel_8x12_neon(
 
     float* c_ptr;
 
-    cptr = C + 0*ldc;
+    c_ptr = C + 0*ldc;
     vst1q_f32(c_ptr + 0, c00);
     vst1q_f32(c_ptr + 4, c01);
     vst1q_f32(c_ptr + 8, c02);
