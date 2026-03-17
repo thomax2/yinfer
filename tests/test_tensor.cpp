@@ -1,7 +1,16 @@
 #include <gtest/gtest.h>
 #include "llm_engine/tensor.h"
+#include "llm_engine/memory/memory_pool.h"
 
 using namespace llm_engine;
+
+static void init_memory_pool() {
+    static bool initialized = false;
+    if (!initialized) {
+        g_memory_pool = new MemoryPool(512ULL * 1024 * 1024);
+        initialized = true;
+    }
+}
 
 TEST(TensorTest, StrideCompute) {
 

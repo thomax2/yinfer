@@ -34,7 +34,17 @@ target_link_libraries(test_graph
     GTest::Main
 )
 
+add_executable(test_neon test_neon.cpp)
+
+target_link_libraries(test_neon
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+
 
 add_test(NAME tensor_test COMMAND test_tensor)
 add_test(NAME math_ref_test COMMAND test_math_ref)
 add_test(NAME graph_test COMMAND test_graph)
+add_test(NAME neon_test COMMAND test_neon)

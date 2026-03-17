@@ -2,7 +2,7 @@
 
 #include <vector>
 
-#include "llm_engine/graph.h"
+#include "llm_engine/graph/graph.h"
 
 namespace llm_engine {
 

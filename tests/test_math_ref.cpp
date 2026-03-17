@@ -1,9 +1,18 @@
 #include <gtest/gtest.h>
 #include "llm_engine/tensor.h"
 #include "backends/cpu/reference/math_ref.h"
+#include "backends/cpu/reference/math_ref.h"
 
 using namespace llm_engine;
 using namespace llm_engine::reference;
+
+static void init_memory_pool() {
+    static bool initialized = false;
+    if (!initialized) {
+        g_memory_pool = new MemoryPool(512ULL * 1024 * 1024);
+        initialized = true;
+    }
+}
 
 TEST(MatmulTest, Basic2x2) {
 

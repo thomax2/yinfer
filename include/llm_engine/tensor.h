@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "llm_engine/memory/memory_pool.h"
+
 namespace llm_engine {
 
 enum class DataType {
@@ -37,6 +39,8 @@ public:
 
     void* data = nullptr;
 
+    bool owns_data = true;
+
     DataType dtype = DataType::FP32;
     DeviceType device = DeviceType::CPU;
 
@@ -53,8 +57,20 @@ public:
         allocate();
     }
 
+    Tensor(const std::vector<int>& s,
+           void* external_data,
+           DataType t = DataType::FP32)
+        : shape(s), data(external_data), dtype(t)
+    {
+        compute_stride();
+        owns_data = false;
+    }
+
+
     ~Tensor() {
-        free_memory();
+        if(owns_data && data)
+            g_memory_pool->free_block(data);
+
     }
 
     size_t size() const {
@@ -87,21 +103,10 @@ private:
     }
 
     void allocate() {
-        if (device != DeviceType::CPU)
-            // 目前只支持CPU，其他设备暂不支持
-            return;
-
-        data = std::malloc(bytes());
-        if(data)
-            std::memset(data, 0, bytes());
+        data = g_memory_pool->allocate(bytes());
+        std::memset(data,0,bytes());
     }
 
-    void free_memory() {
-        if (device == DeviceType::CPU && data) {
-            std::free(data);
-            data = nullptr;
-        }
-    }
 };
 
 } // namespace llm_engine
