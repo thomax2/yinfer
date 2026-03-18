@@ -1,9 +1,6 @@
 # ARM NEON Matmul 性能测试报告
 
 **测试环境：**
-- **用户/主机：** sunrise@ubuntu
-- **工作目录：** ~/test_di/yinfer-main/build
-- **测试时间：** 2026-03-15T17:23:46+08:00
 - **可执行文件：** ./benchmarks/bench_gemm
 
 ## 系统配置
