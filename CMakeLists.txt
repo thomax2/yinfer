@@ -25,7 +25,7 @@ target_compile_options(llm_engine PRIVATE
 )
 
 enable_testing()
-# add_subdirectory(tests)
+add_subdirectory(tests)
 
 # 新增：挂载 Benchmark 目录
-add_subdirectory(benchmarks)
+# add_subdirectory(benchmarks)

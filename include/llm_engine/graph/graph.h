@@ -15,6 +15,7 @@ public:
 
     virtual Status forward() = 0;
     virtual ~GraphNode() = default;
+    virtual bool is_temporary() const { return false; }
 };
 
 
