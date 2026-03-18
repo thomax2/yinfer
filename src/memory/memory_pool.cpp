@@ -63,7 +63,8 @@ void MemoryPool::split(BlockHeader* block, size_t bytes)
 }
 
 void* MemoryPool::allocate(size_t bytes) {
-    BlockHeader* block = find_best_fit(bytes);
+    size_t aligned_bytes = (bytes + 15) & ~15;
+    BlockHeader* block = find_best_fit(aligned_bytes);
 
     if(!block)
         return nullptr; // 没有足够的内存

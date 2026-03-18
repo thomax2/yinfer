@@ -6,6 +6,7 @@
 
 #include "backends/cpu/reference/math_ref.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/kernel_common.h"
 
 using namespace llm_engine;
 
@@ -53,9 +54,13 @@ TEST(NeonTest, MatmulAccuracy) {
     // 3. 跑你手写的 NEON 加速版
 
     // ✅ 分配 workspace（关键）
-    size_t ws_size = 2 * ((M+7)/8) * 8 * K * sizeof(float);
+    using namespace arm_neon;
+    int mp = (M + MR - 1) / MR; // A 的块数
+    int np = (N + NR - 1) / NR; // B 的块数
+    size_t ws_size = (mp * MR * K + np * NR * K) * sizeof(float);
     float* workspace = (float*)g_memory_pool->allocate(ws_size);
 
+    std::memset(workspace, 0, ws_size);
 
     arm_neon::matmul_neon(A, B, C_neon, workspace);
 

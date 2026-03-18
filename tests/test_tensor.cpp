@@ -13,7 +13,7 @@ static void init_memory_pool() {
 }
 
 TEST(TensorTest, StrideCompute) {
-
+    init_memory_pool();
     Tensor t({2,3,4});
 
     EXPECT_EQ(t.stride[0], 12);
@@ -23,7 +23,7 @@ TEST(TensorTest, StrideCompute) {
 }
 
 TEST(TensorTest, MemoryAllocate) {
-
+    init_memory_pool();
     Tensor t({2,2});
 
     ASSERT_NE(t.data, nullptr);

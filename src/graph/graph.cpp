@@ -1,4 +1,4 @@
-#include "llm_engine/graph.h"
+#include "llm_engine/graph/graph.h"
 #include "backends/cpu/reference/math_ref.h"
 
 namespace llm_engine {

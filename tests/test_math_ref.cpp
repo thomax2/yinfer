@@ -15,7 +15,7 @@ static void init_memory_pool() {
 }
 
 TEST(MatmulTest, Basic2x2) {
-
+    init_memory_pool();
     Tensor A({2,2});
     Tensor B({2,2});
     Tensor C({2,2});
@@ -42,7 +42,7 @@ TEST(MatmulTest, Basic2x2) {
 
 
 TEST(AddTest, BasicAdd) {
-
+    init_memory_pool();     
     Tensor A({4});
     Tensor B({4});
     Tensor C({4});

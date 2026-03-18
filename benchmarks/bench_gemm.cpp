@@ -1,24 +1,36 @@
 #include <benchmark/benchmark.h>
 #include <random>
+#include <cstring>
+#include <vector> // 引入 vector 管理临时内存
 
-// 注意根据你实际的路径修改 include
 #include "llm_engine/tensor.h"
+#include "llm_engine/memory/memory_pool.h"
 #include "backends/cpu/reference/math_ref.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/kernel_common.h"
 
 using namespace llm_engine;
 
-// 核心防御：填充随机数，模拟真实的大模型激活值与权重，防止 CPU 零值优化作弊
+static void init_memory_pool() {
+    static bool initialized = false;
+    if (!initialized) {
+        // 分配 512MB 内存池
+        g_memory_pool = new MemoryPool(512ULL * 1024 * 1024);
+        initialized = true;
+    }
+}
+
 void fill_random(Tensor& t) {
     float* ptr = t.ptr<float>();
     size_t num = t.size();
     for (size_t i = 0; i < num; ++i) {
-        // 生成 0.0 ~ 1.0 的随机浮点数
         ptr[i] = static_cast<float>(rand()) / RAND_MAX;
     }
 }
 
 static void BM_matmul_ref(benchmark::State& state) {
+    init_memory_pool(); // ✅ 补上救命的初始化
+
     int N = state.range(0);
     Tensor A({N, N});
     Tensor B({N, N});
@@ -30,9 +42,17 @@ static void BM_matmul_ref(benchmark::State& state) {
     for (auto _ : state) {
         reference::matmul_ref(A, B, C);
     }
+
+    state.counters["GFLOPS"] = benchmark::Counter(
+        static_cast<double>(state.iterations()) * 2 * N * N * N,
+        benchmark::Counter::kIsRate,
+        benchmark::Counter::kIs1000 
+    );
 }
 
 static void BM_matmul_neon(benchmark::State& state) {
+    init_memory_pool(); 
+
     int N = state.range(0);
     Tensor A({N, N});
     Tensor B({N, N});
@@ -41,13 +61,26 @@ static void BM_matmul_neon(benchmark::State& state) {
     fill_random(A);
     fill_random(B);
 
+    using namespace arm_neon;
+    int mp = (N + MR - 1) / MR; 
+    int np = (N + NR - 1) / NR; 
+    size_t num_elements = mp * MR * N + np * NR * N;
+    
+    // ✅ 使用 std::vector 安全管理测试时的生命周期，防止撑爆自定义 MemoryPool
+    std::vector<float> workspace_vec(num_elements, 0.0f);
+    float* workspace = workspace_vec.data();
+
     for (auto _ : state) {
-        // 调用你的汇编级优化算子
-        arm_neon::matmul_neon(A, B, C);
+        arm_neon::matmul_neon(A, B, C, workspace);
     }
+
+    state.counters["GFLOPS"] = benchmark::Counter(
+        static_cast<double>(state.iterations()) * 2 * N * N * N,
+        benchmark::Counter::kIsRate,
+        benchmark::Counter::kIs1000 
+    );
 }
 
-// 定义测试矩阵的维度：128x128, 512x512, 1024x1024
 BENCHMARK(BM_matmul_ref)->Arg(128)->Arg(512)->Arg(1024);
 BENCHMARK(BM_matmul_neon)->Arg(128)->Arg(512)->Arg(1024);
 
