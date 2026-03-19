@@ -13,5 +13,27 @@ Status matmul_neon(
     float* workspace
 );
 
+void rmsnorm_neon(
+    const float* x,
+    const float* weight,
+    float* y,
+    int n,
+    float eps
+);
+
+void rope_neon(
+    float* x,
+    const float* cos,
+    const float* sin,
+    int n
+);
+
+void swiglu_neon(
+    const float* x,
+    const float* up,
+    float* y,
+    int n
+);
+
 }
 }
