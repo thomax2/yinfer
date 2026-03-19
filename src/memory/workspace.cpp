@@ -5,7 +5,6 @@ namespace llm_engine {
 
 Workspace::Workspace(size_t bytes)
 {
-
     ptr = g_memory_pool->allocate(bytes);
     capacity = bytes;
 }

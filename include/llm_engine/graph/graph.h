@@ -33,6 +33,26 @@ public:
     Status forward() override;
 };
 
+class RMSNormNode : public GraphNode {
+public:
+    float eps;
+    RMSNormNode(Tensor* X, Tensor* Weight, Tensor* Y, float eps);
+    Status forward() override;
+};
+
+class SwiGLUNode : public GraphNode {
+public:
+    SwiGLUNode(Tensor* Gate, Tensor* Up, Tensor* Y);
+    Status forward() override;
+};
+
+class RoPENode : public GraphNode {
+public:
+    // 注意：你写的 RoPE 是 in-place 原地修改的，所以输入输出都是 X
+    RoPENode(Tensor* X, Tensor* Cos, Tensor* Sin);
+    Status forward() override;
+};
+
 class ComputationGraph {
 public:
     std::vector<std::unique_ptr<GraphNode>> nodes;
@@ -45,17 +65,18 @@ public:
         DataType dtype = DataType::FP32
     );
 
-    MatmulNode* add_matmul(
-        Tensor* A,
-        Tensor* B,
-        Tensor* C
+    Tensor* create_tensor_from_ptr(
+        const std::vector<int>& shape,
+        void* data,
+        DataType dtype = DataType::FP32
     );
 
-    AddNode* add_add(
-        Tensor* A,
-        Tensor* B,
-        Tensor* C
-    );
+    MatmulNode*     add_matmul(Tensor* A, Tensor* B, Tensor* C);
+    AddNode*        add_add(Tensor* A, Tensor* B, Tensor* C);
+
+    RMSNormNode*    add_rmsnorm(Tensor* X, Tensor* Weight, Tensor* Y, float eps);
+    SwiGLUNode*     add_swiglu(Tensor* Gate, Tensor* Up, Tensor* Y);
+    RoPENode*       add_rope(Tensor* X, Tensor* Cos, Tensor* Sin);
 };
 
 }

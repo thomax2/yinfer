@@ -13,6 +13,12 @@ Status matmul_neon(
     float* workspace
 );
 
+void add_neon(
+    const Tensor& A,
+    const Tensor& B,
+    Tensor& C
+);
+
 void rmsnorm_neon(
     const float* x,
     const float* weight,

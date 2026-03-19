@@ -30,14 +30,19 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
     2. 第一层的输出被加入到生产者中，而第一层的输出正好是第二层的输入，所以第二层的输入都是有生成者的，
        就有入度了，所以要等第一层的节点全被取出之后，才能被取出
     */
+    // 第一趟：先收集所有生产者信息
+    for(auto &node : graph.nodes) {
+        for(auto* t : node->outputs) {
+            producers[t].push_back(node.get());
+        }
+    }
+
+    // 第二趟：基于完整的生产者信息计算入度
     for(auto &node : graph.nodes) {
         for(auto* t : node->inputs) {
             if(producers.count(t) > 0) {
                 in_degree[node.get()]++;
             }
-        }
-        for(auto* t : node->outputs) {
-            producers[t].push_back(node.get());
         }
     }
 
@@ -79,7 +84,7 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
 
 
     // ===== 2. 生命周期分析（核心新增） =====
-    std::unordered_map<Tensor*, TensorLife> life; 
+    std::unordered_map<Tensor*, TensorLife> life;
 
     for(int i = 0; i < order.size(); i++) {
         auto* node = order[i];
