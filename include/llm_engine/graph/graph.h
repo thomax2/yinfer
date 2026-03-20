@@ -62,7 +62,7 @@ public:
     void* arena_buffer = nullptr;
 
     ComputationGraph() = default;
-    ComputationGraph::~ComputationGraph() {
+    ~ComputationGraph() {
         // 如果建图时申请了 Arena 大内存，在这里将其归还给内存池
         if (arena_buffer != nullptr) {
             g_memory_pool->free_block(arena_buffer);
