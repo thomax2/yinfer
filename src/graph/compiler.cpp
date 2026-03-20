@@ -143,14 +143,19 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
         bool is_produced = all_produced.count(t) > 0;
         bool is_consumed = all_consumed.count(t) > 0;
 
-        if (!is_produced) {
-            // 从未被生产过：说明它是图的输入（外部数据）或模型权重
+        // 规则 1：基于拓扑的边界推导 (没有生产者，或没有消费者)
+        if (!is_produced || !is_consumed) {
             protected_tensors.insert(t);
         }
-        
-        if (!is_consumed) {
-            // 从未被消费过：说明它是图的最终输出结果，或者是个没用的游离节点
+
+        // 规则 2：只要是用户显式绑定的外部内存，强制保护！
+        if (t->data != nullptr && t->owns_data == false) {
             protected_tensors.insert(t);
+        }
+
+        // 统一安全检查：边界张量必须绑了物理内存！
+        if (protected_tensors.count(t) > 0 && t->data == nullptr) {
+            throw std::runtime_error("Fatal: The boundary tensor (Input/Output) must be bound to external memory via create_tensor_from_ptr before compiling!");
         }
     }
 
@@ -178,21 +183,16 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
         // 先分配 Outputs，在inputs分配中检查是否分配，没分配才分配，防止读写踩踏 (In-place hazard)
         for (auto* t : node->outputs) {
             
-            // 1. 受保护的全局变量，单独分配真实内存
+            // 1. 受保护的边界张量，直接跳过 (不参与 Arena 排版)
             if (protected_tensors.count(t) > 0) {
-                if (t->data == nullptr) {
-                    t->data = g_memory_pool->allocate(t->bytes());
-                    std::memset(t->data, 0, t->bytes());
-                    t->owns_data = true; 
-                }
-                continue;
+                continue; 
             }
 
-            //【终极修复】：防止 In-place 算子 多分配
-            // 如果这个 Tensor 之前已经分配过房间了，绝对不能再分配！
-            if (tensor_offsets.count(t) > 0)
+            // 2. 防止 In-place 算子多分配
+            if (tensor_offsets.count(t) > 0) {
                 continue; 
-                
+            }
+
             size_t req_size = align_size(t->bytes());
             bool allocated = false;
             

@@ -29,7 +29,7 @@
 
 通过对比普通实现 (`ref`) 与 NEON 优化实现 (`neon`) 的耗时，可以看出显著的性能提升：
 
-| 矩阵尺寸 | Ref 耗时 | NEON 耗时 | 加速比 |
+| 矩阵尺寸 | Ref 耗时 (ms) | NEON 耗时 (ms) | 加速比 |
 | :--- | :--- | :--- | :--- |
 | 128 | 12.58 | 0.74 | **~17.0x** |
 | 512 | 4862.41 | 47.04 | **~103.4x** |
@@ -37,3 +37,44 @@
 
 ## 结论
 完成 `arm_neon` matmul 的测试。测试结果显示，使用 NEON 指令集优化后，矩阵乘法性能得到了极大的提升，且随着矩阵尺寸增大，优化效果愈发显著。
+
+---
+
+# 图执行器单元测试报告
+
+**测试可执行文件：** `./build/tests/test_graph`
+
+## 测试概要
+
+| 测试套件 | 测试数量 | 通过 | 失败 |
+| :--- | :--- | :--- | :--- |
+| InplaceMemoryTest | 4 | 4 | 0 |
+| CompilerTest | 1 | 1 | 0 |
+| **总计** | **5** | **5** | **0** |
+
+## 测试详情
+
+### InplaceMemoryTest
+
+| 测试用例 | 描述 | 状态 |
+| :--- | :--- | :--- |
+| `InplaceWithSubsequentUse_External` | 原地操作 + 后续使用（外部绑定） | ✅ PASS |
+| `InplaceAsFinalOutput_External` | 原地操作作为最终输出（外部绑定） | ✅ PASS |
+| `InternalArenaRecycling` | 内部内存池回收验证 | ✅ PASS |
+| `StressMultipleInplace_External` | 多重原地操作压力测试（外部绑定） | ✅ PASS |
+
+**内存规划器输出摘要：**
+- 所有测试中峰值工作区需求均为 0 MB（`InternalArenaRecycling` 峰值约为 3.05e-05 MB）
+- 内存复用机制正常工作
+
+### CompilerTest
+
+| 测试用例 | 描述 | 状态 |
+| :--- | :--- | :--- |
+| `ShouldThrowIfBoundaryNotBound` | 编译器检测未绑定的边界张量并抛出异常 | ✅ PASS |
+
+## 结论
+
+- 内存原地操作（inplace）功能正常，包括外部绑定场景和内部内存池回收机制
+- 编译器能够正确识别未绑定的边界张量并抛出异常，保证计算图的完整性
+- 所有单元测试均通过，系统运行稳定
