@@ -165,17 +165,17 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
     };
 
     size_t peak_memory = 0; 
-    std::unordered_map<Tensor*, size_t> tensor_offsets; // 完美的全局档案本
+    std::unordered_map<Tensor*, size_t> tensor_offsets; // 每个张量在内存池中的起始位置
     std::unordered_set<Tensor*> freed_tensors;          // 记录释放，绝不 erase
 
     struct FreeBlock { size_t offset; size_t size; };
-    std::vector<FreeBlock> free_blocks;
+    std::vector<FreeBlock> free_blocks;                 // 空闲块列表。记录当前可用的内存碎片（起始位置和大小），用于内存复用。
 
     // 模拟时间线推演：从第 0 步走到最后一步
     for (int i = 0; i < order.size(); i++) {
         GraphNode* node = order[i];
         
-        // 【A】必须先分配 Outputs！防止读写踩踏 (In-place hazard)
+        // 先分配 Outputs，在inputs分配中检查是否分配，没分配才分配，防止读写踩踏 (In-place hazard)
         for (auto* t : node->outputs) {
             
             // 1. 受保护的全局变量，单独分配真实内存
@@ -188,12 +188,11 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
                 continue;
             }
 
-            // 🚨 【终极修复】：防止 In-place 算子“灵魂出窍”
+            //【终极修复】：防止 In-place 算子 多分配
             // 如果这个 Tensor 之前已经分配过房间了，绝对不能再分配！
-            if (tensor_offsets.count(t) > 0) {
+            if (tensor_offsets.count(t) > 0)
                 continue; 
-            }
-
+                
             size_t req_size = align_size(t->bytes());
             bool allocated = false;
             
@@ -261,7 +260,7 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
         graph.arena_buffer = g_memory_pool->allocate(peak_memory);
     }
 
-    //【终极优化】：极其干净的全局硬绑定
+    // 开始遍历图中的所有张量，分配推演好的位置
     for (const auto& t_ptr : graph.tensors) {
         Tensor* t = t_ptr.get();
         
@@ -273,7 +272,7 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
                 g_memory_pool->free_block(t->data);
             }
 
-            // 领回大平层的房间钥匙，完成零分配绑定
+            // 确定位置，管理所有权
             size_t offset = tensor_offsets[t];
             t->data = static_cast<char*>(graph.arena_buffer) + offset;
             t->owns_data = false; 

@@ -56,7 +56,7 @@ public:
         compute_stride();
         // allocate();
 
-        // ❌ 删除 allocate(); 
+        // 删除 allocate(); 
         // 建立 Tensor 时绝对不分配真实物理内存（延迟分配）
         data = nullptr;  
         owns_data = false; // 临时张量不拥有数据，全部交给后期的 Workspace 管理
@@ -95,6 +95,14 @@ public:
     template<typename T>
     const T* ptr() const {
         return reinterpret_cast<const T*>(data);
+    }
+
+    void ensure_allocated() {
+        if (data == nullptr) {
+            data = g_memory_pool->allocate(bytes());
+            std::memset(data, 0, bytes());
+            owns_data = true;  // 测试场景下，让 Tensor 自己管理生命周期
+        }
     }
 
 private:
