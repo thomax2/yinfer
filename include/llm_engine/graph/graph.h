@@ -58,6 +58,23 @@ public:
     std::vector<std::unique_ptr<GraphNode>> nodes;
     std::vector<std::unique_ptr<Tensor>> tensors;
 
+    size_t arena_size = 0;
+    void* arena_buffer = nullptr;
+
+    ComputationGraph() = default;
+    ComputationGraph::~ComputationGraph() {
+        // 如果建图时申请了 Arena 大内存，在这里将其归还给内存池
+        if (arena_buffer != nullptr) {
+            g_memory_pool->free_block(arena_buffer);
+            arena_buffer = nullptr;
+            arena_size = 0;
+        }
+    }
+
+    // 禁用拷贝构造和拷贝赋值（C++ 资源管理最佳实践）
+    ComputationGraph(const ComputationGraph&) = delete;
+    ComputationGraph& operator=(const ComputationGraph&) = delete;
+
 public:
     
     Tensor* create_tensor(

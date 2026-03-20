@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <iostream>
 
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
@@ -6,6 +7,7 @@
 
 using namespace llm_engine;
 
+// ===== 辅助：初始化全局内存池 =====
 static void init_memory_pool() {
     static bool initialized = false;
     if (!initialized) {
@@ -14,78 +16,165 @@ static void init_memory_pool() {
     }
 }
 
-TEST(GraphTest, ComplexDagWithMemoryCheck) {
+// ===== 自定义 In-place 算子：模拟 RoPE =====
+class InPlaceRoPENode : public GraphNode {
+public:
+    InPlaceRoPENode(Tensor* input) {
+        inputs.push_back(input);
+        outputs.push_back(input);  // 🔥 关键：output 就是 input 本身！
+    }
+    
+    Status forward() override {
+        float* data = inputs[0]->ptr<float>();
+        size_t size = inputs[0]->size();
+        for(size_t i = 0; i < size; i++) {
+            data[i] *= 1.1f;
+        }
+        return Status::SUCCESS;
+    }
+};
+
+void add_inplace_rope(ComputationGraph& g, Tensor* input) {
+    g.nodes.push_back(std::make_unique<InPlaceRoPENode>(input));
+}
+
+// ============================================================
+// 🔥 测试 1: In-place + 后续还要使用 → 绝不能提前释放
+// ============================================================
+TEST(InplaceMemoryTest, InplaceWithSubsequentUse) {
     init_memory_pool();
     ComputationGraph g;
 
-    // 1. 创建受保护的 Tensor (输入和权重)
-    auto* X  = g.create_tensor({2, 2}); // 输入
-    auto* W1 = g.create_tensor({2, 2}); // 权重 1
-    auto* W2 = g.create_tensor({2, 2}); // 权重 2
-    auto* B  = g.create_tensor({2, 2}); // 权重 3
-
-    // 2. 创建中间临时 Tensor (算完应该被自动 Free)
-    auto* M1 = g.create_tensor({2, 2});
-    auto* M2 = g.create_tensor({2, 2});
-    auto* A1 = g.create_tensor({2, 2});
-    auto* M3 = g.create_tensor({2, 2});
-
-    // 3. 创建受保护的 Tensor (最终输出)
+    auto* X = g.create_tensor({2, 2});  
+    auto* W = g.create_tensor({2, 2});  
     auto* Out = g.create_tensor({2, 2});
 
-    // 4. 初始化明确的数据 (方便手动计算结果)
-    float* x_ptr = X->ptr<float>();
-    x_ptr[0]=1; x_ptr[1]=2; x_ptr[2]=3; x_ptr[3]=4;
+    // 建图: X -> RoPE(X) [inplace] -> Matmul(X, W) -> Out
+    add_inplace_rope(g, X);  
+    g.add_matmul(X, W, Out);  
 
-    float* w1_ptr = W1->ptr<float>(); // 设为单位阵
-    w1_ptr[0]=1; w1_ptr[1]=0; w1_ptr[2]=0; w1_ptr[3]=1;
-
-    float* w2_ptr = W2->ptr<float>(); // 设为单位阵
-    w2_ptr[0]=1; w2_ptr[1]=0; w2_ptr[2]=0; w2_ptr[3]=1;
-
-    float* b_ptr = B->ptr<float>();   // 设为 0.5 倍的单位阵
-    b_ptr[0]=0.5; b_ptr[1]=0; b_ptr[2]=0; b_ptr[3]=0.5;
-
-    // 5. 构建复杂的有向无环图 (DAG)
-    // 模拟大模型的一个带残差的 Block: Out = ((X*W1) + (X*W2)) * B + X
-    g.add_matmul(X, W1, M1); // M1 = X
-    g.add_matmul(X, W2, M2); // M2 = X
-    g.add_add(M1, M2, A1);   // A1 = 2X
-    g.add_matmul(A1, B, M3); // M3 = 2X * 0.5 = X
-    g.add_add(M3, X, Out);   // Out = X + X = 2X
-
-    // 6. 编译计算图
+    // 【关键修复】：先编译分配内存！
     GraphCompiler compiler;
     auto plan = compiler.compile(g);
 
-    // 7. 执行计算图
+    // 再写数据
+    float* x_ptr = X->ptr<float>();
+    for(int i = 0; i < 4; i++) x_ptr[i] = 1.0f + i;  // [1,2,3,4]
+
+    float* w_ptr = W->ptr<float>();
+    w_ptr[0]=1; w_ptr[1]=0; w_ptr[2]=0; w_ptr[3]=1; // 单位阵
+
     GraphRuntime runtime;
     CHECK_STATUS(runtime.run(plan));
 
-    // ==========================================================
-    // 核心校验点 1：验证数学结果是否正确 
-    // Out 应该等于 2 * X = [2, 4, 6, 8]
-    // ==========================================================
+    // 校验
     float* out_ptr = Out->ptr<float>();
-    EXPECT_FLOAT_EQ(out_ptr[0], 2.0f);
-    EXPECT_FLOAT_EQ(out_ptr[1], 4.0f);
-    EXPECT_FLOAT_EQ(out_ptr[2], 6.0f);
-    EXPECT_FLOAT_EQ(out_ptr[3], 8.0f);
+    EXPECT_FLOAT_EQ(out_ptr[0], 1.1f);
+    EXPECT_FLOAT_EQ(out_ptr[3], 4.4f);
+    
+    EXPECT_NE(X->data, nullptr);
+    std::cout << "[PASS] Inplace + subsequent use\n";
+}
 
-    // ==========================================================
-    // 核心校验点 2：验证 Compiler 的自动内存回收 (FreeNode) 是否生效
-    // 中间变量的 data 指针应该被置为了 nullptr
-    // ==========================================================
-    EXPECT_EQ(M1->data, nullptr) << "M1 should have been freed!";
-    EXPECT_EQ(M2->data, nullptr) << "M2 should have been freed!";
-    EXPECT_EQ(A1->data, nullptr) << "A1 should have been freed!";
-    EXPECT_EQ(M3->data, nullptr) << "M3 should have been freed!";
+// ============================================================
+// 🔥 测试 2: In-place + 是最终输出 → protected 保护
+// ============================================================
+TEST(InplaceMemoryTest, InplaceAsFinalOutput) {
+    init_memory_pool();
+    ComputationGraph g;
 
-    // ==========================================================
-    // 核心校验点 3：验证受保护的 Tensor 是否安全活了下来
-    // ==========================================================
-    EXPECT_NE(X->data, nullptr)  << "X is an input, should NOT be freed!";
-    EXPECT_NE(W1->data, nullptr) << "W1 is a weight, should NOT be freed!";
-    EXPECT_NE(B->data, nullptr)  << "B is a weight, should NOT be freed!";
-    EXPECT_NE(Out->data, nullptr)<< "Out is the final output, should NOT be freed!";
+    auto* X = g.create_tensor({2, 2});
+    add_inplace_rope(g, X); 
+
+    GraphCompiler compiler;
+    auto plan = compiler.compile(g);
+
+    float* x_ptr = X->ptr<float>();
+    for(int i = 0; i < 4; i++) x_ptr[i] = 10.0f + i;  
+
+    GraphRuntime runtime;
+    CHECK_STATUS(runtime.run(plan));
+
+    float* result = X->ptr<float>(); 
+    EXPECT_FLOAT_EQ(result[0], 11.0f);  
+    EXPECT_NE(X->data, nullptr);
+    std::cout << "[PASS] Inplace as final output\n";
+}
+
+// ============================================================
+// 🔥 测试 3: In-place死节点内存回收 (极其核心的边界验证)
+// ============================================================
+TEST(InplaceMemoryTest, InplaceDeadValueShouldRecycle) {
+    init_memory_pool();
+    ComputationGraph g;
+
+    // 为了让 X 成为“中间变量”，我们用 Matmul 生产它
+    auto* Input1 = g.create_tensor({2, 2});
+    auto* W1 = g.create_tensor({2, 2});
+    auto* X = g.create_tensor({2, 2}); // 中间变量 X
+    
+    // Step 0: Input1 * W1 -> X
+    g.add_matmul(Input1, W1, X);
+
+    // Step 1: RoPE(X) 
+    // X 在这里被 in-place 修改，之后再无节点使用，它在 Step 1 寿终正寝！
+    add_inplace_rope(g, X); 
+    
+    // Step 2: 产生一个新的毫无关联的运算，用来“吃掉” X 吐出来的内存
+    auto* Input2 = g.create_tensor({2, 2});
+    auto* W2 = g.create_tensor({2, 2});
+    auto* Y = g.create_tensor({2, 2}); // 中间变量 Y
+    auto* FinalOut = g.create_tensor({2, 2});
+    
+    // Input2 * W2 -> Y -> FinalOut 
+    g.add_matmul(Input2, W2, Y);
+    g.add_add(Y, Input2, FinalOut);
+
+    // 编译
+    GraphCompiler compiler;
+    auto plan = compiler.compile(g);
+
+    // 🔍 终极校验：如果你的回收逻辑是对的，Y 一定会 100% 复用 X 的物理内存！
+    EXPECT_EQ(X->data, Y->data) << "FATAL: X was not recycled into free_blocks!";
+    
+    std::cout << "[PASS] Inplace dead value strictly recycled!\n";
+}
+
+// ============================================================
+// 🔥 测试 4: 压力测试 - 连续多个 inplace 算子
+// ============================================================
+TEST(InplaceMemoryTest, StressMultipleInplace) {
+    init_memory_pool();
+    ComputationGraph g;
+
+    auto* X = g.create_tensor({4, 4}); 
+    auto* Zero = g.create_tensor({4, 4}); 
+    auto* Out = g.create_tensor({4, 4});
+
+    // 连续 3 次 inplace
+    add_inplace_rope(g, X);
+    add_inplace_rope(g, X);
+    add_inplace_rope(g, X);
+    
+    // 用 Out = X + 0 代替 Identity，避免 X 成为最终输出
+    g.add_add(X, Zero, Out);  
+
+    GraphCompiler compiler;
+    auto plan = compiler.compile(g);
+
+    float* x_ptr = X->ptr<float>();
+    float* zero_ptr = Zero->ptr<float>();
+    for(int i = 0; i < 16; i++) {
+        x_ptr[i] = 1.0f;
+        zero_ptr[i] = 0.0f;
+    }
+
+    GraphRuntime runtime;
+    CHECK_STATUS(runtime.run(plan));
+
+    float* out_ptr = Out->ptr<float>();
+    // 1.0 * 1.1 * 1.1 * 1.1 = 1.331
+    EXPECT_NEAR(out_ptr[0], 1.331f, 1e-5);
+    
+    std::cout << "[PASS] Stress test: multiple inplace ops passed!\n";
 }

@@ -34,7 +34,7 @@ public:
     std::vector<int> shape;
     std::vector<int> stride;    /*  
                                     在内存中移动到下一个元素需要跳过多少个位置, 例如一个2x3的矩阵，行优先存储，那么shape是{2,3}，
-                                    stride是{3,1}，因为移动到下一行需要跳过3个元素，移动到下一列需要跳过1个元素。           
+                                    stride是{3,1}，因为移动到下一行需要跳过3个元素，移动到下一列需要跳过1个元素。
                                 */ 
 
     void* data = nullptr;
@@ -54,7 +54,12 @@ public:
         : shape(s), dtype(t), device(dev) {
     
         compute_stride();
-        allocate();
+        // allocate();
+
+        // ❌ 删除 allocate(); 
+        // 建立 Tensor 时绝对不分配真实物理内存（延迟分配）
+        data = nullptr;  
+        owns_data = false; // 临时张量不拥有数据，全部交给后期的 Workspace 管理
     }
 
     Tensor(const std::vector<int>& s,
