@@ -30,5 +30,13 @@ void pack_B(
     int ldb
 );
 
+void pack_B_trans(
+    const float* B,
+    float* B_pack,
+    int K,
+    int N,
+    int ldb
+);
+
 }
 }

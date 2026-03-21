@@ -41,7 +41,7 @@ void pack_A(
     针对右矩阵，按 NR 列一组（Panel）进行分块，块内按行优先。
     
     这里有个视角的变化，可以方便后面理解：
-    原B的维度是 KxN，打包后是 NxK（按行优先来看），每NR行其实就是原B的NR列，并且在panel内是按行优先存储的。
+    原B的维度是 KxN，打包后是 (NR*np)xK（按行优先来看），每NR行其实就是原B的NR列，并且在panel内是按行优先存储的。
 
     原始 B (K=4, N=10, NR=4):
 
@@ -89,6 +89,32 @@ void pack_B(
             for(int i = 0; i < NR; i++) {
                 int col = j*NR + i;
                 *B_pack++ = (col < N) ? B[k*ldb + col]: 0.0f;
+            }
+        }
+    }
+}
+
+/*
+    传入B的行列K*N, B_trans 相当于是切B的行，而不是列，行优先改为列优先
+    K*N->N*K
+    在 matmul_neon 中，保证了传入 K 是A的列，N在trans情况下是B的行
+    转置下的pack_B，就是按 NR 行一组（Panel）进行分块，块内按列优先存放数据。
+*/
+void pack_B_trans(
+    const float* B,      // N×K, 行优先
+    float* B_pack,
+    int K,               // 内积维度 (与 pack_B 保持一致!)
+    int N,               // 输入行数，输出列数
+    int ldb              // B 的行宽 (=K)
+) {
+    int np = (N + NR - 1) / NR;
+    
+    for(int j = 0; j < np; j++) {           // Panel 索引
+        for(int k = 0; k < K; k++) {        // 内积维度
+            for(int i = 0; i < NR; i++) {   // Panel 内列
+                int row = j*NR + i;         // 逻辑行索引 (0~N-1)
+                // 关键映射: Bᵀ(k, row) = B(row, k)
+                *B_pack++ = (row < N) ? B[row * ldb + k] : 0.0f;
             }
         }
     }

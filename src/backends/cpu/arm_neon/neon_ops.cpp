@@ -16,7 +16,8 @@ Status matmul_neon(
     const Tensor& A,
     const Tensor& B,
     Tensor& C,
-    float* workspace
+    float* workspace,
+    bool transB = false
 ) {
     // 目前仅支持FP32的矩阵乘法
     if (A.dtype != DataType::FP32 || B.dtype != DataType::FP32 || C.dtype != DataType::FP32)
@@ -28,7 +29,20 @@ Status matmul_neon(
 
     int M = A.shape[0];
     int K = A.shape[1];
-    int N = B.shape[1];
+
+    // ⚠️ 关键：根据 transB 确定 N 和 ldb
+    int N, ldb;
+    if (!transB) {
+        // B 是 K×N, 行优先
+        N = B.shape[1];
+        ldb = N;  // B 的行宽
+        // 可选：验证 B.shape[0] == K
+    } else {
+        // B 是 N×K, 行优先 (用于计算 Bᵀ)
+        N = B.shape[0];  // ⚠️ N 来自 B 的行数
+        ldb = K;         // ⚠️ B 的行宽是 K
+        // 可选：验证 B.shape[1] == K
+    }
 
     const float* a = A.ptr<float>();
     const float* b = B.ptr<float>();
@@ -41,7 +55,11 @@ Status matmul_neon(
     float* B_pack = workspace + mp * MR * K;
 
     pack_A(a, A_pack, M, K, K);
-    pack_B(b, B_pack, K, N, N);
+    if (!transB) {
+        pack_B(b, B_pack, K, N, ldb);
+    } else {
+        pack_B_trans(b, B_pack, K, N, ldb);
+    }
 
     for(int i = 0; i < mp; i++) {
         for(int j = 0; j < np; j++) {

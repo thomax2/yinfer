@@ -10,7 +10,8 @@ Status matmul_neon(
     const Tensor& A,
     const Tensor& B,
     Tensor& C,
-    float* workspace
+    float* workspace,
+    bool transB = false
 );
 
 void add_neon(
