@@ -18,6 +18,7 @@ set(LLM_ENGINE_SOURCES
     # Sprint 4: 内存管理
     src/memory/memory_pool.cpp
     src/memory/workspace.cpp
+    src/memory/kv_cache.cpp
 )
 
 # 如果是在 ARM 架构（如 aarch64），才添加 Neon 源并启用 ARM 专属优化
@@ -26,6 +27,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
         src/backends/cpu/arm_neon/pack.cpp
         src/backends/cpu/arm_neon/gemm_kernel_8x12_neon.cpp
         src/backends/cpu/arm_neon/neon_ops.cpp
+        src/backends/cpu/arm_neon/softmax_neon.cpp
+        src/backends/cpu/arm_neon/attention_neon.cpp
         src/backends/cpu/arm_neon/neon_backend.cpp
         src/backends/cpu/arm_neon/rms_norm_neon.cpp
         src/backends/cpu/arm_neon/rope_neon.cpp

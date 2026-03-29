@@ -2,6 +2,8 @@
 
 #include "llm_engine/tensor.h"
 #include "llm_engine/status.h"
+#include "llm_engine/memory/kv_cache.h"
+#include "llm_engine/memory/workspace.h"
 
 namespace llm_engine {
 namespace arm_neon {
@@ -12,6 +14,19 @@ Status matmul_neon(
     Tensor& C,
     float* workspace,
     bool transB = false
+);
+
+Status bmm_neon(
+    const Tensor& A,
+    const Tensor& B,
+    Tensor& C,
+    float* workspace,
+    bool transB = false
+);
+
+Status softmax_neon(
+    const Tensor& input,
+    Tensor& output
 );
 
 void add_neon(

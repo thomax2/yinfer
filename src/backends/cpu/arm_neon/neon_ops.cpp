@@ -17,7 +17,7 @@ Status matmul_neon(
     const Tensor& B,
     Tensor& C,
     float* workspace,
-    bool transB = false
+    bool transB
 ) {
     // 目前仅支持FP32的矩阵乘法
     if (A.dtype != DataType::FP32 || B.dtype != DataType::FP32 || C.dtype != DataType::FP32)
@@ -125,13 +125,15 @@ Status bmm_neon(
     const Tensor& B, // [B, K, N] 或 [B, N, K]
     Tensor& C,       // [B, M, N]
     float* workspace,
-    bool transB = false
+    bool transB
 ) {
     int batch = A.shape[0];
     int M = A.shape[1];
     int K = A.shape[2];
-    int N = B.shape[2];
     int N = transB ? B.shape[1] : B.shape[2];
+    int stride_A = M * K;
+    int stride_B = transB ? (N * K) : (K * N);
+    int stride_C = M * N;
     
     for (int b = 0; b < batch; b++) {
         Tensor A_b;
