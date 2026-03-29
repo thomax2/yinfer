@@ -42,5 +42,24 @@ void swiglu_neon(
     int n
 );
 
+struct AttentionConfig {
+    int hidden_dim;
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+};
+
+Status attention_neon(
+    const Tensor& hidden_states, 
+    Tensor& attn_output,         
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o, 
+    const float* cos_ptr, const float* sin_ptr, 
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+);
+
 }
 }

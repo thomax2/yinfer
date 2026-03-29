@@ -120,5 +120,47 @@ void add_neon(const Tensor& A, const Tensor& B, Tensor& C) {
     }
 }
 
+Status bmm_neon(
+    const Tensor& A, // [B, M, K]
+    const Tensor& B, // [B, K, N] 或 [B, N, K]
+    Tensor& C,       // [B, M, N]
+    float* workspace,
+    bool transB = false
+) {
+    int batch = A.shape[0];
+    int M = A.shape[1];
+    int K = A.shape[2];
+    int N = B.shape[2];
+    int N = transB ? B.shape[1] : B.shape[2];
+    
+    for (int b = 0; b < batch; b++) {
+        Tensor A_b;
+        A_b.shape = {M, K};
+        A_b.data = (void*)(A.ptr<float>() + b * stride_A);
+        A_b.dtype = A.dtype; 
+        A_b.device = A.device;
+
+        Tensor B_b;
+        B_b.shape = transB ? std::vector<int>{N, K} : std::vector<int>{K, N};
+        B_b.data = (void*)(B.ptr<float>() + b * stride_B);
+        B_b.dtype = B.dtype;
+        B_b.device = B.device;
+
+        Tensor C_b;
+        C_b.shape = {M, N};
+        C_b.data = (void*)(C.ptr<float>() + b * stride_C);
+        C_b.dtype = C.dtype;
+        C_b.device = C.device;
+
+        // ⚠️ 将 transB 传给底层的 matmul_neon
+        Status status = matmul_neon(A_b, B_b, C_b, workspace, transB);
+        if (status != Status::SUCCESS) {
+            return status;
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
 }
 }
