@@ -1,5 +1,6 @@
 #include "neon_ops.h"
 #include <arm_neon.h>
+#include <cmath>
 #include <algorithm>
 #include <limits>
 

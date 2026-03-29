@@ -248,3 +248,57 @@ TEST(NeonTest, RoPEAccuracy) {
             << " (ref=" << x_ref_ptr[i] << ", neon=" << x_neon_ptr[i] << ")";
     }
 }
+
+// ============================================================
+// 🔥 测试: Softmax_NEON 精度验证
+// ============================================================
+TEST(NeonTest, SoftmaxAccuracy) {
+    init_memory_pool();
+    srand(42);
+
+    int num_rep = 8;       // 模拟有 8 个 Query Head 一起算
+    int seq_len = 128;     // 模拟当前序列长度
+
+    Tensor input({num_rep, seq_len});
+    Tensor output_neon({num_rep, seq_len});
+    Tensor output_ref({num_rep, seq_len}); // 用于存放 C++ 跑出来的标准答案
+
+    input.ensure_allocated();
+    output_neon.ensure_allocated();
+    output_ref.ensure_allocated();
+
+    float* in_ptr = input.ptr<float>();
+    float* out_neon_ptr = output_neon.ptr<float>();
+    float* out_ref_ptr = output_ref.ptr<float>();
+
+    // 1. 填充随机输入
+    for (int i = 0; i < input.size(); ++i) {
+        in_ptr[i] = (static_cast<float>(rand()) / RAND_MAX) * 10.0f - 5.0f; // -5 到 5 之间
+    }
+
+    // 2. 运行你写的 NEON 版本
+    // 我们假设 softmax_neon 是 out-of-place 或者 in-place，这里为了方便比对，先把输入拷给 output_neon
+    memcpy(out_neon_ptr, in_ptr, input.bytes());
+    llm_engine::arm_neon::softmax_neon(output_neon, output_neon);
+
+    // 3. 运行标准的 C++ Reference 版本
+    for (int b = 0; b < num_rep; ++b) {
+        const float* in_row = in_ptr + b * seq_len;
+        float* out_row = out_ref_ptr + b * seq_len;
+
+        float max_val = std::numeric_limits<float>::lowest();
+        for (int i = 0; i < seq_len; ++i) max_val = std::max(max_val, in_row[i]);
+
+        float sum_exp = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            out_row[i] = std::exp(in_row[i] - max_val);
+            sum_exp += out_row[i];
+        }
+        for (int i = 0; i < seq_len; ++i) out_row[i] /= sum_exp;
+    }
+
+    // 4. 对比结果 (因为涉及 exp 近似和浮点累加，允许 1e-3 的误差)
+    for (int i = 0; i < output_neon.size(); ++i) {
+        EXPECT_NEAR(out_neon_ptr[i], out_ref_ptr[i], 1e-3);
+    }
+}

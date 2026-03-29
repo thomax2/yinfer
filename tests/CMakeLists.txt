@@ -51,7 +51,12 @@ target_link_libraries(test_attention
 )
 
 
+target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
+
 add_test(NAME tensor_test COMMAND test_tensor)
 add_test(NAME math_ref_test COMMAND test_math_ref)
 add_test(NAME graph_test COMMAND test_graph)
 add_test(NAME neon_test COMMAND test_neon)
+add_test(NAME attention_test COMMAND test_attention)
+set_tests_properties(attention_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

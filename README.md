@@ -78,3 +78,42 @@
 - 内存原地操作（inplace）功能正常，包括外部绑定场景和内部内存池回收机制
 - 编译器能够正确识别未绑定的边界张量并抛出异常，保证计算图的完整性
 - 所有单元测试均通过，系统运行稳定
+
+
+## Attention 算子单元测试报告
+
+**测试可执行文件：** `./build/tests/test_attention`
+
+### 测试概要
+
+| 测试套件 | 测试数量 | 通过 | 失败 |
+| :--- | :--- | :--- | :--- |
+| AttentionTest | 1 | 1 | 0 |
+
+### 测试详情
+
+| 测试用例 | 描述 | 状态 |
+| :--- | :--- | :--- |
+| `PyTorchAlignment` | 与 PyTorch 黄金输出对齐测试（含 KV Cache 副作用验证） | ✅ PASS |
+
+### 测试说明
+
+- **测试配置：** `hidden_dim=64, num_q_heads=4, num_kv_heads=2, head_dim=16`（GQA 分组查询注意力）
+- **验证内容：**
+  1. `attention_neon` 算子的最终输出与 PyTorch 参考实现输出对齐（容忍误差 `1e-4`）
+  2. KV Cache 中写入的 K 张量与 PyTorch 导出的黄金数据对齐（容忍误差 `1e-5`）
+- **测试数据：** 从 Python 脚本生成的二进制文件加载（`data/*.bin`）
+
+### 测试环境
+
+- **数据路径解析：** 自动搜索 `TEST_DATA_DIR` 环境变量指定的目录、源码 `tests/` 目录，以及构建目录的相对路径
+- **内存资源：**
+  - MemoryPool：256 MB
+  - Workspace：2 MB
+  - KVCache：`batch=1, max_seq_len=128`
+
+### 结论
+
+- `arm_neon::attention_neon` 实现与 PyTorch 参考实现完全对齐
+- KV Cache 的写入逻辑正确，支持增量式生成场景（首个 token 生成）
+- 所有单元测试通过，Attention 模块可投入实际推理使用
