@@ -2,6 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <cmath>
+#include <filesystem>
 
 #include "llm_engine/tensor.h"
 #include "llm_engine/memory/memory_pool.h"
@@ -11,10 +12,42 @@
 
 using namespace llm_engine;
 
+namespace {
+
+std::string resolve_data_path(const std::string& filepath) {
+    namespace fs = std::filesystem;
+    fs::path p(filepath);
+
+    if (fs::exists(p)) {
+        return p.string();
+    }
+
+#ifdef TEST_DATA_DIR
+    fs::path from_source_data = fs::path(TEST_DATA_DIR) / p.filename();
+    if (fs::exists(from_source_data)) {
+        return from_source_data.string();
+    }
+#endif
+
+    // 兼容从 build/tests 目录直接执行二进制的场景
+    fs::path from_build_tests = fs::path("../..") / "tests" / p;
+    if (fs::exists(from_build_tests)) {
+        return from_build_tests.lexically_normal().string();
+    }
+
+    return filepath;
+}
+
+} // namespace
+
 // 辅助函数：从二进制文件加载数据到 Tensor 中
 void load_tensor_from_bin(const std::string& filepath, Tensor& tensor) {
-    std::ifstream file(filepath, std::ios::binary);
-    ASSERT_TRUE(file.is_open()) << "Failed to open " << filepath;
+    std::string resolved_path = resolve_data_path(filepath);
+    std::ifstream file(resolved_path, std::ios::binary);
+    ASSERT_TRUE(file.is_open())
+        << "Failed to open " << filepath
+        << " (resolved: " << resolved_path
+        << ", cwd: " << std::filesystem::current_path().string() << ")";
     file.read(reinterpret_cast<char*>(tensor.ptr<float>()), tensor.bytes());
     file.close();
 }

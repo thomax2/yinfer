@@ -18,6 +18,8 @@ set(LLM_ENGINE_SOURCES
     # Sprint 4: 内存管理
     src/memory/memory_pool.cpp
     src/memory/workspace.cpp
+
+    src/memory/kv_cache.cpp
 )
 
 # 如果是在 ARM 架构（如 aarch64），才添加 Neon 源并启用 ARM 专属优化

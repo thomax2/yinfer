@@ -42,6 +42,13 @@ target_link_libraries(test_neon
     GTest::Main
 )
 
+add_executable(test_attention test_attention.cpp)
+
+target_link_libraries(test_attention
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
 
 
 add_test(NAME tensor_test COMMAND test_tensor)
