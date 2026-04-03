@@ -76,5 +76,20 @@ Status attention_neon(
     Workspace& workspace
 );
 
+struct FFNConfig {
+    int hidden_dim;
+    int intermediate_size;
+};
+
+Status ffn_neon(
+    const Tensor& hidden_states, 
+    Tensor& ffn_output,          
+    const Tensor& w_gate,        
+    const Tensor& w_up,          
+    const Tensor& w_down,        
+    const FFNConfig& config,     
+    Workspace& workspace
+);
+
 }
 }
