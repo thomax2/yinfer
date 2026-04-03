@@ -50,8 +50,17 @@ target_link_libraries(test_attention
     GTest::Main
 )
 
-
 target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
+
+add_executable(test_ffn test_ffn.cpp)
+
+target_link_libraries(test_ffn
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
 
 
 add_test(NAME tensor_test COMMAND test_tensor)
