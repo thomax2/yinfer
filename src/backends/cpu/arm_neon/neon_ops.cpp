@@ -17,7 +17,8 @@ Status matmul_neon(
     const Tensor& B,
     Tensor& C,
     float* workspace,
-    bool transB
+    bool transB = false,
+    const float* bias = nullptr   // ⭐新增
 ) {
     // 目前仅支持FP32的矩阵乘法
     if (A.dtype != DataType::FP32 || B.dtype != DataType::FP32 || C.dtype != DataType::FP32)
@@ -89,6 +90,23 @@ Status matmul_neon(
             }
         }
     }
+
+    if (bias) {
+        // C: [M, N]
+        for (int m = 0; m < M; ++m) {
+            int n = 0;
+            for (; n <= N - 4; n += 4) {
+                float32x4_t v = vld1q_f32(c + m*N + n);
+                float32x4_t b = vld1q_f32(bias + n);
+                v = vaddq_f32(v, b);
+                vst1q_f32(c + m*N + n, v);
+            }
+            for (; n < N; ++n) {
+                c[m*N + n] += bias[n];
+            }
+        }
+    }
+
     return Status::SUCCESS;
 }
 

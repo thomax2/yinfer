@@ -13,7 +13,8 @@ Status matmul_neon(
     const Tensor& B,
     Tensor& C,
     float* workspace,
-    bool transB = false
+    bool transB = false,
+    const float* bias = nullptr
 );
 
 Status bmm_neon(

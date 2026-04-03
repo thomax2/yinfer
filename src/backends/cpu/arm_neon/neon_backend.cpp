@@ -55,7 +55,7 @@ static void register_neon()
             return Status::OUT_OF_MEMORY;
         }
 
-        Status status = arm_neon::matmul_neon(A, B, C, workspace);
+        Status status = arm_neon::matmul_neon(A, B, C, workspace, false, nullptr);
         g_memory_pool->free_block(workspace);
         return status;
     };

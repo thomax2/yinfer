@@ -64,7 +64,7 @@ TEST(NeonTest, MatmulAccuracy) {
     float* workspace = (float*)g_memory_pool->allocate(ws_size);
     std::memset(workspace, 0, ws_size);
 
-    arm_neon::matmul_neon(A, B, C_neon, workspace);
+    arm_neon::matmul_neon(A, B, C_neon, workspace, false, nullptr);
 
     // 4. 逐元素比对 (允许微小误差)
     float* c_ref_ptr = C_ref.ptr<float>();

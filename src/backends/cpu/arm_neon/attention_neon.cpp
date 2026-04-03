@@ -11,7 +11,8 @@ namespace arm_neon {
 Status attention_neon(
     const Tensor& hidden_states, // [1, hidden_dim]
     Tensor& attn_output,         // [1, hidden_dim]
-    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o, 
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const float* q_bias, const float* k_bias, const float* v_bias,
     const float* cos_ptr, const float* sin_ptr, 
     KVCache& kv_cache,
     int layer_id,
@@ -48,9 +49,9 @@ Status attention_neon(
     // ==========================================
     // 1 & 2. QKV 投影与 RoPE
     // ==========================================
-    matmul_neon(hidden_states, w_q, Q_proj, matmul_ws_ptr);
-    matmul_neon(hidden_states, w_k, K_proj, matmul_ws_ptr);
-    matmul_neon(hidden_states, w_v, V_proj, matmul_ws_ptr);
+    matmul_neon(hidden_states, w_q, Q_proj, matmul_ws_ptr, false, q_bias);
+    matmul_neon(hidden_states, w_k, K_proj, matmul_ws_ptr, false, k_bias);
+    matmul_neon(hidden_states, w_v, V_proj, matmul_ws_ptr, false, v_bias);
 
     rope_neon(q_proj_ptr, cos_ptr, sin_ptr, q_size);
     rope_neon(k_proj_ptr, cos_ptr, sin_ptr, k_size);
@@ -88,7 +89,7 @@ Status attention_neon(
 
         // A. 极致性能：一次计算 Score = Q_group * K_cache^T
         // 因为 K_cache 是复用的，底层会自动 pack 唯一一次 K，然后服务于 num_rep 行的 Q！
-        matmul_neon(Q_group, K_cache, Score, matmul_ws_ptr, true);
+        matmul_neon(Q_group, K_cache, Score, matmul_ws_ptr, true, nullptr);
 
         // B. Score 缩放 (按总元素个数循环)
         int total_score_elements = num_rep * current_seq_len;
@@ -113,13 +114,13 @@ Status attention_neon(
         float* out_group_ptr = attn_out_ptr + kv_head * num_rep * config.head_dim;
         Tensor Out_group({num_rep, config.head_dim}, out_group_ptr);
         
-        matmul_neon(Score, V_cache, Out_group, matmul_ws_ptr, false);
+        matmul_neon(Score, V_cache, Out_group, matmul_ws_ptr, false, nullptr);
     }
 
     // ==========================================
     // 5. 最终输出投影
     // ==========================================
-    matmul_neon(Attn_Out_Buf, w_o, attn_output, matmul_ws_ptr);
+    matmul_neon(Attn_Out_Buf, w_o, attn_output, matmul_ws_ptr, false, nullptr);
 
     return Status::SUCCESS;
 }

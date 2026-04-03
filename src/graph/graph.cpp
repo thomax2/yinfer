@@ -32,7 +32,7 @@ Status MatmulNode::forward() {
     float* workspace = (float*)g_memory_pool->allocate(ws_size);
 
     // 3. 执行 NEON 矩阵乘法
-    Status status = arm_neon::matmul_neon(*A, *B, *C, workspace);
+    Status status = arm_neon::matmul_neon(*A, *B, *C, workspace, false, nullptr);
 
     // 4. 执行完毕，立刻释放临时内存，防止显存/内存泄漏！
     g_memory_pool->free_block(workspace);

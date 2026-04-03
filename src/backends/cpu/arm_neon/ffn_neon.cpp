@@ -79,10 +79,10 @@ Status ffn_neon(
     // ==========================================
     // 2. 向下投影与门控投影
     // ==========================================
-    Status status = matmul_neon(hidden_states, w_gate, Gate, matmul_ws_ptr);
+    Status status = matmul_neon(hidden_states, w_gate, Gate, matmul_ws_ptr, false, nullptr);
     if (status != Status::SUCCESS) return status;
 
-    status = matmul_neon(hidden_states, w_up, Up, matmul_ws_ptr);
+    status = matmul_neon(hidden_states, w_up, Up, matmul_ws_ptr, false, nullptr);
     if (status != Status::SUCCESS) return status;
 
     // ==========================================
@@ -95,7 +95,7 @@ Status ffn_neon(
     // ==========================================
     // 4. 向下投影
     // ==========================================
-    status = matmul_neon(Gate, w_down, ffn_output, matmul_ws_ptr);
+    status = matmul_neon(Gate, w_down, ffn_output, matmul_ws_ptr, false, nullptr);
 
     return status;
 }

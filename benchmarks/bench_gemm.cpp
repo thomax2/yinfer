@@ -71,7 +71,7 @@ static void BM_matmul_neon(benchmark::State& state) {
     float* workspace = workspace_vec.data();
 
     for (auto _ : state) {
-        arm_neon::matmul_neon(A, B, C, workspace);
+        arm_neon::matmul_neon(A, B, C, workspace, false, nullptr);
     }
 
     state.counters["GFLOPS"] = benchmark::Counter(
