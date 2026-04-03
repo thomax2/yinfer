@@ -29,6 +29,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
         src/backends/cpu/arm_neon/neon_ops.cpp
         src/backends/cpu/arm_neon/softmax_neon.cpp
         src/backends/cpu/arm_neon/attention_neon.cpp
+        src/backends/cpu/arm_neon/ffn_neon.cpp
         src/backends/cpu/arm_neon/neon_backend.cpp
         src/backends/cpu/arm_neon/rms_norm_neon.cpp
         src/backends/cpu/arm_neon/rope_neon.cpp

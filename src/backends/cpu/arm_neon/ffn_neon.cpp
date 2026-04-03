@@ -1,5 +1,5 @@
-#include "src/backends/cpu/arm_neon/neon_ops.h"
-#include "src/backends/cpu/arm_neon/kernel_common.h" // 引入 MR, NR 用于精确计算 pack 内存
+#include "backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/kernel_common.h" // 引入 MR, NR 用于精确计算 pack 内存
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/tensor.h"
 #include <algorithm>
