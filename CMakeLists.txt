@@ -34,6 +34,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
         src/backends/cpu/arm_neon/rms_norm_neon.cpp
         src/backends/cpu/arm_neon/rope_neon.cpp
         src/backends/cpu/arm_neon/swiglu_neon.cpp
+        src/backends/cpu/arm_neon/qwen_block_neon.cpp
     )
 endif()
 
