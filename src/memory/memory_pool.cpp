@@ -69,7 +69,7 @@ void* MemoryPool::allocate(size_t bytes) {
     if(!block)
         return nullptr; // 没有足够的内存
     
-    split(block, bytes);
+    split(block, aligned_bytes);
     block->free = false;
 
     return (char*)block + sizeof(BlockHeader);

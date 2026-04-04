@@ -4,7 +4,7 @@
 
 namespace llm_engine {
 
-struct BlockHeader {
+struct alignas(16) BlockHeader {
     size_t size;        // 数据块大小（不含header）
     bool free;          // 是否空闲
     

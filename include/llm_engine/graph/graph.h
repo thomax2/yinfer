@@ -5,6 +5,8 @@
 
 #include "llm_engine/tensor.h"
 #include "llm_engine/status.h"
+#include "llm_engine/memory/kv_cache.h"
+#include "src/backends/cpu/arm_neon/neon_ops.h"
 
 namespace llm_engine {
 
@@ -53,6 +55,35 @@ public:
     Status forward() override;
 };
 
+class QwenBlockNode : public GraphNode {
+public:
+    arm_neon::AttentionConfig attn_config;
+    arm_neon::FFNConfig ffn_config;
+    float rms_norm_eps;
+    int layer_id;
+    int* current_pos_ptr; // 💡 使用指针，方便外部的推理大循环统一更新位置
+    KVCache* kv_cache;
+
+    // 构造函数：接收所有的参数和张量
+    QwenBlockNode(
+        Tensor* hidden_states,
+        Tensor* norm1_weight,
+        Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+        Tensor* b_q, Tensor* b_k, Tensor* b_v,
+        Tensor* cos, Tensor* sin,
+        Tensor* norm2_weight,
+        Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+        KVCache* cache, 
+        int l_id, 
+        int* pos_ptr, 
+        arm_neon::AttentionConfig a_conf,
+        arm_neon::FFNConfig f_conf,
+        float eps
+    );
+
+    Status forward() override;
+};
+
 class ComputationGraph {
 public:
     std::vector<std::unique_ptr<GraphNode>> nodes;
@@ -94,6 +125,17 @@ public:
     RMSNormNode*    add_rmsnorm(Tensor* X, Tensor* Weight, Tensor* Y, float eps);
     SwiGLUNode*     add_swiglu(Tensor* Gate, Tensor* Up, Tensor* Y);
     RoPENode*       add_rope(Tensor* X, Tensor* Cos, Tensor* Sin);
+    
+    QwenBlockNode* add_qwen_block(
+        Tensor* hidden_states, Tensor* norm1_weight,
+        Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+        Tensor* b_q, Tensor* b_k, Tensor* b_v,
+        Tensor* cos, Tensor* sin,
+        Tensor* norm2_weight,
+        Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+        KVCache* cache, int l_id, int* pos_ptr,
+        arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
+    );
 };
 
 }

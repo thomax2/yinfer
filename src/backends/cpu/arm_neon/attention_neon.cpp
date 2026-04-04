@@ -20,6 +20,50 @@ Status attention_neon(
     const AttentionConfig& config,
     Workspace& workspace
 ) {
+
+    int num_tokens = hidden_states.shape[0];
+    int hidden_dim = hidden_states.shape[1];
+
+    int q_out_dim = config.num_q_heads * config.head_dim;
+    int kv_out_dim = config.num_kv_heads * config.head_dim;
+
+    // ==========================================
+    // 🛡️ 防御 1：严格的 Shape 校验
+    // ==========================================
+    if (w_q.shape[1] != q_out_dim || w_k.shape[1] != kv_out_dim || w_v.shape[1] != kv_out_dim) {
+        return Status::INVALID_ARGUMENT; 
+    }
+    // 严格绑定输入特征维度，防止配置错误
+    if (w_o.shape[0] != q_out_dim || w_o.shape[1] != hidden_dim) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    // ==========================================
+    // 🛡️ 防御 2：极致优化的 Workspace 大小检查
+    // ==========================================
+    // 计算 Q, K, V 投影所需的空间
+    size_t q_bytes = num_tokens * q_out_dim * sizeof(float);
+    size_t k_bytes = num_tokens * kv_out_dim * sizeof(float);
+    size_t v_bytes = num_tokens * kv_out_dim * sizeof(float);
+
+    // 计算 GQA 复用组大小
+    int num_rep = config.num_q_heads / config.num_kv_heads;
+    
+    // Score 缓冲区：只需要存当前 GQA 组的分数 (极限省内存！)
+    size_t score_bytes = num_tokens * num_rep * kv_cache.max_seq_len * sizeof(float);
+
+    // Attention 融合后的输出缓存 (乘 w_o 之前)
+    size_t attn_out_bytes = num_tokens * q_out_dim * sizeof(float);
+
+    // 给底层的 GEMM 预留汇编指令 Pack 打包的缓存区
+    size_t pack_bytes = 1024 * 1024; // 1MB，够跑 0.5B 模型了
+
+    size_t required = q_bytes + k_bytes + v_bytes + score_bytes + attn_out_bytes + pack_bytes;
+
+    if (workspace.size() < required) {
+        return Status::OUT_OF_MEMORY;
+    }
+
     // ==========================================
     // 0. Workspace 内存切分
     // ==========================================
@@ -45,6 +89,13 @@ Status attention_neon(
     Tensor K_proj({1, k_size}, k_proj_ptr);
     Tensor V_proj({1, v_size}, v_proj_ptr);
     Tensor Attn_Out_Buf({1, q_size}, attn_out_ptr);
+
+
+    // w_q 必须是 [hidden_dim, q_size]
+    assert(w_q.shape[1] == q_size);
+    assert(w_k.shape[1] == k_size);
+    assert(w_v.shape[1] == v_size);
+
 
     // ==========================================
     // 1 & 2. QKV 投影与 RoPE

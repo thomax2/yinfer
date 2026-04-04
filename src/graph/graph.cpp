@@ -103,6 +103,99 @@ Status RoPENode::forward() {
     return Status::SUCCESS;
 }
 
+QwenBlockNode::QwenBlockNode(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps)
+    : kv_cache(cache), layer_id(l_id), current_pos_ptr(pos_ptr),
+      attn_config(a_conf), ffn_config(f_conf), rms_norm_eps(eps) 
+{
+    // 将所有依赖的 Tensor 依次存入 inputs，以便图层可以统一管理它们
+    inputs.push_back(hidden_states); // inputs[0]
+    inputs.push_back(norm1_weight);  // inputs[1]
+    inputs.push_back(w_q);           // inputs[2]
+    inputs.push_back(w_k);           // inputs[3]
+    inputs.push_back(w_v);           // inputs[4]
+    inputs.push_back(w_o);           // inputs[5]
+    inputs.push_back(b_q);           // inputs[6]
+    inputs.push_back(b_k);           // inputs[7]
+    inputs.push_back(b_v);           // inputs[8]
+    inputs.push_back(cos);           // inputs[9]
+    inputs.push_back(sin);           // inputs[10]
+    inputs.push_back(norm2_weight);  // inputs[11]
+    inputs.push_back(w_gate);        // inputs[12]
+    inputs.push_back(w_up);          // inputs[13]
+    inputs.push_back(w_down);        // inputs[14]
+
+    // 因为 QwenBlock 是原地修改 (In-place) 计算，输出同样是 hidden_states
+    outputs.push_back(hidden_states);
+}
+
+Status QwenBlockNode::forward() {
+    // 1. 解包 Inputs (顺序与构造函数中 push_back 的顺序一致)
+    Tensor* hidden_states = inputs[0];
+    Tensor* norm1_weight  = inputs[1];
+    Tensor* w_q = inputs[2]; Tensor* w_k = inputs[3]; Tensor* w_v = inputs[4]; Tensor* w_o = inputs[5];
+    Tensor* b_q = inputs[6]; Tensor* b_k = inputs[7]; Tensor* b_v = inputs[8];
+    Tensor* cos = inputs[9]; Tensor* sin = inputs[10];
+    Tensor* norm2_weight  = inputs[11];
+    Tensor* w_gate = inputs[12]; Tensor* w_up = inputs[13]; Tensor* w_down = inputs[14];
+
+    int num_tokens = hidden_states->shape[0];
+    int hidden_dim = hidden_states->shape[1];
+
+    // ==========================================
+    // 2. 精确计算当前前向传播需要的 Workspace 大小
+    // ==========================================
+    // (1) 内部残差和归一化缓存：需要存 residual 和 norm_out，共2个 Tensor
+    size_t buffer_bytes = 2 * num_tokens * hidden_dim * sizeof(float);
+    
+    // (2) 矩阵乘法的 Pack 缓存（给 NEON 底层计算预留）
+    // 正常给 1MB~2MB 就足够处理 Qwen-0.5B 的 Decode 和小批量 Prefill 了
+    size_t pack_bytes = 2 * 1024 * 1024; 
+    
+    size_t total_ws_size = buffer_bytes + pack_bytes;
+
+    // ==========================================
+    // 3. 从全局内存池临时申请并包装为 Workspace
+    // ==========================================
+    void* raw_ptr = g_memory_pool->allocate(total_ws_size);
+    if (!raw_ptr) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    // 调用我们在上一节修改好的“无开销子工作区”构造函数
+    Workspace temp_workspace(raw_ptr, total_ws_size);
+
+    // ==========================================
+    // 4. 调用后端的纯数学计算算子
+    // ==========================================
+    Status status = arm_neon::qwen_block_neon(
+        *hidden_states, *norm1_weight,
+        *w_q, *w_k, *w_v, *w_o,
+        b_q->ptr<float>(), b_k->ptr<float>(), b_v->ptr<float>(), // 传入 QKV Bias
+        cos->ptr<float>(), sin->ptr<float>(),
+        *norm2_weight, *w_gate, *w_up, *w_down,
+        *kv_cache, 
+        layer_id, 
+        *current_pos_ptr, // 💡 解引用指针，拿到当前的最新的生成位置
+        attn_config, ffn_config, rms_norm_eps, 
+        temp_workspace
+    );
+
+    // ==========================================
+    // 5. 立即释放内存（完璧归赵）
+    // ==========================================
+    g_memory_pool->free_block(raw_ptr);
+
+    return status;
+}
+
 
 /*                                       创建 tensor                                         */
 Tensor* ComputationGraph::create_tensor(
@@ -174,5 +267,26 @@ RoPENode* ComputationGraph::add_rope(Tensor* X,
     return static_cast<RoPENode*>(nodes.back().get());
 }
 
+
+QwenBlockNode* ComputationGraph::add_qwen_block(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
+) {
+    nodes.push_back(std::make_unique<QwenBlockNode>(
+        hidden_states, norm1_weight,
+        w_q, w_k, w_v, w_o, b_q, b_k, b_v,
+        cos, sin, norm2_weight, w_gate, w_up, w_down,
+        cache, l_id, pos_ptr, a_conf, f_conf, eps
+    ));
+
+    // 完美对齐你的架构：把通用的基类指针变回具体的子类指针并返回
+    return static_cast<QwenBlockNode*>(nodes.back().get());
+}
 
 }

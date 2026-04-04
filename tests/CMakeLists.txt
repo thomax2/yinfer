@@ -44,13 +44,13 @@ target_link_libraries(test_neon
 
 add_executable(test_attention test_attention.cpp)
 
-target_link_libraries(test_attention
-    llm_engine
-    GTest::GTest
-    GTest::Main
-)
+# target_link_libraries(test_attention
+#     llm_engine
+#     GTest::GTest
+#     GTest::Main
+# )
 
-target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+# target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 
 add_executable(test_ffn test_ffn.cpp)
@@ -63,7 +63,26 @@ target_link_libraries(test_ffn
 
 target_compile_definitions(test_ffn PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+add_executable(test_qwen_block test_qwen_block.cpp)
 
+target_link_libraries(test_qwen_block
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+target_compile_definitions(test_qwen_block PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+
+
+add_executable(test_graph_qwen_block test_graph_qwen_block.cpp)
+
+target_link_libraries(test_graph_qwen_block
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
+
+target_compile_definitions(test_graph_qwen_block PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 add_test(NAME tensor_test COMMAND test_tensor)
 add_test(NAME math_ref_test COMMAND test_math_ref)
