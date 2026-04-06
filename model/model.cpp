@@ -222,7 +222,7 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     std::cout << "[Info] Computation Graph built successfully! Total nodes: " << plan.size() << "\n";
 }
 
-int QwenModel::forward(int token_id, int pos, KVCache& kv_cache, Workspace& workspace) {
+int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     // 1. 首个 Token 进来时，触发建图
     if (!is_graph_built) {
         build_graph(kv_cache);
@@ -259,6 +259,49 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache, Workspace& work
     // 而底层的 QwenBlockNeon 和 Matmul 等计算，也直接调用了全局 g_memory_pool。
 
     return next_token;
+}
+
+void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_tokens, std::function<bool(int)> callback) {
+    if (input_tokens.empty()) return;
+
+    // 1. 初始化属于这一次对话的 KV Cache
+    KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
+    int pos = 0;
+
+    // ==========================================
+    // 阶段 A：Prefill（预填充阶段）
+    // ==========================================
+    // 将前面的 Token 逐个喂给模型，累积 KV Cache，但不需要它们的输出
+    for (size_t i = 0; i < input_tokens.size() - 1; ++i) {
+        forward(input_tokens[i], pos, kv_cache);
+        pos++;
+    }
+
+    // ==========================================
+    // 阶段 B：Decode（解码阶段）
+    // ==========================================
+    // 拿出 Prompt 的最后一个词
+    int current_token = input_tokens.back();
+
+    for (int i = 0; i < max_new_tokens; ++i) {
+        // 推理出下一个词
+        int next_token = forward(current_token, pos, kv_cache);
+        pos++;
+
+        // 将生成的词通过回调函数送回前端（比如打印到屏幕）
+        // 如果回调函数返回 false，则提前终止生成（可用于实现用户强行打断）
+        if (!callback(next_token)) {
+            break;
+        }
+
+        // 检查是否遇到了 Qwen 的对话结束符 (通常是 151645 <|im_end|>)
+        if (next_token == 151645 || next_token == 151643) {
+            break;
+        }
+
+        // 把刚生成的词变成下一次的输入
+        current_token = next_token;
+    }
 }
 
 } // namespace llm_engine
