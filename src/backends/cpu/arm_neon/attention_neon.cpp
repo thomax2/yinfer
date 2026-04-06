@@ -2,6 +2,7 @@
 #include "llm_engine/memory/kv_cache.h"
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/tensor.h"
+#include <cassert>
 #include <cmath>
 #include <arm_neon.h>
 
@@ -50,7 +51,7 @@ Status attention_neon(
     int num_rep = config.num_q_heads / config.num_kv_heads;
     
     // Score 缓冲区：只需要存当前 GQA 组的分数 (极限省内存！)
-    size_t score_bytes = num_tokens * num_rep * kv_cache.max_seq_len * sizeof(float);
+    size_t score_bytes = num_tokens * num_rep * kv_cache.get_max_seq_len() * sizeof(float);
 
     // Attention 融合后的输出缓存 (乘 w_o 之前)
     size_t attn_out_bytes = num_tokens * q_out_dim * sizeof(float);
@@ -73,7 +74,6 @@ Status attention_neon(
     int k_size = config.num_kv_heads * config.head_dim;
     int v_size = config.num_kv_heads * config.head_dim;
     int max_seq_len = kv_cache.get_max_seq_len();
-    int num_rep = config.num_q_heads / config.num_kv_heads;
     
     float* q_proj_ptr = ws_base;                ws_base += q_size;
     float* k_proj_ptr = ws_base;                ws_base += k_size;

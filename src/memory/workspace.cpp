@@ -7,6 +7,7 @@ Workspace::Workspace(size_t bytes)
 {
     ptr = g_memory_pool->allocate(bytes);
     capacity = bytes;
+    owns_memory = true;
 }
 
 void* Workspace::data()

@@ -24,6 +24,7 @@ public:
 
     // 2. ⭐新增构造函数：用现有的指针划分子空间 (不分配新内存)
     Workspace(void* pre_allocated_ptr, size_t bytes);
+    ~Workspace();
 
     void* data();
     size_t size();

@@ -44,13 +44,13 @@ target_link_libraries(test_neon
 
 add_executable(test_attention test_attention.cpp)
 
-# target_link_libraries(test_attention
-#     llm_engine
-#     GTest::GTest
-#     GTest::Main
-# )
+target_link_libraries(test_attention
+    llm_engine
+    GTest::GTest
+    GTest::Main
+)
 
-# target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_definitions(test_attention PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 
 add_executable(test_ffn test_ffn.cpp)

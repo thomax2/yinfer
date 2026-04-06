@@ -17,8 +17,8 @@ Status matmul_neon(
     const Tensor& B,
     Tensor& C,
     float* workspace,
-    bool transB = false,
-    const float* bias = nullptr   // ⭐新增
+    bool transB,
+    const float* bias
 ) {
     // 目前仅支持FP32的矩阵乘法
     if (A.dtype != DataType::FP32 || B.dtype != DataType::FP32 || C.dtype != DataType::FP32)

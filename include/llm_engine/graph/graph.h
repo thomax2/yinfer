@@ -6,7 +6,7 @@
 #include "llm_engine/tensor.h"
 #include "llm_engine/status.h"
 #include "llm_engine/memory/kv_cache.h"
-#include "src/backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/neon_ops.h"
 
 namespace llm_engine {
 
