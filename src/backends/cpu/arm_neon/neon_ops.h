@@ -17,6 +17,13 @@ Status matmul_neon(
     const float* bias = nullptr
 );
 
+Status gemv_neon_transposed(
+    const Tensor& A,   // 形状 [1, K]
+    const Tensor& B_T, // 形状 [N, K] (预转置，无需Pack)
+    Tensor& C,         // 形状 [1, N]
+    const float* bias = nullptr
+);
+
 Status bmm_neon(
     const Tensor& A,
     const Tensor& B,

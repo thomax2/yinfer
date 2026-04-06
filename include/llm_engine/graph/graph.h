@@ -28,6 +28,12 @@ public:
     Status forward() override;  // 重写基类的纯虚函数，在cpp中完成具体的实现。
 };
 
+class GemvNode : public GraphNode {
+public:
+    GemvNode(Tensor* A, Tensor* B_T, Tensor* C);
+    Status forward() override;
+};
+
 class AddNode : public GraphNode {
 public:
     AddNode(Tensor* A, Tensor* B, Tensor* C);
@@ -120,6 +126,7 @@ public:
     );
 
     MatmulNode*     add_matmul(Tensor* A, Tensor* B, Tensor* C);
+    GemvNode*       add_gemv(Tensor* A, Tensor* B_T, Tensor* C);
     AddNode*        add_add(Tensor* A, Tensor* B, Tensor* C);
 
     RMSNormNode*    add_rmsnorm(Tensor* X, Tensor* Weight, Tensor* Y, float eps);

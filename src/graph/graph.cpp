@@ -40,6 +40,24 @@ Status MatmulNode::forward() {
     return status;
 }
 
+GemvNode::GemvNode(Tensor* A, Tensor* B_T, Tensor* C) {
+    inputs = {A, B_T};
+    outputs = {C};
+}
+
+Status GemvNode::forward() {
+    Tensor* A = inputs[0];
+    Tensor* B_T = inputs[1];
+    Tensor* C = outputs[0];
+
+    // 不需要任何 Workspace 内存分配，直接调用算子，极速执行！
+    return arm_neon::gemv_neon_transposed(*A, *B_T, *C, nullptr);
+}
+
+GemvNode* ComputationGraph::add_gemv(Tensor* A, Tensor* B_T, Tensor* C) {
+    nodes.push_back(std::make_unique<GemvNode>(A, B_T, C));
+    return static_cast<GemvNode*>(nodes.back().get());
+}
 
 AddNode::AddNode(Tensor* A, Tensor* B, Tensor* C) {
     inputs = {A, B};

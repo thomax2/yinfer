@@ -110,6 +110,51 @@ Status matmul_neon(
     return Status::SUCCESS;
 }
 
+Status gemv_neon_transposed(
+    const Tensor& A, 
+    const Tensor& B_T, 
+    Tensor& C,
+    const float* bias
+) {
+    if (A.dtype != DataType::FP32 || B_T.dtype != DataType::FP32 || C.dtype != DataType::FP32)
+        return Status::INVALID_ARGUMENT;
+
+    int K = A.shape[1];
+    int N = B_T.shape[0]; // B_T 是 [N, K]
+
+    const float* x = A.ptr<float>();
+    const float* W = B_T.ptr<float>();
+    float* y = C.ptr<float>();
+
+    for (int n = 0; n < N; n++) {
+        const float* w = W + n * K; // 定位到 W 的第 n 行首地址
+
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        int k = 0;
+        
+        // 核心：连续内存访问，纯享 NEON 加速
+        for (; k <= K - 4; k += 4) {
+            float32x4_t xv = vld1q_f32(x + k);
+            float32x4_t wv = vld1q_f32(w + k);
+            acc = vfmaq_f32(acc, wv, xv);  // acc += wv * xv
+        }
+
+        // 规约求和
+        float sum = vaddvq_f32(acc);
+
+        // 处理尾部
+        for (; k < K; k++) {
+            sum += x[k] * w[k];
+        }
+
+        if (bias) sum += bias[n];
+        
+        y[n] = sum;
+    }
+
+    return Status::SUCCESS;
+}
+
 void add_neon(const Tensor& A, const Tensor& B, Tensor& C) {
     const float* a_ptr = A.ptr<float>();
     const float* b_ptr = B.ptr<float>();

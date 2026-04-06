@@ -32,4 +32,4 @@ private:
     std::vector<float> v_cache;
 };
 
-} // namespace llm_engine
+} // namespace llm_enginematmul_neon
