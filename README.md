@@ -117,3 +117,85 @@
 - `arm_neon::attention_neon` 实现与 PyTorch 参考实现完全对齐
 - KV Cache 的写入逻辑正确，支持增量式生成场景（首个 token 生成）
 - 所有单元测试通过，Attention 模块可投入实际推理使用
+
+## Qwen Block 单元测试报告
+
+**测试可执行文件：** `./build/tests/test_qwen_block`
+
+### 测试概要
+
+| 测试套件 | 测试数量 | 通过 | 失败 |
+| :--- | :--- | :--- | :--- |
+| QwenBlockTest | 1 | 1 | 0 |
+
+### 测试详情
+
+| 测试用例 | 描述 | 状态 |
+| :--- | :--- | :--- |
+| `PyTorchAlignment` | Qwen Block 完整前向计算与 PyTorch 黄金输出对齐测试 | ✅ PASS |
+
+### 测试说明
+
+- **测试配置：**
+  - `hidden_dim=64, num_q_heads=4, num_kv_heads=2, head_dim=16`
+  - `intermediate_size=128, rms_norm_eps=1e-6`
+  - `max_seq_len=128, num_tokens=1`
+- **验证内容：**
+  - Qwen Block 完整前向计算结果与 PyTorch 导出的黄金输出对齐（容忍误差 `2e-3`）
+  - 包含 RMS Norm、GQA 注意力、FFN（SwiGLU）等全部子模块
+- **测试数据：** 从 Python 脚本生成的二进制文件加载（`data/*.bin`）
+
+### 测试环境
+
+- **数据路径解析：** 自动搜索 `TEST_DATA_DIR` 环境变量、源码 `tests/` 目录及构建目录相对路径
+- **内存资源：**
+  - MemoryPool：256 MB
+  - Workspace：4 MB
+  - KVCache：`batch=1, max_seq_len=128`
+
+### 结论
+
+- `arm_neon::qwen_block_neon` 完整实现与 PyTorch 参考实现完全对齐
+- Qwen Block 所有子模块（RMS Norm、GQA 注意力、RoPE、SwiGLU FFN）集成正确
+- 单元测试通过，Qwen Block 模块可投入实际推理使用
+
+---
+
+## Qwen Block 图集成测试报告
+
+**测试可执行文件：** `./build/tests/test_graph_qwen_block`
+
+### 测试概要
+
+| 测试套件 | 测试数量 | 通过 | 失败 |
+| :--- | :--- | :--- | :--- |
+| GraphIntegrationTest | 1 | 1 | 0 |
+
+### 测试详情
+
+| 测试用例 | 描述 | 状态 |
+| :--- | :--- | :--- |
+| `QwenBlockNode` | 将 Qwen Block 封装为图节点，经编译执行后对齐 PyTorch 输出 | ✅ PASS |
+
+### 测试说明
+
+- **测试配置：** 同上（`hidden_dim=64, num_q_heads=4, num_kv_heads=2, head_dim=16`）
+- **验证内容：**
+  1. 将 15 个外部数据指针（权重、偏置、cos/sin 等）注册为图中的 Tensor
+  2. 通过 `add_qwen_block` 接口创建图节点
+  3. 图编译器生成执行计划并执行
+  4. 最终输出与 PyTorch 黄金输出对齐（容忍误差 `2e-3`）
+- **内存规划器输出：** 峰值工作区需求为 **0 MB**（所有张量均为外部绑定，无额外内存分配）
+
+### 测试环境
+
+- **数据路径解析：** 同前
+- **内存资源：**
+  - MemoryPool：256 MB
+  - Workspace：由图执行器动态管理
+
+### 结论
+
+- Qwen Block 节点可正确集成到计算图中
+- 图编译器能正确处理外部绑定的张量，无需额外工作区内存
+- 编译-执行流程完整，Qwen Block 图集成测试通过
