@@ -40,13 +40,26 @@ endif()
 
 add_library(llm_engine ${LLM_ENGINE_SOURCES})
 
+# 1. 寻找 PCRE2 依赖
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
+
+# 2. 引入第三方库的头文件搜索路径
+include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken)
+include_directories(${PCRE2_INCLUDE_DIRS})
+
+# 3. 收集 tiktoken 的源文件
+file(GLOB TIKTOKEN_SRCS "third_party/cpp-tiktoken/*.cc")
+
 add_executable(qwen_model_loader
     model/main.cpp
     model/model.cpp
+    ${TIKTOKEN_SRCS}
 )
 
 target_link_libraries(qwen_model_loader
     llm_engine
+    ${PCRE2_LIBRARIES}
 )
 
 # 针对不同平台选择合适的编译选项
