@@ -175,7 +175,7 @@ Status QwenBlockNode::forward() {
     
     // (2) 矩阵乘法的 Pack 缓存（给 NEON 底层计算预留）
     // 正常给 1MB~2MB 就足够处理 Qwen-0.5B 的 Decode 和小批量 Prefill 了
-    size_t pack_bytes = 2 * 1024 * 1024; 
+    size_t pack_bytes = 32 * 1024 * 1024; 
     
     size_t total_ws_size = buffer_bytes + pack_bytes;
 

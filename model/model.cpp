@@ -1,5 +1,5 @@
 #include "model.h"
-#include "src/backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/neon_ops.h"
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -65,6 +65,9 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
 
     // 新增：给 lm_head_w_T 分配内存，形状是 [N, K] = [vocab_size, hidden_dim]
     allocate_weight(lm_head_w_T, {config.vocab_size, config.hidden_dim});
+
+    // 初始化 RoPE 查表缓存，确保图边界张量 t_cos/t_sin 绑定到有效内存
+    init_rope_cache();
 }
 
 // --- 析构函数：统一释放 malloc 的权重 ---
@@ -172,6 +175,8 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     // 1. 准备入口边界内存
     ext_hidden_states.resize(hidden_dim, 0.0f);
     t_hidden_states = graph.create_tensor_from_ptr({1, hidden_dim}, ext_hidden_states.data(), DataType::FP32);
+    // 💡 新增：准备出口边界内存
+    ext_logits.resize(vocab_size, 0.0f);
 
     // 2. 利用巧妙的"虚拟边界"处理 RoPE 的动态位移
     // 随便绑定一个初始指针，骗过编译器的防线。真正执行时在 forward 里覆盖！
@@ -180,7 +185,8 @@ void QwenModel::build_graph(KVCache& kv_cache) {
 
     // 3. 创建图内部代管的临时张量 (编译器 Arena 会自动为它们复用内存)
     t_norm_out = graph.create_tensor({1, hidden_dim}, DataType::FP32);
-    t_logits = graph.create_tensor({1, vocab_size}, DataType::FP32);
+    //t_logits = graph.create_tensor({1, vocab_size}, DataType::FP32);
+    t_logits = graph.create_tensor_from_ptr({1, vocab_size}, ext_logits.data(), DataType::FP32);
 
     arm_neon::AttentionConfig attn_cfg = {
         config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim
@@ -222,7 +228,7 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     std::cout << "[Info] Computation Graph built successfully! Total nodes: " << plan.size() << "\n";
 }
 
-int QwenModel::forward(int token_id, int pos, KVCache& kv_cache, Workspace& workspace) {
+int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     // 1. 首个 Token 进来时，触发建图
     if (!is_graph_built) {
         build_graph(kv_cache);
@@ -259,6 +265,49 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache, Workspace& work
     // 而底层的 QwenBlockNeon 和 Matmul 等计算，也直接调用了全局 g_memory_pool。
 
     return next_token;
+}
+
+void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_tokens, std::function<bool(int)> callback) {
+    if (input_tokens.empty()) return;
+
+    // 1. 初始化属于这一次对话的 KV Cache
+    KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
+    int pos = 0;
+
+    // ==========================================
+    // 阶段 A：Prefill（预填充阶段）
+    // ==========================================
+    // 将前面的 Token 逐个喂给模型，累积 KV Cache，但不需要它们的输出
+    for (size_t i = 0; i < input_tokens.size() - 1; ++i) {
+        forward(input_tokens[i], pos, kv_cache);
+        pos++;
+    }
+
+    // ==========================================
+    // 阶段 B：Decode（解码阶段）
+    // ==========================================
+    // 拿出 Prompt 的最后一个词
+    int current_token = input_tokens.back();
+
+    for (int i = 0; i < max_new_tokens; ++i) {
+        // 推理出下一个词
+        int next_token = forward(current_token, pos, kv_cache);
+        pos++;
+
+        // 将生成的词通过回调函数送回前端（比如打印到屏幕）
+        // 如果回调函数返回 false，则提前终止生成（可用于实现用户强行打断）
+        if (!callback(next_token)) {
+            break;
+        }
+
+        // 检查是否遇到了 Qwen 的对话结束符 (通常是 151645 <|im_end|>)
+        if (next_token == 151645 || next_token == 151643) {
+            break;
+        }
+
+        // 把刚生成的词变成下一次的输入
+        current_token = next_token;
+    }
 }
 
 } // namespace llm_engine

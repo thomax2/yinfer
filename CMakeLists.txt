@@ -40,6 +40,15 @@ endif()
 
 add_library(llm_engine ${LLM_ENGINE_SOURCES})
 
+add_executable(qwen_model_loader
+    model/main.cpp
+    model/model.cpp
+)
+
+target_link_libraries(qwen_model_loader
+    llm_engine
+)
+
 # 针对不同平台选择合适的编译选项
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
     target_compile_options(llm_engine PRIVATE -O3 -march=armv8.2-a+fp16)

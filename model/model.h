@@ -3,9 +3,10 @@
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
-#include "src/backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/neon_ops.h"
 #include <vector>
 #include <string>
+#include <functional>
 
 namespace llm_engine {
 
@@ -64,6 +65,7 @@ public:
     // 图的边界张量和中间张量指针
     std::vector<float> ext_hidden_states; // 图的入口物理内存
     Tensor* t_hidden_states = nullptr;    // 图入口张量 (X)
+    std::vector<float> ext_logits;        // 💡 新增：图的出口物理内存
     Tensor* t_norm_out = nullptr;         // 图中间张量
     Tensor* t_logits = nullptr;           // 图出口张量
     
@@ -81,7 +83,18 @@ public:
     bool load_weights(const std::string& weights_dir);
 
     // 完整的前向传播，输入当前 token，输出预测的下一个 token
-    int forward(int token_id, int current_pos, KVCache& kv_cache, Workspace& workspace);
+    int forward(int token_id, int current_pos, KVCache& kv_cache);
+
+
+    // 新增完整的生成大循环
+    // input_tokens: 用户输入的提示词转换成的 ID 数组
+    // max_new_tokens: 最多生成多少个新词
+    // callback: 每生成一个新词，就会触发这个回调函数，用于流式打印
+    void generate(
+        const std::vector<int>& input_tokens, 
+        int max_new_tokens, 
+        std::function<bool(int)> callback
+    );
 
 private:
     // 内部辅助函数：分配固定内存并绑定给 Tensor
