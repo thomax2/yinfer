@@ -106,14 +106,13 @@ Status attention_neon(
 
     // rope_neon(q_proj_ptr, cos_ptr, sin_ptr, q_size);
     // rope_neon(k_proj_ptr, cos_ptr, sin_ptr, k_size);
-
-    // 遍历每一个 Q Head，分别应用长度为 head_dim 的 RoPE
-    for (int h = 0; h < config.num_q_heads; ++h) {
+    // 遍历每一个 Q Head，分别应用长度为 head_dim 的 ROPE
+    for(int h = 0; h < config.num_q_heads; ++h){
         rope_neon(q_proj_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
     }
-    
-    // 遍历每一个 KV Head，分别应用长度为 head_dim 的 RoPE
-    for (int h = 0; h < config.num_kv_heads; ++h) {
+
+    // 遍历每一个 Kv Head，分别应用长度为 head dim 的 ROPE
+    for (int h = 0; h < config.num_kv_heads; ++h){
         rope_neon(k_proj_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
     }
 

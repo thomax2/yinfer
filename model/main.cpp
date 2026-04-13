@@ -11,6 +11,7 @@ using namespace llm_engine;
 // 全局 Tokenizer 指针
 std::shared_ptr<GptEncoding> tokenizer;
 
+
 std::vector<int> real_encode(const std::string& text) {
     std::string prompt = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
     
