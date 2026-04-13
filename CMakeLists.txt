@@ -46,6 +46,7 @@ pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
 
 # 2. 引入第三方库的头文件搜索路径
 include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken/tiktoken)
 include_directories(${PCRE2_INCLUDE_DIRS})
 
 # 3. 收集 tiktoken 的源文件

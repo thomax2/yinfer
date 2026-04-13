@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 
 namespace llm_engine {
 
@@ -30,6 +31,16 @@ void QwenModel::allocate_weight(Tensor& t, const std::vector<int>& shape) {
 // --- 构造函数：根据配置构建完整的模型骨架 ---
 QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
     layers.resize(config.num_layers);
+
+    // ========== 关键修改2：构造函数中只分配一次 KV Cache ==========
+    // 只分配一次，生命周期伴随模型
+    kv_cache = std::make_unique<KVCache>(
+        config.num_layers, 
+        config.max_seq_len, 
+        config.num_kv_heads, 
+        config.head_dim
+    );
+
 
     // 0. Embedding 层
     allocate_weight(embed_tokens_w, {config.vocab_size, config.hidden_dim});
@@ -142,7 +153,8 @@ bool QwenModel::load_weights(const std::string& weights_dir) {
 void QwenModel::init_rope_cache() {
     int max_seq_len = config.max_seq_len; // 例如 2048
     int head_dim = config.head_dim;       // 例如 64
-    
+    int half_dim = head_dim / 2;
+
     // 分配内存
     allocate_weight(cos_cache, {max_seq_len, head_dim});
     allocate_weight(sin_cache, {max_seq_len, head_dim});
@@ -151,18 +163,23 @@ void QwenModel::init_rope_cache() {
     float* sin_ptr = sin_cache.ptr<float>();
     
     // Qwen2.5 默认的 base 是 1000000.0 (10^6)
-    float base = 500000.0f;
+    float base = 1000000.0f;
     
-    for (int pos = 0; pos < max_seq_len; pos++) {
-        for (int i = 0; i < head_dim; i += 2) {
-            float inv_freq = 1.0f / std::pow(base, (float)i / head_dim);
+        for (int pos = 0; pos < max_seq_len; ++pos) {
+        for (int i = 0; i < half_dim; ++i) {
+            // 频率只由前一半的维度下标决定
+            float inv_freq = 1.0f / std::pow(base, (float)(i * 2) / head_dim);
             float freq = pos * inv_freq;
-            
-            cos_ptr[pos * head_dim + i] = std::cos(freq);
-            cos_ptr[pos * head_dim + i + 1] = std::cos(freq);
-            
-            sin_ptr[pos * head_dim + i] = std::sin(freq);
-            sin_ptr[pos * head_dim + i + 1] = std::sin(freq);
+
+            float c = std::cos(freq);
+            float s = std::sin(freq);
+
+            // 前半段和后半段的相同位置存相同的 cos / sin
+            cos_ptr[pos * head_dim + i] = c;
+            cos_ptr[pos * head_dim + i + half_dim] = c;
+
+            sin_ptr[pos * head_dim + i] = s;
+            sin_ptr[pos * head_dim + i + half_dim] = s;
         }
     }
 }
@@ -267,11 +284,15 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     return next_token;
 }
 
+// ========== 关键修改3：generate 函数中只 clear，不重新分配 ==========
 void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_tokens, std::function<bool(int)> callback) {
     if (input_tokens.empty()) return;
 
-    // 1. 初始化属于这一次对话的 KV Cache
-    KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
+    // // 1. 初始化属于这一次对话的 KV Cache
+    // KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
+    // ✅ 只清空内容，地址不变！
+    kv_cache->clear();
+    
     int pos = 0;
 
     // ==========================================
@@ -279,7 +300,7 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
     // ==========================================
     // 将前面的 Token 逐个喂给模型，累积 KV Cache，但不需要它们的输出
     for (size_t i = 0; i < input_tokens.size() - 1; ++i) {
-        forward(input_tokens[i], pos, kv_cache);
+        forward(input_tokens[i], pos, *kv_cache);
         pos++;
     }
 
@@ -291,7 +312,7 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
 
     for (int i = 0; i < max_new_tokens; ++i) {
         // 推理出下一个词
-        int next_token = forward(current_token, pos, kv_cache);
+        int next_token = forward(current_token, pos, *kv_cache);
         pos++;
 
         // 将生成的词通过回调函数送回前端（比如打印到屏幕）
@@ -309,5 +330,6 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
         current_token = next_token;
     }
 }
+
 
 } // namespace llm_engine

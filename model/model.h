@@ -76,6 +76,9 @@ public:
     int current_pos = 0; 
     bool is_graph_built = false;
 
+    // ========== 关键修改1：使用智能指针管理 KV Cache ==========
+    std::unique_ptr<KVCache> kv_cache;
+
     QwenModel(const QwenConfig& cfg);
     ~QwenModel();
 

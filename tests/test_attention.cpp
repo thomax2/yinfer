@@ -101,6 +101,7 @@ TEST(AttentionTest, PyTorchAlignment) {
     Status status = arm_neon::attention_neon(
         hidden_states, attn_output,
         w_q, w_k, w_v, w_o,
+        nullptr, nullptr, nullptr,
         cos_tensor.ptr<float>(), sin_tensor.ptr<float>(),
         kv_cache, layer_id, current_pos, config, workspace
     );
