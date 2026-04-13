@@ -20,33 +20,27 @@ void rope_neon(
     const float* sin,
     int n
 ) {
-
-    // 
-    const float sign_data[4] = {-1.f, 1.f, -1.f, 1.f};
-    float32x4_t sign = vld1q_f32(sign_data);
-
-    // n 必须是偶数（成对处理）
-    for (int i = 0; i < n; i += 4) {
-        float32x4_t vx = vld1q_f32(x + i);
-        float32x4_t vcos = vld1q_f32(cos + i);
-        float32x4_t vsin = vld1q_f32(sin + i);
-
-        // [x0 x1 x2 x3] -> [x1 x0 x3 x2]
-        float32x4_t vrev = vrev64q_f32(vx);
-
-        // sign flip: [-x1, x0, -x3, x2]
-        vrev = vmulq_f32(vrev, sign);
-
-        /* 
-            vmulq_f32 是逐元素乘法， vfmaq_f32 是逐元素乘法加法，res = vx * cos + vrev * sin
-            
-            vcos = [c0, c0, c1, c1], vsin = [s0, s0, s1, s1]
-            想得到 res = [x0*c0 + (-x1)*s0, x1*c0 + x0*s0, x2*c1 + (-x3)*s1, x3*c1 + x2*s1]
-            所以 vrev = [-x1, x0, -x3, x2] 需要 交换+负号
-        */ 
-        float32x4_t res = vfmaq_f32(vmulq_f32(vx, vcos), vrev, vsin);
-
-        vst1q_f32(x + i, res);
+    int half_n = n / 2;
+    // 每次处理 4 个 float，完美契合 128-bit 寄存器
+    for (int i = 0; i < half_n; i += 4) {
+        // 分别加载前半段和后半段
+        float32x4_t x1 = vld1q_f32(x + i);
+        float32x4_t x2 = vld1q_f32(x + i + half_n);
+        
+        // 加载预计算好的 cos 和 sin
+        float32x4_t c = vld1q_f32(cos + i);
+        float32x4_t s = vld1q_f32(sin + i);
+        
+        // 执行 Half-and-Half 旋转公式：
+        // x1_new = x1 * cos - x2 * sin
+        float32x4_t x1_new = vmlsq_f32(vmulq_f32(x1, c), x2, s);
+        
+        // x2_new = x2 * cos + x1 * sin
+        float32x4_t x2_new = vfmaq_f32(vmulq_f32(x2, c), x1, s);
+        
+        // 原地写回内存
+        vst1q_f32(x + i, x1_new);
+        vst1q_f32(x + i + half_n, x2_new);
     }
 }
 

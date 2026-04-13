@@ -104,8 +104,18 @@ Status attention_neon(
     matmul_neon(hidden_states, w_k, K_proj, matmul_ws_ptr, false, k_bias);
     matmul_neon(hidden_states, w_v, V_proj, matmul_ws_ptr, false, v_bias);
 
-    rope_neon(q_proj_ptr, cos_ptr, sin_ptr, q_size);
-    rope_neon(k_proj_ptr, cos_ptr, sin_ptr, k_size);
+    // rope_neon(q_proj_ptr, cos_ptr, sin_ptr, q_size);
+    // rope_neon(k_proj_ptr, cos_ptr, sin_ptr, k_size);
+
+    // 遍历每一个 Q Head，分别应用长度为 head_dim 的 RoPE
+    for (int h = 0; h < config.num_q_heads; ++h) {
+        rope_neon(q_proj_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+    }
+    
+    // 遍历每一个 KV Head，分别应用长度为 head_dim 的 RoPE
+    for (int h = 0; h < config.num_kv_heads; ++h) {
+        rope_neon(k_proj_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+    }
 
     // ==========================================
     // 3. 更新 KV Cache

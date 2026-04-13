@@ -20,6 +20,11 @@ public:
     
     int get_max_seq_len() const { return max_seq_len; }
 
+    void clear() {
+        std::fill(k_cache.begin(), k_cache.end(), 0.0f);
+        std::fill(v_cache.begin(), v_cache.end(), 0.0f);
+    }
+
 private:
     int num_layers;
     int max_seq_len;

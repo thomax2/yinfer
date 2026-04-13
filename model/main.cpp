@@ -11,17 +11,20 @@ using namespace llm_engine;
 // 全局 Tokenizer 指针
 std::shared_ptr<GptEncoding> tokenizer;
 
-// 真实的 Encode：将用户输入转换为 Token ID 数组
 std::vector<int> real_encode(const std::string& text) {
-    // 💡 关键技巧：Qwen 是经过 ChatML 格式微调的模型。
-    // 如果直接输入 "你好"，它可能会无意义地续写。
-    // 我们必须把它包装成对话格式，告诉它这是用户的提问，并让助手准备回答。
     std::string prompt = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
     
-    // 使用 cpp-tiktoken 进行真实分词
-    // 注意：有些 tiktoken 实现默认不允许解析特殊 Token，
-    // 如果报错，可以退回直接 return tokenizer->encode(text);
-    return tokenizer->encode(prompt);
+    // 1. 定义一个集合，显式列出你允许模型处理的特殊 Token
+    std::unordered_set<std::string> allowed_special_tokens;
+    allowed_special_tokens.insert("<|im_start|>");
+    allowed_special_tokens.insert("<|im_end|>");
+
+    // 2. 定义一个空的禁用集合
+    // 注意：根据你提供的源码，只要这里面不包含 "all"，就不会因为发现特殊 Token 而报错
+    std::unordered_set<std::string> disallowed_special_tokens;
+
+    // 3. 传入这两个集合
+    return tokenizer->encode(prompt, allowed_special_tokens, disallowed_special_tokens);
 }
 
 // 真实的 Decode：将模型输出的单个 Token ID 解码为人类语言
