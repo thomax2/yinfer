@@ -72,6 +72,10 @@ int main(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
 
+
+    bool is_first_turn = true;
+    model.clear_history(); // 初始化时清空一次
+
     std::cout << "=========================================" << std::endl;
     std::cout << "🚀 欢迎使用 Qwen-0.5B CPU 极速推理引擎！" << std::endl;
     std::cout << "✅ 真实 Tokenizer (cpp-tiktoken) 已成功接入。" << std::endl;
@@ -88,8 +92,15 @@ int main(int argc, const char** argv) {
             std::cout << "Bye!" << std::endl;
             break;
         }
-
         if (input.empty()) continue;
+
+        // 【如果用户输入 clear，手动清空记忆】
+        if (input == "clear") {
+            model.clear_history();
+            is_first_turn = true;
+            std::cout << "[System] History cleared." << std::endl;
+            continue;
+        }
 
         // 【真实编码】：将中文文字转成机器看得懂的 Token 数组
         std::vector<int> input_tokens = real_encode(input);

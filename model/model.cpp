@@ -290,18 +290,24 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
 
     // // 1. 初始化属于这一次对话的 KV Cache
     // KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
-    // ✅ 只清空内容，地址不变！
-    kv_cache->clear();
     
-    int pos = 0;
+    // ✅ 只清空内容，地址不变！
+    // kv_cache->clear();
+    // int pos = 0;
+
+    // 【新增安全检查】：如果内存快满了，必须清空，否则会越界崩溃 (Segfault)
+    if (history_pos + input_tokens.size() + max_new_tokens >= (config.max_seq_len * 0.9)) {
+        std::cout << "\n[Warning] Context limit reached. Clearing history..." << std::endl;
+        clear_history();
+    }
 
     // ==========================================
     // 阶段 A：Prefill（预填充阶段）
     // ==========================================
     // 将前面的 Token 逐个喂给模型，累积 KV Cache，但不需要它们的输出
     for (size_t i = 0; i < input_tokens.size() - 1; ++i) {
-        forward(input_tokens[i], pos, *kv_cache);
-        pos++;
+        forward(input_tokens[i], history_pos, *kv_cache);
+        history_pos++; // 每次 forward 后全局指针 +1
     }
 
     // ==========================================
@@ -312,18 +318,17 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
 
     for (int i = 0; i < max_new_tokens; ++i) {
         // 推理出下一个词
-        int next_token = forward(current_token, pos, *kv_cache);
-        pos++;
-
+        int next_token = forward(current_token, history_pos, *kv_cache);
+        history_pos++; // 模型自己生成的 Token 也会顺延存入 KV Cache
+        
         // 将生成的词通过回调函数送回前端（比如打印到屏幕）
         // 如果回调函数返回 false，则提前终止生成（可用于实现用户强行打断）
-        if (!callback(next_token)) {
-            break;
-        }
+        if (!callback(next_token)) break;
 
-        // 检查是否遇到了 Qwen 的对话结束符 (通常是 151645 <|im_end|>)
+        // 遇到结束符，停止生成
         if (next_token == 151645 || next_token == 151643) {
-            break;
+            // 注意：结束符我们不送入下一次 forward，直接打断
+            break; 
         }
 
         // 把刚生成的词变成下一次的输入

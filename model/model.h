@@ -20,7 +20,7 @@ struct QwenConfig {
     int head_dim = 64;
     int vocab_size = 151936; 
     float rms_norm_eps = 1e-6;
-    int max_seq_len = 2048; // 你支持的最大上下文长度
+    int max_seq_len = 8192; // 你支持的最大上下文长度
 };
 
 // 单个 Block 的权重容器
@@ -78,6 +78,15 @@ public:
 
     // ========== 关键修改1：使用智能指针管理 KV Cache ==========
     std::unique_ptr<KVCache> kv_cache;
+
+    // 【新增】：全局历史位置追踪
+    int history_pos = 0; 
+    
+    // 【新增】：提供一个手动清空记忆的接口
+    void clear_history() {
+        if (kv_cache) kv_cache->clear();
+        history_pos = 0;
+    }
 
     QwenModel(const QwenConfig& cfg);
     ~QwenModel();
