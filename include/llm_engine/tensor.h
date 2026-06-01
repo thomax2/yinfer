@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <numeric>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 

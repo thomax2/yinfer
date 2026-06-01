@@ -1,10 +1,12 @@
 #include "model.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
+#include "backends/cpu/arm_neon/pack.h"
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 namespace llm_engine {
 
@@ -26,6 +28,29 @@ void QwenModel::allocate_weight(Tensor& t, const std::vector<int>& shape) {
     // 调用 Tensor.h 中现成的外部指针构造函数
     // 此时 Tensor 的 owns_data 自动为 false，不会触发 g_memory_pool 的析构
     t = Tensor(shape, ptr, DataType::FP32);
+}
+
+void QwenModel::allocate_packed_weight(Tensor& t, int K, int N) {
+    int np = (N + arm_neon::NR - 1) / arm_neon::NR;
+    allocate_weight(t, {np, K, arm_neon::NR});
+}
+
+void QwenModel::prepack_all_weights() {
+    int q_out_dim = config.num_q_heads * config.head_dim;
+    int kv_out_dim = config.num_kv_heads * config.head_dim;
+
+    for (auto& layer : layers) {
+        arm_neon::pack_weight_for_linear_decode(layer.w_q.ptr<float>(), layer.w_q_pack.ptr<float>(), config.hidden_dim, q_out_dim);
+        arm_neon::pack_weight_for_linear_decode(layer.w_k.ptr<float>(), layer.w_k_pack.ptr<float>(), config.hidden_dim, kv_out_dim);
+        arm_neon::pack_weight_for_linear_decode(layer.w_v.ptr<float>(), layer.w_v_pack.ptr<float>(), config.hidden_dim, kv_out_dim);
+        arm_neon::pack_weight_for_linear_decode(layer.w_o.ptr<float>(), layer.w_o_pack.ptr<float>(), q_out_dim, config.hidden_dim);
+
+        arm_neon::pack_weight_for_linear_decode(layer.w_gate.ptr<float>(), layer.w_gate_pack.ptr<float>(), config.hidden_dim, config.intermediate_size);
+        arm_neon::pack_weight_for_linear_decode(layer.w_up.ptr<float>(), layer.w_up_pack.ptr<float>(), config.hidden_dim, config.intermediate_size);
+        arm_neon::pack_weight_for_linear_decode(layer.w_down.ptr<float>(), layer.w_down_pack.ptr<float>(), config.intermediate_size, config.hidden_dim);
+    }
+
+    arm_neon::pack_weight_for_linear_decode(lm_head_w.ptr<float>(), lm_head_pack.ptr<float>(), config.hidden_dim, config.vocab_size);
 }
 
 // --- 构造函数：根据配置构建完整的模型骨架 ---
@@ -56,6 +81,11 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
         allocate_weight(layer.w_v, {config.hidden_dim, config.num_kv_heads * config.head_dim});
         allocate_weight(layer.w_o, {config.num_q_heads * config.head_dim, config.hidden_dim});
 
+        allocate_packed_weight(layer.w_q_pack, config.hidden_dim, config.num_q_heads * config.head_dim);
+        allocate_packed_weight(layer.w_k_pack, config.hidden_dim, config.num_kv_heads * config.head_dim);
+        allocate_packed_weight(layer.w_v_pack, config.hidden_dim, config.num_kv_heads * config.head_dim);
+        allocate_packed_weight(layer.w_o_pack, config.num_q_heads * config.head_dim, config.hidden_dim);
+
         // Bias 是一维的
         allocate_weight(layer.b_q, {config.num_q_heads * config.head_dim});
         allocate_weight(layer.b_k, {config.num_kv_heads * config.head_dim});
@@ -67,6 +97,10 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
         allocate_weight(layer.w_gate, {config.hidden_dim, config.intermediate_size});
         allocate_weight(layer.w_up, {config.hidden_dim, config.intermediate_size});
         allocate_weight(layer.w_down, {config.intermediate_size, config.hidden_dim});
+
+        allocate_packed_weight(layer.w_gate_pack, config.hidden_dim, config.intermediate_size);
+        allocate_packed_weight(layer.w_up_pack, config.hidden_dim, config.intermediate_size);
+        allocate_packed_weight(layer.w_down_pack, config.intermediate_size, config.hidden_dim);
     }
 
     // 2. 最后的输出层
@@ -75,6 +109,7 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
 
     // 新增：给 lm_head_w_T 分配内存，形状是 [N, K] = [vocab_size, hidden_dim]
     allocate_weight(lm_head_w_T, {config.vocab_size, config.hidden_dim});
+    allocate_packed_weight(lm_head_pack, config.hidden_dim, config.vocab_size);
 
     // 初始化 RoPE 查表缓存，确保图边界张量 t_cos/t_sin 绑定到有效内存
     init_rope_cache();
@@ -145,6 +180,8 @@ bool QwenModel::load_weights(const std::string& weights_dir) {
     if (!load_tensor_from_bin(weights_dir + "/lm_head_w.bin", lm_head_w)) return false;
     
     if (!load_tensor_from_bin(weights_dir + "/lm_head_w_T.bin", lm_head_w_T)) return false;
+
+    prepack_all_weights();
     
     std::cout << "所有权重加载成功！" << std::endl;
     return true;
@@ -221,10 +258,12 @@ void QwenModel::build_graph(KVCache& kv_cache) {
             t_hidden_states, 
             &layer.norm1_w, 
             &layer.w_q, &layer.w_k, &layer.w_v, &layer.w_o,
+            &layer.w_q_pack, &layer.w_k_pack, &layer.w_v_pack, &layer.w_o_pack,
             &layer.b_q, &layer.b_k, &layer.b_v,
             t_cos, t_sin,
             &layer.norm2_w, 
             &layer.w_gate, &layer.w_up, &layer.w_down,
+            &layer.w_gate_pack, &layer.w_up_pack, &layer.w_down_pack,
             &kv_cache, i, &current_pos, // 传入 current_pos 的指针
             attn_cfg, ffn_cfg, config.rms_norm_eps
         );

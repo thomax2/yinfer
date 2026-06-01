@@ -124,6 +124,46 @@ Status RoPENode::forward() {
 QwenBlockNode::QwenBlockNode(
     Tensor* hidden_states, Tensor* norm1_weight,
     Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+    Tensor* w_q_pack, Tensor* w_k_pack, Tensor* w_v_pack, Tensor* w_o_pack,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+    Tensor* w_gate_pack, Tensor* w_up_pack, Tensor* w_down_pack,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps)
+    : kv_cache(cache), layer_id(l_id), current_pos_ptr(pos_ptr),
+      attn_config(a_conf), ffn_config(f_conf), rms_norm_eps(eps)
+{
+    inputs.push_back(hidden_states);
+    inputs.push_back(norm1_weight);
+    inputs.push_back(w_q);
+    inputs.push_back(w_k);
+    inputs.push_back(w_v);
+    inputs.push_back(w_o);
+    inputs.push_back(w_q_pack);
+    inputs.push_back(w_k_pack);
+    inputs.push_back(w_v_pack);
+    inputs.push_back(w_o_pack);
+    inputs.push_back(b_q);
+    inputs.push_back(b_k);
+    inputs.push_back(b_v);
+    inputs.push_back(cos);
+    inputs.push_back(sin);
+    inputs.push_back(norm2_weight);
+    inputs.push_back(w_gate);
+    inputs.push_back(w_up);
+    inputs.push_back(w_down);
+    inputs.push_back(w_gate_pack);
+    inputs.push_back(w_up_pack);
+    inputs.push_back(w_down_pack);
+
+    outputs.push_back(hidden_states);
+}
+
+QwenBlockNode::QwenBlockNode(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
     Tensor* b_q, Tensor* b_k, Tensor* b_v,
     Tensor* cos, Tensor* sin,
     Tensor* norm2_weight,
@@ -159,10 +199,27 @@ Status QwenBlockNode::forward() {
     Tensor* hidden_states = inputs[0];
     Tensor* norm1_weight  = inputs[1];
     Tensor* w_q = inputs[2]; Tensor* w_k = inputs[3]; Tensor* w_v = inputs[4]; Tensor* w_o = inputs[5];
-    Tensor* b_q = inputs[6]; Tensor* b_k = inputs[7]; Tensor* b_v = inputs[8];
-    Tensor* cos = inputs[9]; Tensor* sin = inputs[10];
-    Tensor* norm2_weight  = inputs[11];
-    Tensor* w_gate = inputs[12]; Tensor* w_up = inputs[13]; Tensor* w_down = inputs[14];
+    Tensor* w_q_pack = nullptr; Tensor* w_k_pack = nullptr; Tensor* w_v_pack = nullptr; Tensor* w_o_pack = nullptr;
+    Tensor* b_q = nullptr; Tensor* b_k = nullptr; Tensor* b_v = nullptr;
+    Tensor* cos = nullptr; Tensor* sin = nullptr;
+    Tensor* norm2_weight  = nullptr;
+    Tensor* w_gate = nullptr; Tensor* w_up = nullptr; Tensor* w_down = nullptr;
+    Tensor* w_gate_pack = nullptr; Tensor* w_up_pack = nullptr; Tensor* w_down_pack = nullptr;
+
+    bool has_packed_weights = inputs.size() >= 22;
+    if (has_packed_weights) {
+        w_q_pack = inputs[6]; w_k_pack = inputs[7]; w_v_pack = inputs[8]; w_o_pack = inputs[9];
+        b_q = inputs[10]; b_k = inputs[11]; b_v = inputs[12];
+        cos = inputs[13]; sin = inputs[14];
+        norm2_weight = inputs[15];
+        w_gate = inputs[16]; w_up = inputs[17]; w_down = inputs[18];
+        w_gate_pack = inputs[19]; w_up_pack = inputs[20]; w_down_pack = inputs[21];
+    } else {
+        b_q = inputs[6]; b_k = inputs[7]; b_v = inputs[8];
+        cos = inputs[9]; sin = inputs[10];
+        norm2_weight = inputs[11];
+        w_gate = inputs[12]; w_up = inputs[13]; w_down = inputs[14];
+    }
 
     int num_tokens = hidden_states->shape[0];
     int hidden_dim = hidden_states->shape[1];
@@ -193,18 +250,37 @@ Status QwenBlockNode::forward() {
     // ==========================================
     // 4. 调用后端的纯数学计算算子
     // ==========================================
-    Status status = arm_neon::qwen_block_neon(
-        *hidden_states, *norm1_weight,
-        *w_q, *w_k, *w_v, *w_o,
-        b_q->ptr<float>(), b_k->ptr<float>(), b_v->ptr<float>(), // 传入 QKV Bias
-        cos->ptr<float>(), sin->ptr<float>(),
-        *norm2_weight, *w_gate, *w_up, *w_down,
-        *kv_cache, 
-        layer_id, 
-        *current_pos_ptr, // 💡 解引用指针，拿到当前的最新的生成位置
-        attn_config, ffn_config, rms_norm_eps, 
-        temp_workspace
-    );
+    Status status = Status::SUCCESS;
+    if (has_packed_weights) {
+        status = arm_neon::qwen_block_neon(
+            *hidden_states, *norm1_weight,
+            *w_q, *w_k, *w_v, *w_o,
+            *w_q_pack, *w_k_pack, *w_v_pack, *w_o_pack,
+            b_q->ptr<float>(), b_k->ptr<float>(), b_v->ptr<float>(),
+            cos->ptr<float>(), sin->ptr<float>(),
+            *norm2_weight,
+            *w_gate, *w_up, *w_down,
+            *w_gate_pack, *w_up_pack, *w_down_pack,
+            *kv_cache,
+            layer_id,
+            *current_pos_ptr,
+            attn_config, ffn_config, rms_norm_eps,
+            temp_workspace
+        );
+    } else {
+        status = arm_neon::qwen_block_neon(
+            *hidden_states, *norm1_weight,
+            *w_q, *w_k, *w_v, *w_o,
+            b_q->ptr<float>(), b_k->ptr<float>(), b_v->ptr<float>(),
+            cos->ptr<float>(), sin->ptr<float>(),
+            *norm2_weight, *w_gate, *w_up, *w_down,
+            *kv_cache,
+            layer_id,
+            *current_pos_ptr,
+            attn_config, ffn_config, rms_norm_eps,
+            temp_workspace
+        );
+    }
 
     // ==========================================
     // 5. 立即释放内存（完璧归赵）
@@ -285,6 +361,32 @@ RoPENode* ComputationGraph::add_rope(Tensor* X,
     return static_cast<RoPENode*>(nodes.back().get());
 }
 
+
+QwenBlockNode* ComputationGraph::add_qwen_block(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+    Tensor* w_q_pack, Tensor* w_k_pack, Tensor* w_v_pack, Tensor* w_o_pack,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+    Tensor* w_gate_pack, Tensor* w_up_pack, Tensor* w_down_pack,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
+) {
+    nodes.push_back(std::make_unique<QwenBlockNode>(
+        hidden_states, norm1_weight,
+        w_q, w_k, w_v, w_o,
+        w_q_pack, w_k_pack, w_v_pack, w_o_pack,
+        b_q, b_k, b_v,
+        cos, sin, norm2_weight,
+        w_gate, w_up, w_down,
+        w_gate_pack, w_up_pack, w_down_pack,
+        cache, l_id, pos_ptr, a_conf, f_conf, eps
+    ));
+
+    return static_cast<QwenBlockNode*>(nodes.back().get());
+}
 
 QwenBlockNode* ComputationGraph::add_qwen_block(
     Tensor* hidden_states, Tensor* norm1_weight,

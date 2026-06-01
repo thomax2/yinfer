@@ -18,9 +18,18 @@ Status matmul_neon(
 );
 
 Status gemv_neon_transposed(
-    const Tensor& A,   // 形状 [1, K]
-    const Tensor& B_T, // 形状 [N, K] (预转置，无需Pack)
-    Tensor& C,         // 形状 [1, N]
+    const Tensor& A,
+    const Tensor& B_T,
+    Tensor& C,
+    const float* bias = nullptr
+);
+
+Status linear_decode_prepacked_neon(
+    const float* x,
+    const float* w_pack,
+    float* y,
+    int K,
+    int N,
     const float* bias = nullptr
 );
 
@@ -73,11 +82,25 @@ struct AttentionConfig {
 };
 
 Status attention_neon(
-    const Tensor& hidden_states, 
-    Tensor& attn_output,         
-    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o, 
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const Tensor& w_q_pack, const Tensor& w_k_pack, const Tensor& w_v_pack, const Tensor& w_o_pack,
     const float* q_bias, const float* k_bias, const float* v_bias,
-    const float* cos_ptr, const float* sin_ptr, 
+    const float* cos_ptr, const float* sin_ptr,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+);
+
+Status attention_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* cos_ptr, const float* sin_ptr,
     KVCache& kv_cache,
     int layer_id,
     int current_pos,
@@ -91,24 +114,54 @@ struct FFNConfig {
 };
 
 Status ffn_neon(
-    const Tensor& hidden_states, 
-    Tensor& ffn_output,          
-    const Tensor& w_gate,        
-    const Tensor& w_up,          
-    const Tensor& w_down,        
-    const FFNConfig& config,     
+    const Tensor& hidden_states,
+    Tensor& ffn_output,
+    const Tensor& w_gate,
+    const Tensor& w_up,
+    const Tensor& w_down,
+    const Tensor& w_gate_pack,
+    const Tensor& w_up_pack,
+    const Tensor& w_down_pack,
+    const FFNConfig& config,
+    Workspace& workspace
+);
+
+Status ffn_neon(
+    const Tensor& hidden_states,
+    Tensor& ffn_output,
+    const Tensor& w_gate,
+    const Tensor& w_up,
+    const Tensor& w_down,
+    const FFNConfig& config,
     Workspace& workspace
 );
 
 Status qwen_block_neon(
-    Tensor& hidden_states,       // 输入并作为最终输出 (In-place)
-    const Tensor& norm1_weight,  // Attention 前的 RMSNorm 权重
-    // Attention 参数
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const Tensor& w_q_pack, const Tensor& w_k_pack, const Tensor& w_v_pack, const Tensor& w_o_pack,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* cos_ptr, const float* sin_ptr,
+    const Tensor& norm2_weight,
+    const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down,
+    const Tensor& w_gate_pack, const Tensor& w_up_pack, const Tensor& w_down_pack,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& attn_config,
+    const FFNConfig& ffn_config,
+    float rms_norm_eps,
+    Workspace& workspace
+);
+
+Status qwen_block_neon(
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
     const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
     const float* q_bias, const float* k_bias, const float* v_bias,
     const float* cos_ptr, const float* sin_ptr,
-    const Tensor& norm2_weight,  // FFN 前的 RMSNorm 权重
-    // FFN 参数 (Qwen2.5 的 FFN 是无 Bias 的)
+    const Tensor& norm2_weight,
     const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down,
     KVCache& kv_cache,
     int layer_id,

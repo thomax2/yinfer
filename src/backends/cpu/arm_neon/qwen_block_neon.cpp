@@ -11,11 +11,13 @@ Status qwen_block_neon(
     const Tensor& norm1_weight,  // Attention 前的 RMSNorm 权重
     // Attention 参数
     const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const Tensor& w_q_pack, const Tensor& w_k_pack, const Tensor& w_v_pack, const Tensor& w_o_pack,
     const float* q_bias, const float* k_bias, const float* v_bias,  // ✅ 新增 QKV Bias
     const float* cos_ptr, const float* sin_ptr,
     const Tensor& norm2_weight,  // FFN 前的 RMSNorm 权重
     // FFN 参数 (Qwen2.5 的 FFN 是无 Bias 的)
     const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down,
+    const Tensor& w_gate_pack, const Tensor& w_up_pack, const Tensor& w_down_pack,
     KVCache& kv_cache,
     int layer_id,
     int current_pos,
@@ -75,6 +77,7 @@ Status qwen_block_neon(
     Status status = attention_neon(
         norm_out, hidden_states, 
         w_q, w_k, w_v, w_o,
+        w_q_pack, w_k_pack, w_v_pack, w_o_pack,
         q_bias, k_bias, v_bias,
         cos_ptr, sin_ptr, 
         kv_cache, layer_id, current_pos, attn_config,
@@ -110,6 +113,7 @@ Status qwen_block_neon(
     status = ffn_neon(
         norm_out, hidden_states,
         w_gate, w_up, w_down,
+        w_gate_pack, w_up_pack, w_down_pack,
         ffn_config,
         sub_workspace
     );
@@ -121,6 +125,38 @@ Status qwen_block_neon(
     add_neon(residual, hidden_states, hidden_states);
 
     return Status::SUCCESS;
+}
+
+Status qwen_block_neon(
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* cos_ptr, const float* sin_ptr,
+    const Tensor& norm2_weight,
+    const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& attn_config,
+    const FFNConfig& ffn_config,
+    float rms_norm_eps,
+    Workspace& workspace
+) {
+    Tensor empty;
+    return qwen_block_neon(
+        hidden_states, norm1_weight,
+        w_q, w_k, w_v, w_o,
+        empty, empty, empty, empty,
+        q_bias, k_bias, v_bias,
+        cos_ptr, sin_ptr,
+        norm2_weight,
+        w_gate, w_up, w_down,
+        empty, empty, empty,
+        kv_cache, layer_id, current_pos,
+        attn_config, ffn_config, rms_norm_eps,
+        workspace
+    );
 }
 
 } // namespace arm_neon

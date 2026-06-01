@@ -75,6 +75,24 @@ public:
         Tensor* hidden_states,
         Tensor* norm1_weight,
         Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+        Tensor* w_q_pack, Tensor* w_k_pack, Tensor* w_v_pack, Tensor* w_o_pack,
+        Tensor* b_q, Tensor* b_k, Tensor* b_v,
+        Tensor* cos, Tensor* sin,
+        Tensor* norm2_weight,
+        Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+        Tensor* w_gate_pack, Tensor* w_up_pack, Tensor* w_down_pack,
+        KVCache* cache,
+        int l_id,
+        int* pos_ptr,
+        arm_neon::AttentionConfig a_conf,
+        arm_neon::FFNConfig f_conf,
+        float eps
+    );
+
+    QwenBlockNode(
+        Tensor* hidden_states,
+        Tensor* norm1_weight,
+        Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
         Tensor* b_q, Tensor* b_k, Tensor* b_v,
         Tensor* cos, Tensor* sin,
         Tensor* norm2_weight,
@@ -133,6 +151,19 @@ public:
     SwiGLUNode*     add_swiglu(Tensor* Gate, Tensor* Up, Tensor* Y);
     RoPENode*       add_rope(Tensor* X, Tensor* Cos, Tensor* Sin);
     
+    QwenBlockNode* add_qwen_block(
+        Tensor* hidden_states, Tensor* norm1_weight,
+        Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
+        Tensor* w_q_pack, Tensor* w_k_pack, Tensor* w_v_pack, Tensor* w_o_pack,
+        Tensor* b_q, Tensor* b_k, Tensor* b_v,
+        Tensor* cos, Tensor* sin,
+        Tensor* norm2_weight,
+        Tensor* w_gate, Tensor* w_up, Tensor* w_down,
+        Tensor* w_gate_pack, Tensor* w_up_pack, Tensor* w_down_pack,
+        KVCache* cache, int l_id, int* pos_ptr,
+        arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
+    );
+
     QwenBlockNode* add_qwen_block(
         Tensor* hidden_states, Tensor* norm1_weight,
         Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,

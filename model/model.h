@@ -29,6 +29,8 @@ struct QwenBlockWeights {
     Tensor w_q, w_k, w_v, w_o;
     Tensor b_q, b_k, b_v;
     Tensor w_gate, w_up, w_down;
+    Tensor w_q_pack, w_k_pack, w_v_pack, w_o_pack;
+    Tensor w_gate_pack, w_up_pack, w_down_pack;
 };
 
 class QwenModel {
@@ -45,6 +47,7 @@ public:
     Tensor final_norm_w;
     Tensor lm_head_w;
     Tensor lm_head_w_T;     // 新增：[N, K] 专供 decode 阶段的 GEMV 极速版使用！
+    Tensor lm_head_pack;
 
     // RoPE 查表缓存
     Tensor cos_cache;
@@ -111,6 +114,8 @@ public:
 private:
     // 内部辅助函数：分配固定内存并绑定给 Tensor
     void allocate_weight(Tensor& t, const std::vector<int>& shape);
+    void allocate_packed_weight(Tensor& t, int K, int N);
+    void prepack_all_weights();
     // 内部辅助函数：读取二进制文件
     bool load_tensor_from_bin(const std::string& filepath, Tensor& tensor);
     void init_rope_cache();

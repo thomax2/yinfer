@@ -26,6 +26,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
     list(APPEND LLM_ENGINE_SOURCES
         src/backends/cpu/arm_neon/pack.cpp
         src/backends/cpu/arm_neon/gemm_kernel_8x12_neon.cpp
+        src/backends/cpu/arm_neon/linear_decode_neon.cpp
         src/backends/cpu/arm_neon/neon_ops.cpp
         src/backends/cpu/arm_neon/softmax_neon.cpp
         src/backends/cpu/arm_neon/attention_neon.cpp

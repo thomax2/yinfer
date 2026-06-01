@@ -13,6 +13,7 @@ Status attention_neon(
     const Tensor& hidden_states, // [1, hidden_dim]
     Tensor& attn_output,         // [1, hidden_dim]
     const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const Tensor& w_q_pack, const Tensor& w_k_pack, const Tensor& w_v_pack, const Tensor& w_o_pack,
     const float* q_bias, const float* k_bias, const float* v_bias,
     const float* cos_ptr, const float* sin_ptr, 
     KVCache& kv_cache,
@@ -100,9 +101,29 @@ Status attention_neon(
     // ==========================================
     // 1 & 2. QKV 投影与 RoPE
     // ==========================================
-    matmul_neon(hidden_states, w_q, Q_proj, matmul_ws_ptr, false, q_bias);
-    matmul_neon(hidden_states, w_k, K_proj, matmul_ws_ptr, false, k_bias);
-    matmul_neon(hidden_states, w_v, V_proj, matmul_ws_ptr, false, v_bias);
+    if (num_tokens == 1 && w_q_pack.data && w_k_pack.data && w_v_pack.data) {
+        Status status = linear_decode_prepacked_neon(
+            hidden_states.ptr<float>(), w_q_pack.ptr<float>(), q_proj_ptr,
+            hidden_dim, q_size, q_bias
+        );
+        if (status != Status::SUCCESS) return status;
+
+        status = linear_decode_prepacked_neon(
+            hidden_states.ptr<float>(), w_k_pack.ptr<float>(), k_proj_ptr,
+            hidden_dim, k_size, k_bias
+        );
+        if (status != Status::SUCCESS) return status;
+
+        status = linear_decode_prepacked_neon(
+            hidden_states.ptr<float>(), w_v_pack.ptr<float>(), v_proj_ptr,
+            hidden_dim, v_size, v_bias
+        );
+        if (status != Status::SUCCESS) return status;
+    } else {
+        matmul_neon(hidden_states, w_q, Q_proj, matmul_ws_ptr, false, q_bias);
+        matmul_neon(hidden_states, w_k, K_proj, matmul_ws_ptr, false, k_bias);
+        matmul_neon(hidden_states, w_v, V_proj, matmul_ws_ptr, false, v_bias);
+    }
 
     // rope_neon(q_proj_ptr, cos_ptr, sin_ptr, q_size);
     // rope_neon(k_proj_ptr, cos_ptr, sin_ptr, k_size);
@@ -180,9 +201,40 @@ Status attention_neon(
     // ==========================================
     // 5. 最终输出投影
     // ==========================================
-    matmul_neon(Attn_Out_Buf, w_o, attn_output, matmul_ws_ptr, false, nullptr);
+    if (num_tokens == 1 && w_o_pack.data) {
+        Status status = linear_decode_prepacked_neon(
+            attn_out_ptr, w_o_pack.ptr<float>(), attn_output.ptr<float>(),
+            q_size, hidden_dim, nullptr
+        );
+        if (status != Status::SUCCESS) return status;
+    } else {
+        matmul_neon(Attn_Out_Buf, w_o, attn_output, matmul_ws_ptr, false, nullptr);
+    }
 
     return Status::SUCCESS;
+}
+
+Status attention_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const Tensor& w_q, const Tensor& w_k, const Tensor& w_v, const Tensor& w_o,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* cos_ptr, const float* sin_ptr,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+) {
+    Tensor empty;
+    return attention_neon(
+        hidden_states, attn_output,
+        w_q, w_k, w_v, w_o,
+        empty, empty, empty, empty,
+        q_bias, k_bias, v_bias,
+        cos_ptr, sin_ptr,
+        kv_cache, layer_id, current_pos, config, workspace
+    );
 }
 
 } // namespace arm_neon

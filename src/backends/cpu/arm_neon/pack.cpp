@@ -120,6 +120,15 @@ void pack_B_trans(
     }
 }
 
+void pack_weight_for_linear_decode(
+    const float* W,
+    float* W_pack,
+    int K,
+    int N
+) {
+    pack_B(W, W_pack, K, N, N);
+}
+
 }
 
 

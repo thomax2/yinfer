@@ -38,5 +38,12 @@ void pack_B_trans(
     int ldb
 );
 
+void pack_weight_for_linear_decode(
+    const float* W,
+    float* W_pack,
+    int K,
+    int N
+);
+
 }
 }
