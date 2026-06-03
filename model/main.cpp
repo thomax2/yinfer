@@ -14,7 +14,11 @@ std::shared_ptr<GptEncoding> tokenizer;
 
 
 std::vector<int> real_encode(const std::string& text) {
-    std::string prompt = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    // 前导 \n 是为了在多轮拼接时形成正确的 ChatML 边界：
+    // 上一轮模型刚把 <|im_end|> 写进 KV 缓存，本轮拼上 "\n<|im_start|>user..." 后，
+    // 整段 KV 序列就是 "...<|im_end|>\n<|im_start|>user\n..."，与训练格式一致。
+    // 第一轮多出来一个前导换行，对 Qwen2.5 来说是无伤大雅的扰动。
+    std::string prompt = "\n<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
     
     // 1. 定义一个集合，显式列出你允许模型处理的特殊 Token
     std::unordered_set<std::string> allowed_special_tokens;
@@ -96,11 +100,11 @@ int main(int argc, const char** argv) {
         
         std::cout << "Qwen: " << std::flush; 
         
-        // 【生成】：调用模型的 generate 进行推演 (建议把最大生成长度调大一点，比如 200)
+        // 【生成】：调用模型的 generate 进行推演
         int token_count = 0;
         auto start = std::chrono::steady_clock::now();
 
-        model.generate(input_tokens, 200, [&](int token_id) {
+        model.generate(input_tokens, 512, [&](int token_id) {
             // 【真实流式解码】：每当模型算出一个新 ID，立刻解码成中文打印到屏幕！
             std::cout << real_decode(token_id) << std::flush;
             token_count++;

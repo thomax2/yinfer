@@ -129,7 +129,7 @@ Status linear_decode_prepacked_parallel_neon(
     // 线程池不可用，或者输出维度太小，不值得并行
     if (g_thread_pool == nullptr ||
         g_thread_pool->num_threads() <= 1 ||
-        N < 1024) {
+        N < 8192) {
         return linear_decode_prepacked_neon(x, w_pack, y, K, N, bias);
     }
 

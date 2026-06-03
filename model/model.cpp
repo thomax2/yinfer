@@ -392,25 +392,50 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
     // 拿出 Prompt 的最后一个词
     int current_token = input_tokens.back();
 
+    // assistant 段必须以 <|im_end|> 闭合，否则下一轮 prompt 拼接出来的是格式破损的
+    // ChatML，0.5B 这种小模型会被拽回旧 assistant 上下文，出现复读。
+    // 三条退出路径（自然 EOS / 回调中断 / 跑满 max_new_tokens）都要把闭合符写进 KV 缓存。
+    constexpr int IM_END_ID = 151645;
+    constexpr int EOT_ID    = 151643;
+
+    auto inject_im_end = [&]() {
+        if (history_pos >= config.max_seq_len) return;
+        forward(IM_END_ID, history_pos, *kv_cache);
+        history_pos++;
+    };
+
     for (int i = 0; i < max_new_tokens; ++i) {
         // 推理出下一个词
         int next_token = forward(current_token, history_pos, *kv_cache);
         history_pos++; // 模型自己生成的 Token 也会顺延存入 KV Cache
-        
-        // 遇到结束符，停止生成
-        if (next_token == 151645 || next_token == 151643) {
-            // 注意：结束符我们不送入下一次 forward，直接打断
-            break; 
+
+        // 遇到结束符：把它自己也喂回 forward 一次，让 KV 缓存里真的存有 <|im_end|>，
+        // 否则下一轮 prompt 拼到一段没有闭合的 assistant 后面，会复读上一轮内容。
+        if (next_token == IM_END_ID || next_token == EOT_ID) {
+            if (next_token == IM_END_ID) {
+                inject_im_end();
+            } else {
+                if (history_pos < config.max_seq_len) {
+                    forward(next_token, history_pos, *kv_cache);
+                    history_pos++;
+                }
+            }
+            return;
         }
 
         // 将生成的词通过回调函数送回前端（比如打印到屏幕）
         // 如果回调函数返回 false，则提前终止生成（可用于实现用户强行打断）
-        if (!callback(next_token)) break;
-
+        if (!callback(next_token)) {
+            inject_im_end();
+            return;
+        }
 
         // 把刚生成的词变成下一次的输入
         current_token = next_token;
     }
+
+    // 跑满 max_new_tokens 也没遇到 EOS：手动追加 <|im_end|>，给本轮 assistant 段封口。
+    inject_im_end();
 }
 
 
