@@ -72,6 +72,32 @@ ArgmaxResult linear_decode_prepacked_argmax_parallel_neon(
     int N
 );
 
+// FFN 专用：在 [panel_begin, panel_end) 范围内同时计算 gate / up，
+// 并 fused 完成 SwiGLU。y[i] = silu(gate[i]) * up[i]。
+// w_gate_pack / w_up_pack 与 linear_decode_prepacked_neon 使用同一种 packed 布局。
+// 不申请内存、不使用线程池、不访问 g_memory_pool。
+Status fused_gate_up_swiglu_prepacked_range_neon(
+    const float* x,
+    const float* w_gate_pack,
+    const float* w_up_pack,
+    float* y,
+    int K,
+    int N,
+    int panel_begin,
+    int panel_end
+);
+
+// FFN 专用：fused gate+up+SwiGLU 的多线程版本。
+// 当线程池不可用或 N 太小时自动 fallback 串行 range kernel。
+Status fused_gate_up_swiglu_prepacked_parallel_neon(
+    const float* x,
+    const float* w_gate_pack,
+    const float* w_up_pack,
+    float* y,
+    int K,
+    int N
+);
+
 Status bmm_neon(
     const Tensor& A,
     const Tensor& B,

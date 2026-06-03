@@ -118,12 +118,11 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
         allocate_packed_weight(layer.w_down_pack, config.intermediate_size, config.hidden_dim);
     }
 
-    // 2. 最后的输出层
+    // 2. 最后的输出层权重
     allocate_weight(final_norm_w, {config.hidden_dim});
     allocate_weight(lm_head_w, {config.hidden_dim, config.vocab_size}); // 已转置
 
-    // 新增：给 lm_head_w_T 分配内存，形状是 [N, K] = [vocab_size, hidden_dim]
-    allocate_weight(lm_head_w_T, {config.vocab_size, config.hidden_dim});
+    // LM Head 默认走 lm_head_pack + parallel argmax，不再需要 lm_head_w_T。
     allocate_packed_weight(lm_head_pack, config.hidden_dim, config.vocab_size);
 
     // 初始化 RoPE 查表缓存，确保图边界张量 t_cos/t_sin 绑定到有效内存
@@ -197,8 +196,6 @@ bool QwenModel::load_weights(const std::string& weights_dir) {
 
     if (!load_tensor_from_bin(weights_dir + "/final_norm_w.bin", final_norm_w)) return false;
     if (!load_tensor_from_bin(weights_dir + "/lm_head_w.bin", lm_head_w)) return false;
-    
-    if (!load_tensor_from_bin(weights_dir + "/lm_head_w_T.bin", lm_head_w_T)) return false;
 
     prepack_all_weights();
     
@@ -297,8 +294,7 @@ void QwenModel::build_graph(KVCache& kv_cache) {
 
     // 6. 最终的 LM Head 映射
     //    默认走 lm_head_pack + parallel argmax（在 forward 里完成），
-    //    所以 graph 里不再追加 GemvNode；t_logits 和 lm_head_w_T 仅作为 fallback 保留。
-    // graph.add_gemv(t_norm_out, &lm_head_w_T, t_logits);
+    //    所以 graph 里不再追加 GemvNode。lm_head_w_T 已经移除。
 
     // 7. 触发编译器：执行生命周期推断、申请大块 Arena 内存并规划所有临时变量！
     plan = compiler.compile(graph);
@@ -330,28 +326,18 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     CHECK_STATUS(runtime.run(plan));
 
     // 6. LM Head：在图外做，使用 packed 权重 + 并行 fused argmax，
-    //    避免分配/写入完整 logits 数组；如果 packed 权重缺失则回退到老路径。
-    int next_token = 0;
-    if (lm_head_pack.data != nullptr) {
-        auto r = arm_neon::linear_decode_prepacked_argmax_parallel_neon(
-            t_norm_out->ptr<float>(),
-            lm_head_pack.ptr<float>(),
-            config.hidden_dim,
-            config.vocab_size
-        );
-        next_token = r.index;
-    } else {
-        // Fallback：图未生成 logits，这里手算一次普通 GEMV 后再 argmax
-        // （正常路径不会走到这里，留作安全网）
-        float max_val = -1e9f;
-        float* logits_ptr = t_logits->ptr<float>();
-        for (int v = 0; v < config.vocab_size; ++v) {
-            if (logits_ptr[v] > max_val) {
-                max_val = logits_ptr[v];
-                next_token = v;
-            }
-        }
+    //    避免分配/写入完整 logits 数组。lm_head_w_T fallback 已移除。
+    if (lm_head_pack.data == nullptr) {
+        std::cerr << "[ERROR] lm_head_pack is null." << std::endl;
+        return 0;
     }
+    auto r = arm_neon::linear_decode_prepacked_argmax_parallel_neon(
+        t_norm_out->ptr<float>(),
+        lm_head_pack.ptr<float>(),
+        config.hidden_dim,
+        config.vocab_size
+    );
+    int next_token = r.index;
 
     // Note: 传入的 workspace 参数已经不再需要使用了，因为
     // 中间结果 (logits, norm_out) 由 GraphCompiler 的 Arena 接管。

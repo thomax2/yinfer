@@ -59,38 +59,49 @@ Status ffn_neon(
     Tensor Up({num_tokens, intermediate_size}, up_ptr);
 
     Status status = Status::SUCCESS;
-    if (num_tokens == 1 && w_gate_pack.data && w_up_pack.data) {
-        status = linear_decode_prepacked_parallel_neon(
-            hidden_states.ptr<float>(), w_gate_pack.ptr<float>(), gate_ptr,
-            hidden_dim, intermediate_size, nullptr
+
+    // Decode 快速路径：num_tokens == 1 且三个 packed 权重都齐全时，
+    // 走 fused gate+up+SwiGLU + 串行 down。
+    // - fused kernel 在一次 panel 扫描里同时累加 gate/up 并写出 silu(gate)*up，
+    //   省掉一对完整 intermediate 中间向量的写回 + 读回。
+    // - down 的 N=hidden_dim=896，并行收益小，保持串行 packed linear。
+    if (num_tokens == 1 &&
+        w_gate_pack.data &&
+        w_up_pack.data &&
+        w_down_pack.data) {
+
+        status = fused_gate_up_swiglu_prepacked_parallel_neon(
+            hidden_states.ptr<float>(),
+            w_gate_pack.ptr<float>(),
+            w_up_pack.ptr<float>(),
+            gate_ptr,
+            hidden_dim,
+            intermediate_size
         );
         if (status != Status::SUCCESS) return status;
 
-        status = linear_decode_prepacked_parallel_neon(
-            hidden_states.ptr<float>(), w_up_pack.ptr<float>(), up_ptr,
-            hidden_dim, intermediate_size, nullptr
+        status = linear_decode_prepacked_neon(
+            gate_ptr,
+            w_down_pack.ptr<float>(),
+            ffn_output.ptr<float>(),
+            intermediate_size,
+            hidden_dim,
+            nullptr
         );
-        if (status != Status::SUCCESS) return status;
-    } else {
-        status = matmul_neon(hidden_states, w_gate, Gate, matmul_ws_ptr, false, nullptr);
-        if (status != Status::SUCCESS) return status;
-
-        status = matmul_neon(hidden_states, w_up, Up, matmul_ws_ptr, false, nullptr);
-        if (status != Status::SUCCESS) return status;
+        return status;
     }
+
+    // batch / prefill 路径：保持原 matmul + swiglu 实现。
+    status = matmul_neon(hidden_states, w_gate, Gate, matmul_ws_ptr, false, nullptr);
+    if (status != Status::SUCCESS) return status;
+
+    status = matmul_neon(hidden_states, w_up, Up, matmul_ws_ptr, false, nullptr);
+    if (status != Status::SUCCESS) return status;
 
     int total_elements = num_tokens * intermediate_size;
     swiglu_neon(gate_ptr, up_ptr, gate_ptr, total_elements);
 
-    if (num_tokens == 1 && w_down_pack.data) {
-        status = linear_decode_prepacked_parallel_neon(
-            gate_ptr, w_down_pack.ptr<float>(), ffn_output.ptr<float>(),
-            intermediate_size, hidden_dim, nullptr
-        );
-    } else {
-        status = matmul_neon(Gate, w_down, ffn_output, matmul_ws_ptr, false, nullptr);
-    }
-
+    status = matmul_neon(Gate, w_down, ffn_output, matmul_ws_ptr, false, nullptr);
     return status;
 }
 

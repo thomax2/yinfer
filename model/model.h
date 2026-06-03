@@ -48,7 +48,6 @@ public:
     // 2. 最后的输出层权重
     Tensor final_norm_w;
     Tensor lm_head_w;
-    Tensor lm_head_w_T;     // 新增：[N, K] 专供 decode 阶段的 GEMV 极速版使用！
     Tensor lm_head_pack;
 
     // RoPE 查表缓存
