@@ -49,10 +49,16 @@ void ThreadPool::worker_loop() {
         // 执行任务
         (*task.fn)(task.begin, task.end);
 
-        // 完成后递减计数，必要时通知 parallel_for
-        if (task.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // 完成后递减计数，必要时通知 parallel_for。
+        // 必须在持有 done_mu 的情况下递减 remaining：否则一旦 remaining 归零，
+        // 主线程的 wait 谓词可能立即返回并退出 parallel_for，
+        // 导致栈上的 done_mu / done_cv 被析构，
+        // worker 后续再去 lock done_mu 就会访问已析构对象。
+        {
             std::lock_guard<std::mutex> lk(*task.done_mu);
-            task.done_cv->notify_all();
+            if (task.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                task.done_cv->notify_all();
+            }
         }
     }
 }
