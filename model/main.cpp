@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <chrono>
 #include "tiktoken/encoding.h"
 
 using namespace llm_engine;
@@ -96,13 +97,23 @@ int main(int argc, const char** argv) {
         std::cout << "Qwen: " << std::flush; 
         
         // 【生成】：调用模型的 generate 进行推演 (建议把最大生成长度调大一点，比如 200)
-        model.generate(input_tokens, 200, [](int token_id) {
+        int token_count = 0;
+        auto start = std::chrono::steady_clock::now();
+
+        model.generate(input_tokens, 200, [&](int token_id) {
             // 【真实流式解码】：每当模型算出一个新 ID，立刻解码成中文打印到屏幕！
             std::cout << real_decode(token_id) << std::flush;
+            token_count++;
             return true; // 返回 true 表示继续生成下一个字
         });
-        
+
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        double tokens_per_sec = token_count / elapsed.count();
+
         std::cout << std::endl; // 回答结束后换行
+        std::cout << "[用时 " << elapsed.count() << " 秒，生成 " << token_count
+                  << " 个 token，速度 " << tokens_per_sec << " tok/s]" << std::endl;
     }
 
     return EXIT_SUCCESS;

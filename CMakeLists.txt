@@ -19,6 +19,9 @@ set(LLM_ENGINE_SOURCES
     src/memory/memory_pool.cpp
     src/memory/workspace.cpp
     src/memory/kv_cache.cpp
+
+    # Sprint 5: 持久线程池（算子内部并行）
+    src/runtime/thread_pool.cpp
 )
 
 # 如果是在 ARM 架构（如 aarch64），才添加 Neon 源并启用 ARM 专属优化
@@ -40,6 +43,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
 endif()
 
 add_library(llm_engine ${LLM_ENGINE_SOURCES})
+
+# 线程池依赖：POSIX 平台上 std::thread 需要 pthread
+find_package(Threads REQUIRED)
+target_link_libraries(llm_engine PUBLIC Threads::Threads)
 
 # 1. 寻找 PCRE2 依赖
 find_package(PkgConfig REQUIRED)

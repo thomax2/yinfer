@@ -33,6 +33,45 @@ Status linear_decode_prepacked_neon(
     const float* bias = nullptr
 );
 
+// 在 [panel_begin, panel_end) 区间内计算 packed GEMV 的输出。
+// panel_begin/panel_end 是 panel 维度（一个 panel = NR 个输出通道）。
+// 不申请内存，不使用线程池，不访问 g_memory_pool。
+Status linear_decode_prepacked_range_neon(
+    const float* x,
+    const float* w_pack,
+    float* y,
+    int K,
+    int N,
+    int panel_begin,
+    int panel_end,
+    const float* bias = nullptr
+);
+
+// 多线程版 packed GEMV：输出完整 y[0..N)。
+// 当线程池不可用或 N 太小时，自动 fallback 串行。
+Status linear_decode_prepacked_parallel_neon(
+    const float* x,
+    const float* w_pack,
+    float* y,
+    int K,
+    int N,
+    const float* bias = nullptr
+);
+
+struct ArgmaxResult {
+    int index;
+    float value;
+};
+
+// LM Head 专用：fused parallel argmax，不输出完整 logits。
+// 每个 worker 维护一个 local 最大值，最后归并。
+ArgmaxResult linear_decode_prepacked_argmax_parallel_neon(
+    const float* x,
+    const float* w_pack,
+    int K,
+    int N
+);
+
 Status bmm_neon(
     const Tensor& A,
     const Tensor& B,

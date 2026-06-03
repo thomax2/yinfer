@@ -3,7 +3,9 @@
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
+#include "llm_engine/runtime/thread_pool.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
+#include <memory>
 #include <vector>
 #include <string>
 #include <functional>
@@ -69,18 +71,23 @@ public:
     std::vector<float> ext_hidden_states; // 图的入口物理内存
     Tensor* t_hidden_states = nullptr;    // 图入口张量 (X)
     std::vector<float> ext_logits;        // 💡 新增：图的出口物理内存
+    std::vector<float> ext_norm_out;      // 💡 新增：final RMSNorm 的外部输出物理内存（图的最终输出）
     Tensor* t_norm_out = nullptr;         // 图中间张量
     Tensor* t_logits = nullptr;           // 图出口张量
-    
+
     // 动态边界指针（极其巧妙的零开销技巧：每步只需修改它们的 data 指向）
     Tensor* t_cos = nullptr;
     Tensor* t_sin = nullptr;
 
-    int current_pos = 0; 
+    int current_pos = 0;
     bool is_graph_built = false;
 
     // ========== 关键修改1：使用智能指针管理 KV Cache ==========
     std::unique_ptr<KVCache> kv_cache;
+
+    // ========== 持久线程池（算子内部并行复用）==========
+    std::unique_ptr<ThreadPool> thread_pool;
+    int num_threads = 4;
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 

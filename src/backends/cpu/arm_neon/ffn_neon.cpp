@@ -60,13 +60,13 @@ Status ffn_neon(
 
     Status status = Status::SUCCESS;
     if (num_tokens == 1 && w_gate_pack.data && w_up_pack.data) {
-        status = linear_decode_prepacked_neon(
+        status = linear_decode_prepacked_parallel_neon(
             hidden_states.ptr<float>(), w_gate_pack.ptr<float>(), gate_ptr,
             hidden_dim, intermediate_size, nullptr
         );
         if (status != Status::SUCCESS) return status;
 
-        status = linear_decode_prepacked_neon(
+        status = linear_decode_prepacked_parallel_neon(
             hidden_states.ptr<float>(), w_up_pack.ptr<float>(), up_ptr,
             hidden_dim, intermediate_size, nullptr
         );
@@ -83,7 +83,7 @@ Status ffn_neon(
     swiglu_neon(gate_ptr, up_ptr, gate_ptr, total_elements);
 
     if (num_tokens == 1 && w_down_pack.data) {
-        status = linear_decode_prepacked_neon(
+        status = linear_decode_prepacked_parallel_neon(
             gate_ptr, w_down_pack.ptr<float>(), ffn_output.ptr<float>(),
             intermediate_size, hidden_dim, nullptr
         );

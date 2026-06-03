@@ -55,6 +55,21 @@ void QwenModel::prepack_all_weights() {
 
 // --- 构造函数：根据配置构建完整的模型骨架 ---
 QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
+    // ========== 持久线程池：算子内部并行复用 ==========
+    {
+        int threads = 4;
+        const char* env = std::getenv("LLM_NUM_THREADS");
+        if (env) {
+            int v = std::atoi(env);
+            if (v > 0) threads = v;
+        }
+        threads = std::max(1, std::min(threads, 8));
+        num_threads = threads;
+        thread_pool = std::make_unique<ThreadPool>(num_threads);
+        g_thread_pool = thread_pool.get();
+        std::cout << "[Info] ThreadPool initialized with " << num_threads << " threads" << std::endl;
+    }
+
     layers.resize(config.num_layers);
 
     // ========== 关键修改2：构造函数中只分配一次 KV Cache ==========
@@ -117,10 +132,14 @@ QwenModel::QwenModel(const QwenConfig& cfg) : config(cfg) {
 
 // --- 析构函数：统一释放 malloc 的权重 ---
 QwenModel::~QwenModel() {
+    // 解绑全局线程池指针，避免悬挂
+    if (g_thread_pool == thread_pool.get()) {
+        g_thread_pool = nullptr;
+    }
     for (void* ptr : weight_ptrs) {
         std::free(ptr);
     }
-    // unique_ptr 自动释放 kv_cache，无需手动 delete
+    // unique_ptr 自动释放 kv_cache / thread_pool，无需手动 delete
 }
 
 // --- 文件读取辅助函数 ---
@@ -231,6 +250,8 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     t_hidden_states = graph.create_tensor_from_ptr({1, hidden_dim}, ext_hidden_states.data(), DataType::FP32);
     // 💡 新增：准备出口边界内存
     ext_logits.resize(vocab_size, 0.0f);
+    // 💡 新增：final RMSNorm 的输出物理内存（图的最终输出，必须是外部绑定张量）
+    ext_norm_out.resize(hidden_dim, 0.0f);
 
     // 2. 利用巧妙的"虚拟边界"处理 RoPE 的动态位移
     // 随便绑定一个初始指针，骗过编译器的防线。真正执行时在 forward 里覆盖！
@@ -238,7 +259,9 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     t_sin = graph.create_tensor_from_ptr({1, head_dim}, sin_cache.ptr<float>(), DataType::FP32);
 
     // 3. 创建图内部代管的临时张量 (编译器 Arena 会自动为它们复用内存)
-    t_norm_out = graph.create_tensor({1, hidden_dim}, DataType::FP32);
+    // t_norm_out 是图的最终输出（lm_head 在图外做），必须绑外部 data，
+    // 否则 GraphCompiler 会把无消费者的张量判定为边界并报错。
+    t_norm_out = graph.create_tensor_from_ptr({1, hidden_dim}, ext_norm_out.data(), DataType::FP32);
     //t_logits = graph.create_tensor({1, vocab_size}, DataType::FP32);
     t_logits = graph.create_tensor_from_ptr({1, vocab_size}, ext_logits.data(), DataType::FP32);
 
@@ -273,9 +296,9 @@ void QwenModel::build_graph(KVCache& kv_cache) {
     graph.add_rmsnorm(t_hidden_states, &final_norm_w, t_norm_out, config.rms_norm_eps);
 
     // 6. 最终的 LM Head 映射
-    // 注意：Python 导出的 lm_head_w 通常是转置过的，底层 Matmul 默认不转置B时刚好吻合
-    // graph.add_matmul(t_norm_out, &lm_head_w, t_logits);
-    graph.add_gemv(t_norm_out, &lm_head_w_T, t_logits);
+    //    默认走 lm_head_pack + parallel argmax（在 forward 里完成），
+    //    所以 graph 里不再追加 GemvNode；t_logits 和 lm_head_w_T 仅作为 fallback 保留。
+    // graph.add_gemv(t_norm_out, &lm_head_w_T, t_logits);
 
     // 7. 触发编译器：执行生命周期推断、申请大块 Arena 内存并规划所有临时变量！
     plan = compiler.compile(graph);
@@ -306,15 +329,27 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     // 5. 触发计算图执行！不需要再关心具体的算子、Workspace 等细节
     CHECK_STATUS(runtime.run(plan));
 
-    // 6. Argmax (贪心搜索：找出概率最大的词)
+    // 6. LM Head：在图外做，使用 packed 权重 + 并行 fused argmax，
+    //    避免分配/写入完整 logits 数组；如果 packed 权重缺失则回退到老路径。
     int next_token = 0;
-    float max_val = -1e9f;
-    float* logits_ptr = t_logits->ptr<float>(); // 直接从图的出口拿结果
-    
-    for (int v = 0; v < config.vocab_size; ++v) {
-        if (logits_ptr[v] > max_val) {
-            max_val = logits_ptr[v];
-            next_token = v;
+    if (lm_head_pack.data != nullptr) {
+        auto r = arm_neon::linear_decode_prepacked_argmax_parallel_neon(
+            t_norm_out->ptr<float>(),
+            lm_head_pack.ptr<float>(),
+            config.hidden_dim,
+            config.vocab_size
+        );
+        next_token = r.index;
+    } else {
+        // Fallback：图未生成 logits，这里手算一次普通 GEMV 后再 argmax
+        // （正常路径不会走到这里，留作安全网）
+        float max_val = -1e9f;
+        float* logits_ptr = t_logits->ptr<float>();
+        for (int v = 0; v < config.vocab_size; ++v) {
+            if (logits_ptr[v] > max_val) {
+                max_val = logits_ptr[v];
+                next_token = v;
+            }
         }
     }
 
