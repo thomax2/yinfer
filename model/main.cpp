@@ -12,6 +12,23 @@ using namespace llm_engine;
 // 全局 Tokenizer 指针
 std::shared_ptr<GptEncoding> tokenizer;
 
+// 局部 env helpers，避免依赖 model 内部 private 静态方法
+static bool main_env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+static int main_env_int(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    char* end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v) return default_value;
+    return static_cast<int>(x);
+}
+
 
 std::vector<int> real_encode(const std::string& text) {
     // 前导 \n 是为了在多轮拼接时形成正确的 ChatML 边界：
@@ -76,10 +93,14 @@ int main(int argc, const char** argv) {
     std::cout << "=========================================\n" << std::endl;
 
     // 3. 进入交互式对话大循环
+    bool debug_text = main_env_flag("LLM_DEBUG_TEXT");
+    bool stateless = main_env_flag("LLM_STATELESS");
+    int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
+
     while (true) {
         std::cout << "\nUser: ";
         std::string input;
-        
+
         // 读取用户输入的一整行
         if (!std::getline(std::cin, input) || input == "exit" || input == "quit") {
             std::cout << "Bye!" << std::endl;
@@ -95,18 +116,45 @@ int main(int argc, const char** argv) {
             continue;
         }
 
+        // LLM_STATELESS=1：每轮强制清空，单轮独立
+        if (stateless) {
+            model.clear_history();
+            is_first_turn = true;
+            std::cerr << "[MAIN_STATELESS_CLEAR]" << std::endl;
+        }
+
+        if (debug_text) {
+            std::cerr << "[MAIN_INPUT] text=" << input << std::endl;
+        }
+
         // 【真实编码】：将中文文字转成机器看得懂的 Token 数组
         std::vector<int> input_tokens = real_encode(input);
-        
-        std::cout << "Qwen: " << std::flush; 
-        
+
+        if (debug_text) {
+            std::cerr << "[MAIN_TOKENS] count=" << input_tokens.size() << " ids=";
+            for (size_t i = 0; i < input_tokens.size(); ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << input_tokens[i];
+            }
+            std::cerr << std::endl;
+        }
+
+        std::cout << "Qwen: " << std::flush;
+
         // 【生成】：调用模型的 generate 进行推演
         int token_count = 0;
         auto start = std::chrono::steady_clock::now();
 
-        model.generate(input_tokens, 512, [&](int token_id) {
+        model.generate(input_tokens, max_new_tokens, [&](int token_id) {
             // 【真实流式解码】：每当模型算出一个新 ID，立刻解码成中文打印到屏幕！
-            std::cout << real_decode(token_id) << std::flush;
+            std::string piece = real_decode(token_id);
+            if (debug_text) {
+                std::cerr << "[TEXT_TOKEN]"
+                          << " id=" << token_id
+                          << " piece=" << piece
+                          << std::endl;
+            }
+            std::cout << piece << std::flush;
             token_count++;
             return true; // 返回 true 表示继续生成下一个字
         });

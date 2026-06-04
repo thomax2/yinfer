@@ -126,6 +126,23 @@ private:
     bool load_tensor_from_bin(const std::string& filepath, Tensor& tensor);
     void init_rope_cache();
     void build_graph(KVCache& kv_cache);
+
+    // ========== Debug 辅助 ==========
+    static bool env_flag(const char* name);
+    static int env_int(const char* name, int default_value);
+    static float env_float(const char* name, float default_value);
+
+    struct ForwardDebugResult {
+        int token_id = -1;
+        float logit = 0.0f;
+    };
+
+    struct DebugTopKItem {
+        int id;
+        float value;
+    };
+
+    ForwardDebugResult forward_debug_last_result;
 };
 
 } // namespace llm_engine

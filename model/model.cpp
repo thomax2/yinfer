@@ -7,8 +7,36 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <cstdint>
+#include <string>
 
 namespace llm_engine {
+
+// ========== Debug 辅助：环境变量解析 ==========
+bool QwenModel::env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+int QwenModel::env_int(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    char* end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v) return default_value;
+    return static_cast<int>(x);
+}
+
+float QwenModel::env_float(const char* name, float default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    char* end = nullptr;
+    float x = std::strtof(v, &end);
+    if (end == v) return default_value;
+    return x;
+}
 
 // --- 内存分配：跳过 memory_pool，直接 malloc ---
 void QwenModel::allocate_weight(Tensor& t, const std::vector<int>& shape) {
@@ -305,10 +333,27 @@ void QwenModel::build_graph(KVCache& kv_cache) {
 
 // ========== 关键修改4：forward 函数中 build_graph 传入稳定的地址 ==========
 int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
+    bool dbg_forward = env_flag("LLM_DEBUG_FORWARD");
+    if (dbg_forward) {
+        std::cerr << "[FWD_BEGIN]"
+                  << " pos=" << pos
+                  << " token_in=" << token_id
+                  << " history_pos_member=" << history_pos
+                  << " graph_built=" << is_graph_built
+                  << std::endl;
+    }
+
     // 1. 首个 Token 进来时，触发建图
+    bool just_built = false;
     if (!is_graph_built) {
         // 传入的是成员变量 kv_cache 的引用，地址永远不变！
         build_graph(kv_cache);
+        just_built = true;
+    }
+    if (dbg_forward && just_built) {
+        std::cerr << "[FWD_GRAPH_BUILT]"
+                  << " nodes=" << plan.size()
+                  << std::endl;
     }
 
     // 2. 更新控制全局状态的变量 (BlockNode内部透传了这里的指针)
@@ -323,7 +368,13 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
     t_sin->data = sin_cache.ptr<float>() + current_pos * config.head_dim;
 
     // 5. 触发计算图执行！不需要再关心具体的算子、Workspace 等细节
+    if (dbg_forward) {
+        std::cerr << "[FWD_RUN_BEGIN] pos=" << pos << std::endl;
+    }
     CHECK_STATUS(runtime.run(plan));
+    if (dbg_forward) {
+        std::cerr << "[FWD_RUN_END] pos=" << pos << std::endl;
+    }
 
     // 6. LM Head：在图外做，使用 packed 权重 + 并行 fused argmax，
     //    避免分配/写入完整 logits 数组。lm_head_w_T fallback 已移除。
@@ -331,13 +382,51 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
         std::cerr << "[ERROR] lm_head_pack is null." << std::endl;
         return 0;
     }
-    auto r = arm_neon::linear_decode_prepacked_argmax_parallel_neon(
+    auto rp = arm_neon::linear_decode_prepacked_argmax_parallel_neon(
         t_norm_out->ptr<float>(),
         lm_head_pack.ptr<float>(),
         config.hidden_dim,
         config.vocab_size
     );
-    int next_token = r.index;
+    int next_token = rp.index;
+
+    forward_debug_last_result.token_id = next_token;
+    forward_debug_last_result.logit = rp.value;
+
+    // 串行/并行一致性检查
+    if (env_flag("LLM_DEBUG_ARGMAX_COMPARE")) {
+        auto rs = arm_neon::linear_decode_prepacked_argmax_serial_neon(
+            t_norm_out->ptr<float>(),
+            lm_head_pack.ptr<float>(),
+            config.hidden_dim,
+            config.vocab_size
+        );
+        bool same = (rp.index == rs.index);
+        std::cerr << "[ARGMAX_COMPARE]"
+                  << " pos=" << pos
+                  << " parallel_id=" << rp.index
+                  << " parallel_val=" << rp.value
+                  << " serial_id=" << rs.index
+                  << " serial_val=" << rs.value
+                  << " same=" << (same ? 1 : 0)
+                  << " delta=" << (rp.value - rs.value)
+                  << std::endl;
+        if (!same) {
+            std::cerr << "[ARGMAX_MISMATCH]"
+                      << " pos=" << pos
+                      << " token_in=" << token_id
+                      << std::endl;
+        }
+    }
+
+    if (dbg_forward) {
+        std::cerr << "[FWD_END]"
+                  << " pos=" << pos
+                  << " token_in=" << token_id
+                  << " token_out=" << next_token
+                  << " logit=" << rp.value
+                  << std::endl;
+    }
 
     // Note: 传入的 workspace 参数已经不再需要使用了，因为
     // 中间结果 (logits, norm_out) 由 GraphCompiler 的 Arena 接管。
@@ -350,17 +439,71 @@ int QwenModel::forward(int token_id, int pos, KVCache& kv_cache) {
 void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_tokens, std::function<bool(int)> callback) {
     if (input_tokens.empty()) return;
 
-    // // 1. 初始化属于这一次对话的 KV Cache
-    // KVCache kv_cache(config.num_layers, config.max_seq_len, config.num_kv_heads, config.head_dim);
-    
-    // ✅ 只清空内容，地址不变！
-    // kv_cache->clear();
-    // int pos = 0;
+    static uint64_t s_turn_id = 0;
+    uint64_t turn_id = ++s_turn_id;
+
+    bool dbg_gen = env_flag("LLM_DEBUG_GENERATE");
+    bool dbg_prefill = env_flag("LLM_DEBUG_PREFILL");
+    bool dbg_decode = env_flag("LLM_DEBUG_DECODE") || dbg_gen;
+    bool fix_maxnew_writeback = env_flag("LLM_FIX_MAXNEW_WRITEBACK");
+
+    int history_before = history_pos;
+    int prompt_len = static_cast<int>(input_tokens.size());
+    int history_after_prefill = -1;
+    int emitted_visible = 0;
+    std::string stop_reason = "UNKNOWN";
+
+    if (dbg_gen) {
+        std::cerr << "[GEN_BEGIN]"
+                  << " turn=" << turn_id
+                  << " history_before=" << history_before
+                  << " prompt_len=" << prompt_len
+                  << " max_new_tokens=" << max_new_tokens
+                  << " max_seq_len=" << config.max_seq_len
+                  << std::endl;
+
+        std::cerr << "[GEN_PROMPT_TOKENS] turn=" << turn_id << " ids=";
+        for (size_t i = 0; i < input_tokens.size(); ++i) {
+            if (i) std::cerr << ",";
+            std::cerr << input_tokens[i];
+        }
+        std::cerr << std::endl;
+    }
+
+    auto print_summary = [&]() {
+        std::cerr << "[GEN_END]"
+                  << " turn=" << turn_id
+                  << " stop=" << stop_reason
+                  << " history_before=" << history_before
+                  << " prompt_len=" << prompt_len
+                  << " history_after_prefill=" << history_after_prefill
+                  << " emitted_visible=" << emitted_visible
+                  << " history_after=" << history_pos
+                  << std::endl;
+
+        int expected_rough = history_before + prompt_len + emitted_visible + 1;
+        std::cerr << "[GEN_INVARIANT]"
+                  << " turn=" << turn_id
+                  << " expected_rough=" << expected_rough
+                  << " actual_history=" << history_pos
+                  << " diff=" << (history_pos - expected_rough)
+                  << " note=rough_expected_assumes_one_closing_token"
+                  << std::endl;
+    };
 
     // 【新增安全检查】：如果内存快满了，必须清空，否则会越界崩溃 (Segfault)
     if (history_pos + input_tokens.size() + max_new_tokens >= (config.max_seq_len * 0.9)) {
+        if (dbg_gen) {
+            std::cerr << "[GEN_CONTEXT_CLEAR]"
+                      << " turn=" << turn_id
+                      << " history_before_clear=" << history_pos
+                      << " prompt_len=" << input_tokens.size()
+                      << " max_new_tokens=" << max_new_tokens
+                      << std::endl;
+        }
         std::cout << "\n[Warning] Context limit reached. Clearing history..." << std::endl;
         clear_history();
+        history_before = history_pos; // refresh after clear
     }
 
     // ==========================================
@@ -368,8 +511,29 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
     // ==========================================
     // 将前面的 Token 逐个喂给模型，累积 KV Cache，但不需要它们的输出
     for (size_t i = 0; i < input_tokens.size() - 1; ++i) {
-        forward(input_tokens[i], history_pos, *kv_cache);
+        int pos_before = history_pos;
+        int out = forward(input_tokens[i], history_pos, *kv_cache);
         history_pos++; // 每次 forward 后全局指针 +1
+
+        if (dbg_prefill) {
+            std::cerr << "[PREFILL]"
+                      << " turn=" << turn_id
+                      << " i=" << i
+                      << " pos_before=" << pos_before
+                      << " token_in=" << input_tokens[i]
+                      << " token_pred=" << out
+                      << " pos_after=" << history_pos
+                      << std::endl;
+        }
+    }
+
+    history_after_prefill = history_pos;
+    if (dbg_gen) {
+        std::cerr << "[GEN_PREFILL_END]"
+                  << " turn=" << turn_id
+                  << " history_after_prefill=" << history_after_prefill
+                  << " current_token=" << input_tokens.back()
+                  << std::endl;
     }
 
     // ==========================================
@@ -390,14 +554,30 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
         history_pos++;
     };
 
-    for (int i = 0; i < max_new_tokens; ++i) {
+    bool decode_done = false;
+    for (int i = 0; i < max_new_tokens && !decode_done; ++i) {
+        int pos_before = history_pos;
+        int input_to_forward = current_token;
         // 推理出下一个词
         int next_token = forward(current_token, history_pos, *kv_cache);
         history_pos++; // 模型自己生成的 Token 也会顺延存入 KV Cache
 
+        if (dbg_decode) {
+            std::cerr << "[DECODE]"
+                      << " turn=" << turn_id
+                      << " step=" << i
+                      << " pos_before=" << pos_before
+                      << " token_in=" << input_to_forward
+                      << " token_out=" << next_token
+                      << " logit=" << forward_debug_last_result.logit
+                      << " pos_after=" << history_pos
+                      << std::endl;
+        }
+
         // 遇到结束符：把它自己也喂回 forward 一次，让 KV 缓存里真的存有 <|im_end|>，
         // 否则下一轮 prompt 拼到一段没有闭合的 assistant 后面，会复读上一轮内容。
         if (next_token == IM_END_ID || next_token == EOT_ID) {
+            stop_reason = (next_token == IM_END_ID) ? "IM_END" : "EOT";
             if (next_token == IM_END_ID) {
                 inject_im_end();
             } else {
@@ -406,22 +586,64 @@ void QwenModel::generate(const std::vector<int>& input_tokens, int max_new_token
                     history_pos++;
                 }
             }
-            return;
+            decode_done = true;
+            break;
         }
 
         // 将生成的词通过回调函数送回前端（比如打印到屏幕）
         // 如果回调函数返回 false，则提前终止生成（可用于实现用户强行打断）
         if (!callback(next_token)) {
+            emitted_visible++;
+            stop_reason = "CALLBACK_FALSE";
             inject_im_end();
-            return;
+            decode_done = true;
+            break;
         }
 
+        emitted_visible++;
         // 把刚生成的词变成下一次的输入
         current_token = next_token;
     }
 
-    // 跑满 max_new_tokens 也没遇到 EOS：手动追加 <|im_end|>，给本轮 assistant 段封口。
-    inject_im_end();
+    if (!decode_done) {
+        stop_reason = "MAX_NEW";
+
+        if (dbg_gen) {
+            std::cerr << "[MAXNEW_REACHED]"
+                      << " turn=" << turn_id
+                      << " current_token=" << current_token
+                      << " history_pos_before_close=" << history_pos
+                      << " fix_writeback=" << (fix_maxnew_writeback ? 1 : 0)
+                      << std::endl;
+        }
+
+        // 实验性修复：让最后一个已经打印的 visible token 真正写进 KV，
+        // 否则下一轮 prompt 拼到的 KV 序列里这个 token 实际不存在，
+        // 0.5B 容易被这种状态污染。
+        if (fix_maxnew_writeback) {
+            if (history_pos < config.max_seq_len) {
+                int pos_before = history_pos;
+                int pred = forward(current_token, history_pos, *kv_cache);
+                history_pos++;
+                if (dbg_gen) {
+                    std::cerr << "[MAXNEW_WRITEBACK_LAST_VISIBLE]"
+                              << " turn=" << turn_id
+                              << " pos_before=" << pos_before
+                              << " token_written=" << current_token
+                              << " pred=" << pred
+                              << " pos_after=" << history_pos
+                              << std::endl;
+                }
+            }
+        }
+
+        // 跑满 max_new_tokens 也没遇到 EOS：手动追加 <|im_end|>，给本轮 assistant 段封口。
+        inject_im_end();
+    }
+
+    if (dbg_gen) {
+        print_summary();
+    }
 }
 
 

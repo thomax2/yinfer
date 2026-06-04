@@ -72,6 +72,15 @@ ArgmaxResult linear_decode_prepacked_argmax_parallel_neon(
     int N
 );
 
+// LM Head 专用：fused 串行 argmax，仅供 debug / 一致性比对使用。
+// 不申请内存、不使用线程池。
+ArgmaxResult linear_decode_prepacked_argmax_serial_neon(
+    const float* x,
+    const float* w_pack,
+    int K,
+    int N
+);
+
 // FFN 专用：在 [panel_begin, panel_end) 范围内同时计算 gate / up，
 // 并 fused 完成 SwiGLU。y[i] = silu(gate[i]) * up[i]。
 // w_gate_pack / w_up_pack 与 linear_decode_prepacked_neon 使用同一种 packed 布局。

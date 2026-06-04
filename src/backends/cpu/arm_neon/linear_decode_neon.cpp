@@ -294,6 +294,29 @@ ArgmaxResult linear_decode_prepacked_argmax_parallel_neon(
 }
 
 // =============================================================================
+// LM Head 专用：fused 串行 argmax wrapper（debug / 一致性对照用）。
+// =============================================================================
+ArgmaxResult linear_decode_prepacked_argmax_serial_neon(
+    const float* x,
+    const float* w_pack,
+    int K,
+    int N
+) {
+    ArgmaxResult result;
+    result.index = -1;
+    result.value = -std::numeric_limits<float>::infinity();
+
+    if (!x || !w_pack || K <= 0 || N <= 0) {
+        return result;
+    }
+
+    int np = (N + NR - 1) / NR;
+    return linear_decode_prepacked_argmax_range_neon(
+        x, w_pack, K, N, 0, np
+    );
+}
+
+// =============================================================================
 // FFN 专用 fused kernel：gate + up + SwiGLU 在一个 panel 循环里完成
 // y[col + i] = silu(gate[i]) * up[i]，silu(x) = x / (1 + exp(-x))
 //
