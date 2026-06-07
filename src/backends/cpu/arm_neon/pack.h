@@ -45,5 +45,41 @@ void pack_weight_for_linear_decode(
     int N
 );
 
+void pack_A_f16(
+    const fp16_t* A,
+    fp16_t* A_pack,
+    int M,
+    int K,
+    int lda
+);
+
+void pack_B_f16(
+    const fp16_t* B,
+    fp16_t* B_pack,
+    int K,
+    int N,
+    int ldb
+);
+
+void pack_B_trans_f16(
+    const fp16_t* B,
+    fp16_t* B_pack,
+    int K,
+    int N,
+    int ldb
+);
+
+void pack_B_gptq_w8a16(
+    const int8_t* qweight_kn,
+    const fp16_t* scales_gn,
+    const int8_t* zeros_gn,
+    int8_t* qweight_pack,
+    fp16_t* scales_pack,
+    int8_t* zeros_pack,
+    int K,
+    int N,
+    int group_size
+);
+
 }
 }

@@ -1,5 +1,6 @@
 #include "pack.h"
 #include <cstring>
+#include <algorithm>
 
 namespace llm_engine {
 namespace arm_neon {
@@ -127,6 +128,95 @@ void pack_weight_for_linear_decode(
     int N
 ) {
     pack_B(W, W_pack, K, N, N);
+}
+
+void pack_A_f16(
+    const fp16_t* A,
+    fp16_t* A_pack,
+    int M,
+    int K,
+    int lda
+) {
+    int mp = (M + MR_F16 - 1) / MR_F16;
+    for (int i = 0; i < mp; ++i) {
+        for (int k = 0; k < K; ++k) {
+            for (int r = 0; r < MR_F16; ++r) {
+                int row = i * MR_F16 + r;
+                *A_pack++ = (row < M) ? A[row * lda + k] : (fp16_t)0;
+            }
+        }
+    }
+}
+
+void pack_B_f16(
+    const fp16_t* B,
+    fp16_t* B_pack,
+    int K,
+    int N,
+    int ldb
+) {
+    int np = (N + NR_F16 - 1) / NR_F16;
+    for (int panel = 0; panel < np; ++panel) {
+        for (int k = 0; k < K; ++k) {
+            for (int lane = 0; lane < NR_F16; ++lane) {
+                int col = panel * NR_F16 + lane;
+                *B_pack++ = (col < N) ? B[k * ldb + col] : (fp16_t)0;
+            }
+        }
+    }
+}
+
+void pack_B_trans_f16(
+    const fp16_t* B,
+    fp16_t* B_pack,
+    int K,
+    int N,
+    int ldb
+) {
+    int np = (N + NR_F16 - 1) / NR_F16;
+    for (int panel = 0; panel < np; ++panel) {
+        for (int k = 0; k < K; ++k) {
+            for (int lane = 0; lane < NR_F16; ++lane) {
+                int row = panel * NR_F16 + lane;
+                *B_pack++ = (row < N) ? B[row * ldb + k] : (fp16_t)0;
+            }
+        }
+    }
+}
+
+void pack_B_gptq_w8a16(
+    const int8_t* qweight_kn,
+    const fp16_t* scales_gn,
+    const int8_t* zeros_gn,
+    int8_t* qweight_pack,
+    fp16_t* scales_pack,
+    int8_t* zeros_pack,
+    int K,
+    int N,
+    int group_size
+) {
+    int np = (N + NR_F16 - 1) / NR_F16;
+    int K_pad = ((K + 7) / 8) * 8;
+    int num_groups = (K + group_size - 1) / group_size;
+
+    for (int panel = 0; panel < np; ++panel) {
+        for (int k = 0; k < K_pad; ++k) {
+            for (int lane = 0; lane < NR_F16; ++lane) {
+                int n = panel * NR_F16 + lane;
+                size_t dst = ((size_t)panel * K_pad + k) * NR_F16 + lane;
+                qweight_pack[dst] = (k < K && n < N) ? qweight_kn[(size_t)k * N + n] : (int8_t)0;
+            }
+        }
+
+        for (int g = 0; g < num_groups; ++g) {
+            for (int lane = 0; lane < NR_F16; ++lane) {
+                int n = panel * NR_F16 + lane;
+                size_t dst = ((size_t)panel * num_groups + g) * NR_F16 + lane;
+                scales_pack[dst] = (n < N) ? scales_gn[(size_t)g * N + n] : (fp16_t)0;
+                zeros_pack[dst] = (zeros_gn && n < N) ? zeros_gn[(size_t)g * N + n] : (int8_t)0;
+            }
+        }
+    }
 }
 
 }

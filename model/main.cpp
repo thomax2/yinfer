@@ -67,9 +67,9 @@ int main(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
 
-    // 1. 初始化引擎最核心的全局内存池 (至少给 512MB)
+    // 1. 初始化引擎最核心的全局内存池 (FP16 KV cache + GPTQ packed weights)
     if (g_memory_pool == nullptr) {
-        g_memory_pool = new MemoryPool(512ULL * 1024 * 1024);
+        g_memory_pool = new MemoryPool(1024ULL * 1024 * 1024);
     }
 
     QwenConfig cfg;
@@ -77,7 +77,7 @@ int main(int argc, const char** argv) {
 
     // 2. 加载权重
     std::cout << "正在加载模型权重..." << std::endl;
-    if (!model.load_weights("../weights/qwen_0.5b_full_bins")) {
+    if (!model.load_weights("../weights/qwen2p5_1p5b_fp16_gptq_int8_neon")) {
         std::cerr << "模型权重加载失败，程序退出。" << std::endl;
         return EXIT_FAILURE;
     }
@@ -87,7 +87,7 @@ int main(int argc, const char** argv) {
     model.clear_history(); // 初始化时清空一次
 
     std::cout << "=========================================" << std::endl;
-    std::cout << "🚀 欢迎使用 Qwen-0.5B CPU 极速推理引擎！" << std::endl;
+    std::cout << "欢迎使用 Qwen2.5-1.5B FP16+GPTQ-Int8 CPU 推理引擎！" << std::endl;
     std::cout << "✅ 真实 Tokenizer (cpp-tiktoken) 已成功接入。" << std::endl;
     std::cout << "提示：输入 'exit' 或 'quit' 退出程序。" << std::endl;
     std::cout << "=========================================\n" << std::endl;

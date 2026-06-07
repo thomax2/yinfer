@@ -140,7 +140,11 @@ Status attention_neon(
     // ==========================================
     // 3. 更新 KV Cache
     // ==========================================
-    kv_cache.update(layer_id, current_pos, k_proj_ptr, v_proj_ptr);
+    kv_cache.update(
+        layer_id,
+        current_pos,
+        reinterpret_cast<const fp16_t*>(k_proj_ptr),
+        reinterpret_cast<const fp16_t*>(v_proj_ptr));
 
     // ==========================================
     // 4. GQA 核心计算循环 (💡 修复问题3：按 KV Head 循环！)
@@ -151,8 +155,8 @@ Status attention_neon(
     for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
         
         // --- 准备 K 和 V (完全纯净的 2D Tensor) ---
-        float* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
-        float* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
+        float* k_cache_ptr = reinterpret_cast<float*>(kv_cache.get_k_head_ptr(layer_id, kv_head));
+        float* v_cache_ptr = reinterpret_cast<float*>(kv_cache.get_v_head_ptr(layer_id, kv_head));
         
         // 💡 修复问题1：直接使用 [seq_len, head_dim] 2D 形状
         Tensor K_cache({current_seq_len, config.head_dim}, k_cache_ptr);
@@ -235,6 +239,106 @@ Status attention_neon(
         cos_ptr, sin_ptr,
         kv_cache, layer_id, current_pos, config, workspace
     );
+}
+
+Status attention_f16_gptq_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_ptr,
+    const fp16_t* sin_ptr,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+) {
+    if (hidden_states.dtype != DataType::FP16 || attn_output.dtype != DataType::FP16) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int hidden_dim = hidden_states.shape[1];
+    int q_size = config.num_q_heads * config.head_dim;
+    int kv_size = config.num_kv_heads * config.head_dim;
+    int num_rep = config.num_q_heads / config.num_kv_heads;
+    int max_seq_len = kv_cache.get_max_seq_len();
+
+    size_t q_bytes = align_size((size_t)q_size * sizeof(fp16_t));
+    size_t k_bytes = align_size((size_t)kv_size * sizeof(fp16_t));
+    size_t v_bytes = align_size((size_t)kv_size * sizeof(fp16_t));
+    size_t score_bytes = align_size((size_t)num_rep * max_seq_len * sizeof(fp16_t));
+    size_t attn_bytes = align_size((size_t)q_size * sizeof(fp16_t));
+    size_t matmul_bytes = align_size(32ULL * 1024 * 1024);
+    size_t required = q_bytes + k_bytes + v_bytes + score_bytes + attn_bytes + matmul_bytes;
+    if (workspace.size() < required) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    char* base = static_cast<char*>(workspace.data());
+    base = align_ptr(base); fp16_t* q_ptr = reinterpret_cast<fp16_t*>(base); base += q_bytes;
+    base = align_ptr(base); fp16_t* k_ptr = reinterpret_cast<fp16_t*>(base); base += k_bytes;
+    base = align_ptr(base); fp16_t* v_ptr = reinterpret_cast<fp16_t*>(base); base += v_bytes;
+    base = align_ptr(base); fp16_t* score_ptr = reinterpret_cast<fp16_t*>(base); base += score_bytes;
+    base = align_ptr(base); fp16_t* attn_out_ptr = reinterpret_cast<fp16_t*>(base); base += attn_bytes;
+    base = align_ptr(base); fp16_t* matmul_ws = reinterpret_cast<fp16_t*>(base);
+
+    Status status = linear_gptq_int8_decode_neon(
+        hidden_states.ptr<fp16_t>(), q_proj, q_ptr, q_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    status = linear_gptq_int8_decode_neon(
+        hidden_states.ptr<fp16_t>(), k_proj, k_ptr, k_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    status = linear_gptq_int8_decode_neon(
+        hidden_states.ptr<fp16_t>(), v_proj, v_ptr, v_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+
+    for (int h = 0; h < config.num_q_heads; ++h) {
+        rope_f16_neon(q_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+    }
+    for (int h = 0; h < config.num_kv_heads; ++h) {
+        rope_f16_neon(k_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+    }
+
+    kv_cache.update(layer_id, current_pos, k_ptr, v_ptr);
+
+    int current_seq_len = current_pos + 1;
+    float scale = 1.0f / std::sqrt((float)config.head_dim);
+
+    for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
+        fp16_t* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
+        fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
+        fp16_t* q_group_ptr = q_ptr + kv_head * num_rep * config.head_dim;
+        fp16_t* out_group_ptr = attn_out_ptr + kv_head * num_rep * config.head_dim;
+
+        Tensor Q_group({num_rep, config.head_dim}, q_group_ptr, DataType::FP16);
+        Tensor K_cache({current_seq_len, config.head_dim}, k_cache_ptr, DataType::FP16);
+        Tensor V_cache({current_seq_len, config.head_dim}, v_cache_ptr, DataType::FP16);
+        Tensor Score({num_rep, current_seq_len}, score_ptr, DataType::FP16);
+        Tensor Out_group({num_rep, config.head_dim}, out_group_ptr, DataType::FP16);
+
+        status = matmul_f16_neon(Q_group, K_cache, Score, matmul_ws, true, nullptr);
+        if (status != Status::SUCCESS) return status;
+
+        int total_score = num_rep * current_seq_len;
+        for (int i = 0; i < total_score; ++i) {
+            score_ptr[i] = (fp16_t)((float)score_ptr[i] * scale);
+        }
+
+        status = softmax_f16_neon(Score, Score);
+        if (status != Status::SUCCESS) return status;
+
+        status = matmul_f16_neon(Score, V_cache, Out_group, matmul_ws, false, nullptr);
+        if (status != Status::SUCCESS) return status;
+    }
+
+    return linear_gptq_int8_decode_neon(
+        attn_out_ptr, o_proj, attn_output.ptr<fp16_t>(), nullptr, nullptr, 0);
 }
 
 } // namespace arm_neon

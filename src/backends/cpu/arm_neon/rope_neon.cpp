@@ -44,5 +44,35 @@ void rope_neon(
     }
 }
 
+void rope_f16_neon(
+    fp16_t* x,
+    const fp16_t* cos,
+    const fp16_t* sin,
+    int n
+) {
+    int half_n = n / 2;
+    int i = 0;
+    for (; i <= half_n - 8; i += 8) {
+        float16x8_t x1 = vld1q_f16(x + i);
+        float16x8_t x2 = vld1q_f16(x + i + half_n);
+        float16x8_t c = vld1q_f16(cos + i);
+        float16x8_t s = vld1q_f16(sin + i);
+
+        float16x8_t x1_new = vfmsq_f16(vmulq_f16(x1, c), x2, s);
+        float16x8_t x2_new = vfmaq_f16(vmulq_f16(x2, c), x1, s);
+
+        vst1q_f16(x + i, x1_new);
+        vst1q_f16(x + i + half_n, x2_new);
+    }
+    for (; i < half_n; ++i) {
+        float x1 = (float)x[i];
+        float x2 = (float)x[i + half_n];
+        float c = (float)cos[i];
+        float s = (float)sin[i];
+        x[i] = (fp16_t)(x1 * c - x2 * s);
+        x[i + half_n] = (fp16_t)(x2 * c + x1 * s);
+    }
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

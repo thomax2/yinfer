@@ -137,5 +137,54 @@ Status softmax_neon(const Tensor& input, Tensor& output) {
     return Status::SUCCESS;
 }
 
+Status softmax_f16_neon(const Tensor& input, Tensor& output) {
+    if (input.dtype != DataType::FP16 || output.dtype != DataType::FP16)
+        return Status::INVALID_ARGUMENT;
+    if (input.size() != output.size())
+        return Status::INVALID_ARGUMENT;
+
+    int seq_len = input.shape.back();
+    int batch_size = input.size() / seq_len;
+    const fp16_t* in_base = input.ptr<fp16_t>();
+    fp16_t* out_base = output.ptr<fp16_t>();
+
+    for (int b = 0; b < batch_size; ++b) {
+        const fp16_t* in = in_base + (size_t)b * seq_len;
+        fp16_t* out = out_base + (size_t)b * seq_len;
+
+        float max_val = -std::numeric_limits<float>::infinity();
+        int i = 0;
+        for (; i <= seq_len - 8; i += 8) {
+            float16x8_t hv = vld1q_f16(in + i);
+            float32x4_t lo = vcvt_f32_f16(vget_low_f16(hv));
+            float32x4_t hi = vcvt_f32_f16(vget_high_f16(hv));
+            max_val = std::max(max_val, vmaxvq_f32(lo));
+            max_val = std::max(max_val, vmaxvq_f32(hi));
+        }
+        for (; i < seq_len; ++i) {
+            max_val = std::max(max_val, (float)in[i]);
+        }
+
+        float sum = 0.0f;
+        for (i = 0; i < seq_len; ++i) {
+            float e = std::exp((float)in[i] - max_val);
+            out[i] = (fp16_t)e;
+            sum += e;
+        }
+
+        float inv = 1.0f / sum;
+        float16x8_t hinv = vdupq_n_f16((fp16_t)inv);
+        for (i = 0; i <= seq_len - 8; i += 8) {
+            float16x8_t hv = vld1q_f16(out + i);
+            vst1q_f16(out + i, vmulq_f16(hv, hinv));
+        }
+        for (; i < seq_len; ++i) {
+            out[i] = (fp16_t)((float)out[i] * inv);
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

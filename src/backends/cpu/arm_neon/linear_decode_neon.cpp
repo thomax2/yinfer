@@ -3,6 +3,7 @@
 #include "llm_engine/runtime/thread_pool.h"
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -314,6 +315,130 @@ ArgmaxResult linear_decode_prepacked_argmax_serial_neon(
     return linear_decode_prepacked_argmax_range_neon(
         x, w_pack, K, N, 0, np
     );
+}
+
+static inline int gptq_group_for_k(const GPTQInt8Weight& w, int k) {
+    if (w.has_g_idx && w.g_idx.data) {
+        return w.g_idx.ptr<int32_t>()[k];
+    }
+    return k / w.group_size;
+}
+
+Status linear_gptq_int8_decode_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    void*,
+    size_t
+) {
+    if (!x || !y || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int K_pad = ((w.K + 7) / 8) * 8;
+    const int np = (w.N + NR_F16 - 1) / NR_F16;
+    const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
+    const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
+    const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+
+    for (int panel = 0; panel < np; ++panel) {
+        float16x8_t acc0 = vdupq_n_f16((fp16_t)0);
+        float16x8_t acc1 = vdupq_n_f16((fp16_t)0);
+
+        for (int k = 0; k < w.K; ++k) {
+            int group = gptq_group_for_k(w, k);
+            const int8_t* q = qpack + ((size_t)panel * K_pad + k) * NR_F16;
+            const fp16_t* s = spack + ((size_t)panel * w.num_groups + group) * NR_F16;
+            const int8_t* z = zpack ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 : nullptr;
+
+            fp16_t dq0[8];
+            fp16_t dq1[8];
+            for (int lane = 0; lane < 8; ++lane) {
+                int z0 = z ? z[lane] : 0;
+                int z1 = z ? z[lane + 8] : 0;
+                dq0[lane] = (fp16_t)((float)(q[lane] - z0) * (float)s[lane]);
+                dq1[lane] = (fp16_t)((float)(q[lane + 8] - z1) * (float)s[lane + 8]);
+            }
+
+            fp16_t xv = x[k];
+            acc0 = vfmaq_n_f16(acc0, vld1q_f16(dq0), xv);
+            acc1 = vfmaq_n_f16(acc1, vld1q_f16(dq1), xv);
+        }
+
+        int col = panel * NR_F16;
+        int actual_n = std::min(NR_F16, w.N - col);
+        fp16_t tmp[NR_F16];
+        vst1q_f16(tmp, acc0);
+        vst1q_f16(tmp + 8, acc1);
+
+        for (int lane = 0; lane < actual_n; ++lane) {
+            float v = (float)tmp[lane];
+            if (bias) v += (float)bias[col + lane];
+            y[col + lane] = (fp16_t)v;
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
+ArgmaxResult linear_gptq_int8_decode_argmax_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    void*,
+    size_t
+) {
+    ArgmaxResult result{-1, -std::numeric_limits<float>::infinity()};
+    if (!x || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
+        return result;
+    }
+
+    const int K_pad = ((w.K + 7) / 8) * 8;
+    const int np = (w.N + NR_F16 - 1) / NR_F16;
+    const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
+    const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
+    const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+
+    for (int panel = 0; panel < np; ++panel) {
+        float16x8_t acc0 = vdupq_n_f16((fp16_t)0);
+        float16x8_t acc1 = vdupq_n_f16((fp16_t)0);
+
+        for (int k = 0; k < w.K; ++k) {
+            int group = gptq_group_for_k(w, k);
+            const int8_t* q = qpack + ((size_t)panel * K_pad + k) * NR_F16;
+            const fp16_t* s = spack + ((size_t)panel * w.num_groups + group) * NR_F16;
+            const int8_t* z = zpack ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 : nullptr;
+
+            fp16_t dq0[8];
+            fp16_t dq1[8];
+            for (int lane = 0; lane < 8; ++lane) {
+                int z0 = z ? z[lane] : 0;
+                int z1 = z ? z[lane + 8] : 0;
+                dq0[lane] = (fp16_t)((float)(q[lane] - z0) * (float)s[lane]);
+                dq1[lane] = (fp16_t)((float)(q[lane + 8] - z1) * (float)s[lane + 8]);
+            }
+
+            fp16_t xv = x[k];
+            acc0 = vfmaq_n_f16(acc0, vld1q_f16(dq0), xv);
+            acc1 = vfmaq_n_f16(acc1, vld1q_f16(dq1), xv);
+        }
+
+        int col = panel * NR_F16;
+        int actual_n = std::min(NR_F16, w.N - col);
+        fp16_t tmp[NR_F16];
+        vst1q_f16(tmp, acc0);
+        vst1q_f16(tmp + 8, acc1);
+        for (int lane = 0; lane < actual_n; ++lane) {
+            float v = (float)tmp[lane];
+            int index = col + lane;
+            if (v > result.value || (v == result.value && (result.index < 0 || index < result.index))) {
+                result.value = v;
+                result.index = index;
+            }
+        }
+    }
+
+    return result;
 }
 
 // =============================================================================

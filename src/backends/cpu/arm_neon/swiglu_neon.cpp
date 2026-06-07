@@ -92,5 +92,19 @@ void swiglu_neon(
     }
 }
 
+void swiglu_f16_neon(
+    const fp16_t* gate,
+    const fp16_t* up,
+    fp16_t* y,
+    int n
+) {
+    for (int i = 0; i < n; ++i) {
+        float g = (float)gate[i];
+        float u = (float)up[i];
+        float silu = g / (1.0f + std::exp(-g));
+        y[i] = (fp16_t)(silu * u);
+    }
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

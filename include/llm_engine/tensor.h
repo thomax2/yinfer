@@ -5,15 +5,20 @@
 #include <functional>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 
 #include "llm_engine/memory/memory_pool.h"
 
 namespace llm_engine {
 
+using fp16_t = __fp16;
+
 enum class DataType {
-    FP32,
     FP16,
-    INT8
+    FP32,
+    INT8,
+    UINT8,
+    INT32
 };
 
 enum class DeviceType {
@@ -23,9 +28,11 @@ enum class DeviceType {
 
 inline size_t dtype_size(DataType t) {
     switch (t) {
-        case DataType::FP32: return 4;
         case DataType::FP16: return 2;
+        case DataType::FP32: return 4;
         case DataType::INT8: return 1;
+        case DataType::UINT8: return 1;
+        case DataType::INT32: return 4;
         default: return 0;
     }
 }
@@ -42,7 +49,7 @@ public:
 
     bool owns_data = true;
 
-    DataType dtype = DataType::FP32;
+    DataType dtype = DataType::FP16;
     DeviceType device = DeviceType::CPU;
 
 public:
@@ -50,7 +57,7 @@ public:
     Tensor() = default;
 
     Tensor( const std::vector<int>& s,
-            DataType t = DataType::FP32,
+            DataType t = DataType::FP16,
             DeviceType dev = DeviceType::CPU)
         : shape(s), dtype(t), device(dev) {
     
@@ -65,7 +72,7 @@ public:
 
     Tensor(const std::vector<int>& s,
            void* external_data,
-           DataType t = DataType::FP32)
+           DataType t = DataType::FP16)
         : shape(s), data(external_data), dtype(t)
     {
         compute_stride();

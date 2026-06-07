@@ -63,7 +63,7 @@ void MemoryPool::split(BlockHeader* block, size_t bytes)
 }
 
 void* MemoryPool::allocate(size_t bytes) {
-    size_t aligned_bytes = (bytes + 15) & ~15;
+    size_t aligned_bytes = (bytes + 63) & ~63;
     BlockHeader* block = find_best_fit(aligned_bytes);
 
     if(!block)

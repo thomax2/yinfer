@@ -1,3 +1,5 @@
+#pragma once
+
 #include "llm_engine/tensor.h"
 #include "llm_engine/memory/kv_cache.h"
 #include "llm_engine/memory/workspace.h"
@@ -12,27 +14,19 @@
 
 namespace llm_engine {
 
-// Qwen 模型的配置参数 (对应 0.5B)
+// Qwen2.5-1.5B-Instruct-GPTQ-Int8 配置参数
 struct QwenConfig {
-    int num_layers = 24;
-    int hidden_dim = 896;
-    int intermediate_size = 4864;
-    int num_q_heads = 14;
+    int num_layers = 28;
+    int hidden_dim = 1536;
+    int intermediate_size = 8960;
+    int num_q_heads = 12;
     int num_kv_heads = 2;
-    int head_dim = 64;
+    int head_dim = 128;
     int vocab_size = 151936; 
-    float rms_norm_eps = 1e-6;
-    int max_seq_len = 8192; // 你支持的最大上下文长度
-};
-
-// 单个 Block 的权重容器
-struct QwenBlockWeights {
-    Tensor norm1_w, norm2_w;
-    Tensor w_q, w_k, w_v, w_o;
-    Tensor b_q, b_k, b_v;
-    Tensor w_gate, w_up, w_down;
-    Tensor w_q_pack, w_k_pack, w_v_pack, w_o_pack;
-    Tensor w_gate_pack, w_up_pack, w_down_pack;
+    float rms_norm_eps = 1e-6f;
+    int max_seq_len = 8192;
+    float rope_theta = 1000000.0f;
+    bool tie_word_embeddings = true;
 };
 
 class QwenModel {
@@ -42,13 +36,12 @@ public:
     // 0. 词表嵌入层权重
     Tensor embed_tokens_w;
     
-    // 1. 24 层 Transformer 权重
+    // 1. Transformer 权重
     std::vector<QwenBlockWeights> layers;
     
     // 2. 最后的输出层权重
     Tensor final_norm_w;
-    Tensor lm_head_w;
-    Tensor lm_head_pack;
+    arm_neon::GPTQInt8Weight lm_head;
 
     // RoPE 查表缓存
     Tensor cos_cache;
@@ -67,12 +60,10 @@ public:
     std::vector<GraphNode*> plan;
 
     // 图的边界张量和中间张量指针
-    std::vector<float> ext_hidden_states; // 图的入口物理内存
+    std::vector<fp16_t> ext_hidden_states; // 图的入口物理内存
     Tensor* t_hidden_states = nullptr;    // 图入口张量 (X)
-    std::vector<float> ext_logits;        // 💡 新增：图的出口物理内存
-    std::vector<float> ext_norm_out;      // 💡 新增：final RMSNorm 的外部输出物理内存（图的最终输出）
+    std::vector<fp16_t> ext_norm_out;      // final RMSNorm 的外部输出物理内存
     Tensor* t_norm_out = nullptr;         // 图中间张量
-    Tensor* t_logits = nullptr;           // 图出口张量
 
     // 动态边界指针（极其巧妙的零开销技巧：每步只需修改它们的 data 指向）
     Tensor* t_cos = nullptr;
@@ -119,11 +110,11 @@ public:
 
 private:
     // 内部辅助函数：分配固定内存并绑定给 Tensor
-    void allocate_weight(Tensor& t, const std::vector<int>& shape);
-    void allocate_packed_weight(Tensor& t, int K, int N);
-    void prepack_all_weights();
+    void allocate_tensor(Tensor& t, const std::vector<int>& shape, DataType dtype);
+    void allocate_gptq_weight(arm_neon::GPTQInt8Weight& w, int K, int N, int group_size = 128);
     // 内部辅助函数：读取二进制文件
     bool load_tensor_from_bin(const std::string& filepath, Tensor& tensor);
+    bool load_gptq_weight_from_bins(const std::string& prefix, arm_neon::GPTQInt8Weight& w);
     void init_rope_cache();
     void build_graph(KVCache& kv_cache);
 

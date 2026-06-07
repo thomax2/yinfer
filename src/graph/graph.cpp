@@ -24,6 +24,16 @@ Status MatmulNode::forward() {
     int N = B->shape[1];
 
     // 1. 计算需要的 Workspace 大小
+    if (A->dtype == DataType::FP16) {
+        int mp = (M + MR_F16 - 1) / MR_F16;
+        int np = (N + NR_F16 - 1) / NR_F16;
+        size_t ws_size = (size_t)(mp * MR_F16 * K + np * NR_F16 * K) * sizeof(fp16_t);
+        fp16_t* workspace = (fp16_t*)g_memory_pool->allocate(ws_size);
+        Status status = arm_neon::matmul_f16_neon(*A, *B, *C, workspace, false, nullptr);
+        g_memory_pool->free_block(workspace);
+        return status;
+    }
+
     int mp = (M + MR - 1) / MR;
     int np = (N + NR - 1) / NR;
     size_t ws_size = (mp * MR * K + np * NR * K) * sizeof(float);
@@ -66,7 +76,11 @@ AddNode::AddNode(Tensor* A, Tensor* B, Tensor* C) {
 
 Status AddNode::forward() {
     // 调用你手写的 NEON add 算子
-    add_neon(*inputs[0], *inputs[1], *outputs[0]);
+    if (inputs[0]->dtype == DataType::FP16) {
+        add_f16_neon(*inputs[0], *inputs[1], *outputs[0]);
+    } else {
+        add_neon(*inputs[0], *inputs[1], *outputs[0]);
+    }
     return Status::SUCCESS;
 }
 
@@ -78,12 +92,21 @@ RMSNormNode::RMSNormNode(Tensor* X, Tensor* Weight, Tensor* Y, float eps) : eps(
 
 Status RMSNormNode::forward() {
     int n = inputs[0]->shape.back(); // 获取最后一个维度
-    arm_neon::rmsnorm_neon(
-        inputs[0]->ptr<float>(),
-        inputs[1]->ptr<float>(),
-        outputs[0]->ptr<float>(),
-        n, eps
-    );
+    if (inputs[0]->dtype == DataType::FP16) {
+        arm_neon::rmsnorm_f16_neon(
+            inputs[0]->ptr<fp16_t>(),
+            inputs[1]->ptr<fp16_t>(),
+            outputs[0]->ptr<fp16_t>(),
+            n, eps
+        );
+    } else {
+        arm_neon::rmsnorm_neon(
+            inputs[0]->ptr<float>(),
+            inputs[1]->ptr<float>(),
+            outputs[0]->ptr<float>(),
+            n, eps
+        );
+    }
     return Status::SUCCESS;
 }
 
@@ -95,12 +118,21 @@ SwiGLUNode::SwiGLUNode(Tensor* Gate, Tensor* Up, Tensor* Y) {
 
 Status SwiGLUNode::forward() {
     int n = inputs[0]->size();
-    arm_neon::swiglu_neon(
-        inputs[0]->ptr<float>(),
-        inputs[1]->ptr<float>(),
-        outputs[0]->ptr<float>(),
-        n
-    );
+    if (inputs[0]->dtype == DataType::FP16) {
+        arm_neon::swiglu_f16_neon(
+            inputs[0]->ptr<fp16_t>(),
+            inputs[1]->ptr<fp16_t>(),
+            outputs[0]->ptr<fp16_t>(),
+            n
+        );
+    } else {
+        arm_neon::swiglu_neon(
+            inputs[0]->ptr<float>(),
+            inputs[1]->ptr<float>(),
+            outputs[0]->ptr<float>(),
+            n
+        );
+    }
     return Status::SUCCESS;
 }
 
@@ -112,12 +144,21 @@ RoPENode::RoPENode(Tensor* X, Tensor* Cos, Tensor* Sin) {
 
 Status RoPENode::forward() {
     int n = inputs[0]->shape.back();
-    arm_neon::rope_neon(
-        inputs[0]->ptr<float>(),
-        inputs[1]->ptr<float>(),
-        inputs[2]->ptr<float>(),
-        n
-    );
+    if (inputs[0]->dtype == DataType::FP16) {
+        arm_neon::rope_f16_neon(
+            inputs[0]->ptr<fp16_t>(),
+            inputs[1]->ptr<fp16_t>(),
+            inputs[2]->ptr<fp16_t>(),
+            n
+        );
+    } else {
+        arm_neon::rope_neon(
+            inputs[0]->ptr<float>(),
+            inputs[1]->ptr<float>(),
+            inputs[2]->ptr<float>(),
+            n
+        );
+    }
     return Status::SUCCESS;
 }
 
@@ -195,6 +236,45 @@ QwenBlockNode::QwenBlockNode(
 }
 
 Status QwenBlockNode::forward() {
+    if (weights) {
+        Tensor* hidden_states = inputs[0];
+        Tensor* norm1_weight = inputs[1];
+        Tensor* b_q = inputs[2];
+        Tensor* b_k = inputs[3];
+        Tensor* b_v = inputs[4];
+        Tensor* cos = inputs[5];
+        Tensor* sin = inputs[6];
+        Tensor* norm2_weight = inputs[7];
+
+        int num_tokens = hidden_states->shape[0];
+        int hidden_dim = hidden_states->shape[1];
+        size_t buffer_bytes = 2 * align_size((size_t)num_tokens * hidden_dim * sizeof(fp16_t));
+        size_t pack_bytes = 64ULL * 1024 * 1024;
+        size_t total_ws_size = buffer_bytes + pack_bytes;
+        void* raw_ptr = g_memory_pool->allocate(total_ws_size);
+        if (!raw_ptr) return Status::OUT_OF_MEMORY;
+
+        Workspace temp_workspace(raw_ptr, total_ws_size);
+        Status status = arm_neon::qwen_block_f16_gptq_neon(
+            *hidden_states,
+            *norm1_weight,
+            weights->q_proj, weights->k_proj, weights->v_proj, weights->o_proj,
+            b_q->ptr<fp16_t>(), b_k->ptr<fp16_t>(), b_v->ptr<fp16_t>(),
+            cos->ptr<fp16_t>(), sin->ptr<fp16_t>(),
+            *norm2_weight,
+            weights->gate_proj, weights->up_proj, weights->down_proj,
+            *kv_cache,
+            layer_id,
+            *current_pos_ptr,
+            attn_config,
+            ffn_config,
+            rms_norm_eps,
+            temp_workspace
+        );
+        g_memory_pool->free_block(raw_ptr);
+        return status;
+    }
+
     // 1. 解包 Inputs (顺序与构造函数中 push_back 的顺序一致)
     Tensor* hidden_states = inputs[0];
     Tensor* norm1_weight  = inputs[1];
@@ -359,6 +439,41 @@ RoPENode* ComputationGraph::add_rope(Tensor* X,
 ) {
     nodes.push_back(std::make_unique<RoPENode>(X, Cos, Sin));
     return static_cast<RoPENode*>(nodes.back().get());
+}
+
+QwenBlockNode::QwenBlockNode(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    QwenBlockWeights* block_weights,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps)
+    : attn_config(a_conf), ffn_config(f_conf), weights(block_weights),
+      rms_norm_eps(eps), layer_id(l_id), current_pos_ptr(pos_ptr), kv_cache(cache)
+{
+    inputs = {hidden_states, norm1_weight, b_q, b_k, b_v, cos, sin, norm2_weight};
+    outputs = {hidden_states};
+}
+
+QwenBlockNode* ComputationGraph::add_qwen_block(
+    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* b_q, Tensor* b_k, Tensor* b_v,
+    Tensor* cos, Tensor* sin,
+    Tensor* norm2_weight,
+    QwenBlockWeights* weights,
+    KVCache* cache, int l_id, int* pos_ptr,
+    arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
+) {
+    nodes.push_back(std::make_unique<QwenBlockNode>(
+        hidden_states, norm1_weight,
+        b_q, b_k, b_v,
+        cos, sin,
+        norm2_weight,
+        weights,
+        cache, l_id, pos_ptr, a_conf, f_conf, eps
+    ));
+    return static_cast<QwenBlockNode*>(nodes.back().get());
 }
 
 

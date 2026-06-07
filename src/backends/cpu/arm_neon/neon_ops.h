@@ -4,6 +4,7 @@
 #include "llm_engine/status.h"
 #include "llm_engine/memory/kv_cache.h"
 #include "llm_engine/memory/workspace.h"
+#include "backends/cpu/arm_neon/quant_gptq.h"
 
 namespace llm_engine {
 namespace arm_neon {
@@ -15,6 +16,15 @@ Status matmul_neon(
     float* workspace,
     bool transB = false,
     const float* bias = nullptr
+);
+
+Status matmul_f16_neon(
+    const Tensor& A,
+    const Tensor& B,
+    Tensor& C,
+    fp16_t* workspace,
+    bool transB = false,
+    const fp16_t* bias = nullptr
 );
 
 Status gemv_neon_transposed(
@@ -81,6 +91,22 @@ ArgmaxResult linear_decode_prepacked_argmax_serial_neon(
     int N
 );
 
+Status linear_gptq_int8_decode_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias = nullptr,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
+);
+
+ArgmaxResult linear_gptq_int8_decode_argmax_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
+);
+
 // FFN 专用：在 [panel_begin, panel_end) 范围内同时计算 gate / up，
 // 并 fused 完成 SwiGLU。y[i] = silu(gate[i]) * up[i]。
 // w_gate_pack / w_up_pack 与 linear_decode_prepacked_neon 使用同一种 packed 布局。
@@ -120,7 +146,18 @@ Status softmax_neon(
     Tensor& output
 );
 
+Status softmax_f16_neon(
+    const Tensor& input,
+    Tensor& output
+);
+
 void add_neon(
+    const Tensor& A,
+    const Tensor& B,
+    Tensor& C
+);
+
+void add_f16_neon(
     const Tensor& A,
     const Tensor& B,
     Tensor& C
@@ -134,6 +171,14 @@ void rmsnorm_neon(
     float eps
 );
 
+void rmsnorm_f16_neon(
+    const fp16_t* x,
+    const fp16_t* weight,
+    fp16_t* y,
+    int n,
+    float eps
+);
+
 void rope_neon(
     float* x,
     const float* cos,
@@ -141,10 +186,24 @@ void rope_neon(
     int n
 );
 
+void rope_f16_neon(
+    fp16_t* x,
+    const fp16_t* cos,
+    const fp16_t* sin,
+    int n
+);
+
 void swiglu_neon(
     const float* x,
     const float* up,
     float* y,
+    int n
+);
+
+void swiglu_f16_neon(
+    const fp16_t* gate,
+    const fp16_t* up,
+    fp16_t* y,
     int n
 );
 
@@ -162,6 +221,25 @@ Status attention_neon(
     const Tensor& w_q_pack, const Tensor& w_k_pack, const Tensor& w_v_pack, const Tensor& w_o_pack,
     const float* q_bias, const float* k_bias, const float* v_bias,
     const float* cos_ptr, const float* sin_ptr,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+);
+
+Status attention_f16_gptq_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_ptr,
+    const fp16_t* sin_ptr,
     KVCache& kv_cache,
     int layer_id,
     int current_pos,
@@ -200,6 +278,16 @@ Status ffn_neon(
     Workspace& workspace
 );
 
+Status ffn_f16_gptq_neon(
+    const Tensor& hidden_states,
+    Tensor& ffn_output,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
+    const FFNConfig& config,
+    Workspace& workspace
+);
+
 Status ffn_neon(
     const Tensor& hidden_states,
     Tensor& ffn_output,
@@ -220,6 +308,31 @@ Status qwen_block_neon(
     const Tensor& norm2_weight,
     const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down,
     const Tensor& w_gate_pack, const Tensor& w_up_pack, const Tensor& w_down_pack,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& attn_config,
+    const FFNConfig& ffn_config,
+    float rms_norm_eps,
+    Workspace& workspace
+);
+
+Status qwen_block_f16_gptq_neon(
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_ptr,
+    const fp16_t* sin_ptr,
+    const Tensor& norm2_weight,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
     KVCache& kv_cache,
     int layer_id,
     int current_pos,

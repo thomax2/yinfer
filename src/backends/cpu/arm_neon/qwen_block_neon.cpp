@@ -159,5 +159,96 @@ Status qwen_block_neon(
     );
 }
 
+Status qwen_block_f16_gptq_neon(
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_ptr,
+    const fp16_t* sin_ptr,
+    const Tensor& norm2_weight,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
+    KVCache& kv_cache,
+    int layer_id,
+    int current_pos,
+    const AttentionConfig& attn_config,
+    const FFNConfig& ffn_config,
+    float rms_norm_eps,
+    Workspace& workspace
+) {
+    if (hidden_states.dtype != DataType::FP16 ||
+        norm1_weight.dtype != DataType::FP16 ||
+        norm2_weight.dtype != DataType::FP16) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int num_tokens = hidden_states.shape[0];
+    int hidden_dim = hidden_states.shape[1];
+    size_t row_bytes = align_size((size_t)num_tokens * hidden_dim * sizeof(fp16_t));
+    size_t used_bytes = row_bytes * 2;
+    if (workspace.size() < used_bytes) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    char* base = static_cast<char*>(workspace.data());
+    base = align_ptr(base);
+    fp16_t* residual_ptr = reinterpret_cast<fp16_t*>(base);
+    base += row_bytes;
+    base = align_ptr(base);
+    fp16_t* norm_ptr = reinterpret_cast<fp16_t*>(base);
+    base += row_bytes;
+
+    Tensor residual({num_tokens, hidden_dim}, residual_ptr, DataType::FP16);
+    Tensor norm_out({num_tokens, hidden_dim}, norm_ptr, DataType::FP16);
+    Workspace sub_workspace(base, workspace.size() - used_bytes);
+
+    std::memcpy(residual_ptr, hidden_states.ptr<fp16_t>(), (size_t)num_tokens * hidden_dim * sizeof(fp16_t));
+    for (int i = 0; i < num_tokens; ++i) {
+        rmsnorm_f16_neon(
+            hidden_states.ptr<fp16_t>() + (size_t)i * hidden_dim,
+            norm1_weight.ptr<fp16_t>(),
+            norm_ptr + (size_t)i * hidden_dim,
+            hidden_dim,
+            rms_norm_eps);
+    }
+
+    Status status = attention_f16_gptq_neon(
+        norm_out, hidden_states,
+        q_proj, k_proj, v_proj, o_proj,
+        q_bias, k_bias, v_bias,
+        cos_ptr, sin_ptr,
+        kv_cache, layer_id, current_pos,
+        attn_config, sub_workspace);
+    if (status != Status::SUCCESS) return status;
+
+    add_f16_neon(residual, hidden_states, hidden_states);
+
+    std::memcpy(residual_ptr, hidden_states.ptr<fp16_t>(), (size_t)num_tokens * hidden_dim * sizeof(fp16_t));
+    for (int i = 0; i < num_tokens; ++i) {
+        rmsnorm_f16_neon(
+            hidden_states.ptr<fp16_t>() + (size_t)i * hidden_dim,
+            norm2_weight.ptr<fp16_t>(),
+            norm_ptr + (size_t)i * hidden_dim,
+            hidden_dim,
+            rms_norm_eps);
+    }
+
+    status = ffn_f16_gptq_neon(
+        norm_out, hidden_states,
+        gate_proj, up_proj, down_proj,
+        ffn_config, sub_workspace);
+    if (status != Status::SUCCESS) return status;
+
+    add_f16_neon(residual, hidden_states, hidden_states);
+    return Status::SUCCESS;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

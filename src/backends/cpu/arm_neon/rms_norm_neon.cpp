@@ -52,5 +52,45 @@ void rmsnorm_neon(
     }
 }
 
+void rmsnorm_f16_neon(
+    const fp16_t* x,
+    const fp16_t* weight,
+    fp16_t* y,
+    int n,
+    float eps
+) {
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+
+    int i = 0;
+    for (; i <= n - 8; i += 8) {
+        float16x8_t hx = vld1q_f16(x + i);
+        float32x4_t lo = vcvt_f32_f16(vget_low_f16(hx));
+        float32x4_t hi = vcvt_f32_f16(vget_high_f16(hx));
+        sum0 = vfmaq_f32(sum0, lo, lo);
+        sum1 = vfmaq_f32(sum1, hi, hi);
+    }
+
+    float sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+    for (; i < n; ++i) {
+        float v = (float)x[i];
+        sum += v * v;
+    }
+
+    float scale = 1.0f / std::sqrt(sum / n + eps);
+    float16x8_t hscale = vdupq_n_f16((fp16_t)scale);
+
+    i = 0;
+    for (; i <= n - 8; i += 8) {
+        float16x8_t hx = vld1q_f16(x + i);
+        float16x8_t hw = vld1q_f16(weight + i);
+        float16x8_t hy = vmulq_f16(vmulq_f16(hx, hscale), hw);
+        vst1q_f16(y + i, hy);
+    }
+    for (; i < n; ++i) {
+        y[i] = (fp16_t)((float)x[i] * scale * (float)weight[i]);
+    }
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

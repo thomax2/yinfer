@@ -105,9 +105,9 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
     // 4. 工业级内存规划 (Static Memory Arena Planner)
     // ===================================================================
     
-    // 辅助函数：16 字节对齐
+    // 辅助函数：64 字节 cache-line 对齐
     auto align_size = [](size_t size) -> size_t {
-        return (size + 15) & ~15;
+        return (size + 63) & ~63;
     };
 
     size_t peak_memory = 0; 
