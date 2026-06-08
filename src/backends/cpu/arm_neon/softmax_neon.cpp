@@ -165,6 +165,18 @@ Status softmax_f16_neon(const Tensor& input, Tensor& output) {
             max_val = std::max(max_val, (float)in[i]);
         }
 
+        if (std::isinf(max_val)) {
+            int inf_count = 0;
+            for (i = 0; i < seq_len; ++i) {
+                if ((float)in[i] == max_val) inf_count++;
+            }
+            fp16_t v_inf = (fp16_t)(inf_count > 0 ? 1.0f / inf_count : 0.0f);
+            for (i = 0; i < seq_len; ++i) {
+                out[i] = ((float)in[i] == max_val) ? v_inf : (fp16_t)0;
+            }
+            continue;
+        }
+
         float sum = 0.0f;
         for (i = 0; i < seq_len; ++i) {
             float e = std::exp((float)in[i] - max_val);

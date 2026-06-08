@@ -246,57 +246,25 @@ Status matmul_f16_neon(
     int M = A.shape[0];
     int K = A.shape[1];
     int N = transB ? B.shape[0] : B.shape[1];
-    int ldb = transB ? K : N;
 
     const fp16_t* a = A.ptr<fp16_t>();
     const fp16_t* b = B.ptr<fp16_t>();
     fp16_t* c = C.ptr<fp16_t>();
 
-    int mp = (M + MR_F16 - 1) / MR_F16;
-    int np = (N + NR_F16 - 1) / NR_F16;
-
-    fp16_t* A_pack = workspace;
-    fp16_t* B_pack = workspace + (size_t)mp * MR_F16 * K;
-
-    pack_A_f16(a, A_pack, M, K, K);
-    if (transB) {
-        pack_B_trans_f16(b, B_pack, K, N, ldb);
-    } else {
-        pack_B_f16(b, B_pack, K, N, ldb);
-    }
-
-    for (int i = 0; i < mp; ++i) {
-        const fp16_t* Ap = A_pack + (size_t)i * MR_F16 * K;
-        int actual_m = std::min(MR_F16, M - i * MR_F16);
-        for (int j = 0; j < np; ++j) {
-            const fp16_t* Bp = B_pack + (size_t)j * K * NR_F16;
-            int actual_n = std::min(NR_F16, N - j * NR_F16);
-            if (actual_m == MR_F16 && actual_n == NR_F16) {
-                gemm_kernel_f16_8x16_neon(Ap, Bp, c + (size_t)i * MR_F16 * N + j * NR_F16, K, N);
-            } else {
-                fp16_t temp[MR_F16 * NR_F16] = {};
-                gemm_kernel_f16_8x16_neon(Ap, Bp, temp, K, NR_F16);
-                for (int r = 0; r < actual_m; ++r) {
-                    for (int col = 0; col < actual_n; ++col) {
-                        c[(size_t)(i * MR_F16 + r) * N + (j * NR_F16 + col)] =
-                            temp[r * NR_F16 + col];
-                    }
-                }
+    // Correctness-first FP32 accumulation. The old FP16 micro-kernel can overflow
+    // attention scores on Qwen2.5-1.5B and turn softmax into NaN.
+    (void)workspace;
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float sum = bias ? (float)bias[n] : 0.0f;
+            for (int k = 0; k < K; ++k) {
+                float av = (float)a[(size_t)m * K + k];
+                float bv = transB
+                    ? (float)b[(size_t)n * K + k]
+                    : (float)b[(size_t)k * N + n];
+                sum += av * bv;
             }
-        }
-    }
-
-    if (bias) {
-        for (int m = 0; m < M; ++m) {
-            int n = 0;
-            for (; n <= N - 8; n += 8) {
-                float16x8_t v = vld1q_f16(c + (size_t)m * N + n);
-                float16x8_t bvec = vld1q_f16(bias + n);
-                vst1q_f16(c + (size_t)m * N + n, vaddq_f16(v, bvec));
-            }
-            for (; n < N; ++n) {
-                c[(size_t)m * N + n] = (fp16_t)((float)c[(size_t)m * N + n] + (float)bias[n]);
-            }
+            c[(size_t)m * N + n] = (fp16_t)sum;
         }
     }
 
