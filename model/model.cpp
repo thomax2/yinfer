@@ -265,6 +265,19 @@ int QwenModel::forward(int token_id, int pos, KVCache& cache) {
         0);
     forward_debug_last_result.token_id = result.index;
     forward_debug_last_result.logit = result.value;
+    if (result.index < 0 || result.index >= config.vocab_size) {
+        std::cerr << "[ERROR] lm_head argmax failed"
+                  << " index=" << result.index
+                  << " value=" << result.value
+                  << " K=" << lm_head.K
+                  << " N=" << lm_head.N
+                  << " qweight=" << lm_head.qweight_pack.data
+                  << " scales=" << lm_head.scales_pack.data
+                  << " zeros=" << lm_head.zeros_pack.data
+                  << " norm_out=" << t_norm_out->data
+                  << std::endl;
+        return -1;
+    }
     return result.index;
 }
 
@@ -280,6 +293,13 @@ void QwenModel::generate(
         if (history_pos >= config.max_seq_len) return;
         next_token = forward(tok, history_pos, *kv_cache);
         history_pos++;
+        if (next_token < 0) {
+            std::cerr << "[ERROR] prompt forward failed"
+                      << " token=" << tok
+                      << " pos=" << (history_pos - 1)
+                      << std::endl;
+            return;
+        }
     }
 
     int current_token = next_token;

@@ -5,8 +5,22 @@
 #include <queue>
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 namespace llm_engine {
+
+namespace {
+bool env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v) return false;
+    return std::string(v) == "1" ||
+           std::string(v) == "true" ||
+           std::string(v) == "TRUE" ||
+           std::string(v) == "on" ||
+           std::string(v) == "ON";
+}
+} // namespace
 
 struct TensorLife {
     int start = -1;
@@ -49,16 +63,21 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
         }
     }
 
+    bool debug_graph = env_flag("LLM_DEBUG_GRAPH");
     // ===== 3. 打印生命周期（debug用） =====
-    std::cout << "\n=== Tensor Liveness ===\n";
+    if (debug_graph) {
+        std::cout << "\n=== Tensor Liveness ===\n";
+    }
 
     for(auto& kv : life) {
         auto* t = kv.first;
         auto& l = kv.second;
 
-        std::cout << "Tensor@" << t
-                  << " : [" << l.start
-                  << ", " << l.end << "]\n";
+        if (debug_graph) {
+            std::cout << "Tensor@" << t
+                      << " : [" << l.start
+                      << ", " << l.end << "]\n";
+        }
     }
 
     // ===== 3.1 自动推导并保护 Input 和 Output (核心新增保护逻辑) =====
@@ -188,7 +207,9 @@ std::vector<GraphNode*> GraphCompiler::compile(ComputationGraph& graph) {
         }
     }
 
-    std::cout << "\n[Memory Planner] Peak Workspace Required: " << peak_memory / 1024.0 / 1024.0 << " MB\n";
+    if (debug_graph) {
+        std::cout << "\n[Memory Planner] Peak Workspace Required: " << peak_memory / 1024.0 / 1024.0 << " MB\n";
+    }
 
     // ===================================================================
     // 5. 零分配运行态准备 (Zero-Allocation Binding)
