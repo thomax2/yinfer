@@ -15,6 +15,16 @@ namespace llm_engine {
 
 namespace {
 
+constexpr int QWEN_EOT_ID = 151643;      // <|endoftext|>
+constexpr int QWEN_IM_START_ID = 151644; // <|im_start|>
+constexpr int QWEN_IM_END_ID = 151645;   // <|im_end|>
+
+bool is_stop_token(int token_id) {
+    return token_id == QWEN_EOT_ID ||
+           token_id == QWEN_IM_START_ID ||
+           token_id == QWEN_IM_END_ID;
+}
+
 std::string join_path(const std::string& dir, const std::string& name) {
     if (dir.empty()) return name;
     char last = dir.back();
@@ -332,6 +342,14 @@ void QwenModel::generate(
 
     int current_token = next_token;
     for (int i = 0; i < max_new_tokens && current_token >= 0; ++i) {
+        if (is_stop_token(current_token)) {
+            if (history_pos < config.max_seq_len) {
+                forward(current_token, history_pos, *kv_cache);
+                history_pos++;
+            }
+            break;
+        }
+
         if (!callback(current_token)) break;
         if (history_pos >= config.max_seq_len) break;
         current_token = forward(current_token, history_pos, *kv_cache);
