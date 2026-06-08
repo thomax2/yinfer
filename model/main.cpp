@@ -67,9 +67,12 @@ int main(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
 
-    // 1. 初始化引擎最核心的全局内存池 (FP16 KV cache + GPTQ packed weights)
+    // 1. 初始化引擎最核心的全局内存池。
+    // Qwen2.5-1.5B 的 GPTQ packed weights + FP16 embedding 约 2GB+，
+    // 默认给 3GB；可用 LLM_MEMORY_POOL_MB 覆盖。
     if (g_memory_pool == nullptr) {
-        g_memory_pool = new MemoryPool(1024ULL * 1024 * 1024);
+        int pool_mb = main_env_int("LLM_MEMORY_POOL_MB", 3072);
+        g_memory_pool = new MemoryPool((size_t)pool_mb * 1024ULL * 1024ULL);
     }
 
     QwenConfig cfg;

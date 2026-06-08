@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <sstream>
 
 namespace llm_engine {
@@ -100,6 +101,16 @@ void QwenModel::allocate_tensor(Tensor& t, const std::vector<int>& shape, DataTy
     for (int d : shape) elements *= static_cast<size_t>(d);
     size_t bytes = elements * dtype_size(dtype);
     t.data = g_memory_pool->allocate(bytes);
+    if (!t.data) {
+        std::ostringstream oss;
+        oss << "MemoryPool allocation failed: bytes=" << bytes << " shape=[";
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i) oss << ",";
+            oss << shape[i];
+        }
+        oss << "] dtype=" << static_cast<int>(dtype);
+        throw std::runtime_error(oss.str());
+    }
     std::memset(t.data, 0, bytes);
     weight_ptrs.push_back(t.data);
 
@@ -247,7 +258,7 @@ int QwenModel::forward(int token_id, int pos, KVCache& cache) {
         return -1;
     }
 
-    ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
+    arm_neon::ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
         t_norm_out->ptr<fp16_t>(),
         lm_head,
         nullptr,
