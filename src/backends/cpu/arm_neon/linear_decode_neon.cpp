@@ -5,12 +5,24 @@
 #include <atomic>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <string>
 #include <vector>
 #include <arm_neon.h>
 
 namespace llm_engine {
 namespace arm_neon {
+
+namespace {
+bool debug_numeric_enabled() {
+    const char* v = std::getenv("LLM_DEBUG_NUMERIC");
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+} // namespace
 
 // =============================================================================
 // Range kernel：计算 [panel_begin, panel_end) 范围内的输出通道
@@ -398,6 +410,11 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
     const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
     const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+    bool debug_numeric = debug_numeric_enabled();
+    int x_nan = 0;
+    int scale_nan = 0;
+    int logit_nan = 0;
+    int logit_finite = 0;
 
     for (int panel = 0; panel < np; ++panel) {
         float16x8_t acc0 = vdupq_n_f16((fp16_t)0);
@@ -412,6 +429,10 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
             fp16_t dq0[8];
             fp16_t dq1[8];
             for (int lane = 0; lane < 8; ++lane) {
+                if (debug_numeric) {
+                    if (std::isnan((float)s[lane])) scale_nan++;
+                    if (std::isnan((float)s[lane + 8])) scale_nan++;
+                }
                 int z0 = z ? z[lane] : 0;
                 int z1 = z ? z[lane + 8] : 0;
                 dq0[lane] = (fp16_t)((float)(q[lane] - z0) * (float)s[lane]);
@@ -419,6 +440,7 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
             }
 
             fp16_t xv = x[k];
+            if (debug_numeric && std::isnan((float)xv)) x_nan++;
             acc0 = vfmaq_n_f16(acc0, vld1q_f16(dq0), xv);
             acc1 = vfmaq_n_f16(acc1, vld1q_f16(dq1), xv);
         }
@@ -430,12 +452,27 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
         vst1q_f16(tmp + 8, acc1);
         for (int lane = 0; lane < actual_n; ++lane) {
             float v = (float)tmp[lane];
+            if (debug_numeric) {
+                if (std::isnan(v)) logit_nan++;
+                else if (std::isfinite(v)) logit_finite++;
+            }
             int index = col + lane;
             if (v > result.value || (v == result.value && (result.index < 0 || index < result.index))) {
                 result.value = v;
                 result.index = index;
             }
         }
+    }
+
+    if (debug_numeric) {
+        std::cerr << "[NUMERIC] lm_head_argmax"
+                  << " x_nan=" << x_nan
+                  << " scale_nan=" << scale_nan
+                  << " logit_nan=" << logit_nan
+                  << " logit_finite=" << logit_finite
+                  << " result_index=" << result.index
+                  << " result_value=" << result.value
+                  << std::endl;
     }
 
     return result;

@@ -1,9 +1,52 @@
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include <vector>
 #include <cstring> // for memcpy
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string>
 
 namespace llm_engine {
 namespace arm_neon {
+
+namespace {
+bool debug_numeric_enabled() {
+    const char* v = std::getenv("LLM_DEBUG_NUMERIC");
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+void dump_f16_stats(const char* tag, int layer_id, const fp16_t* data, int n) {
+    int finite_count = 0;
+    int nan_count = 0;
+    int inf_count = 0;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        float v = (float)data[i];
+        if (std::isnan(v)) {
+            nan_count++;
+        } else if (!std::isfinite(v)) {
+            inf_count++;
+        } else {
+            finite_count++;
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+        }
+    }
+    std::cerr << "[NUMERIC] layer=" << layer_id
+              << " stage=" << tag
+              << " finite=" << finite_count
+              << " nan=" << nan_count
+              << " inf=" << inf_count
+              << " min=" << min_v
+              << " max=" << max_v
+              << std::endl;
+}
+} // namespace
 
 // Qwen Block 计算流
 Status qwen_block_neon(
@@ -228,7 +271,15 @@ Status qwen_block_f16_gptq_neon(
         attn_config, sub_workspace);
     if (status != Status::SUCCESS) return status;
 
+    bool debug_numeric = debug_numeric_enabled();
+    if (debug_numeric) {
+        dump_f16_stats("attn_out", layer_id, hidden_states.ptr<fp16_t>(), num_tokens * hidden_dim);
+    }
+
     add_f16_neon(residual, hidden_states, hidden_states);
+    if (debug_numeric) {
+        dump_f16_stats("attn_residual", layer_id, hidden_states.ptr<fp16_t>(), num_tokens * hidden_dim);
+    }
 
     std::memcpy(residual_ptr, hidden_states.ptr<fp16_t>(), (size_t)num_tokens * hidden_dim * sizeof(fp16_t));
     for (int i = 0; i < num_tokens; ++i) {
@@ -246,7 +297,14 @@ Status qwen_block_f16_gptq_neon(
         ffn_config, sub_workspace);
     if (status != Status::SUCCESS) return status;
 
+    if (debug_numeric) {
+        dump_f16_stats("ffn_out", layer_id, hidden_states.ptr<fp16_t>(), num_tokens * hidden_dim);
+    }
+
     add_f16_neon(residual, hidden_states, hidden_states);
+    if (debug_numeric) {
+        dump_f16_stats("ffn_residual", layer_id, hidden_states.ptr<fp16_t>(), num_tokens * hidden_dim);
+    }
     return Status::SUCCESS;
 }
 

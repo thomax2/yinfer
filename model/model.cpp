@@ -258,6 +258,34 @@ int QwenModel::forward(int token_id, int pos, KVCache& cache) {
         return -1;
     }
 
+    if (env_flag("LLM_DEBUG_NUMERIC")) {
+        const fp16_t* norm = t_norm_out->ptr<fp16_t>();
+        int finite_count = 0;
+        int nan_count = 0;
+        int inf_count = 0;
+        float min_v = std::numeric_limits<float>::infinity();
+        float max_v = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            float v = (float)norm[i];
+            if (std::isnan(v)) {
+                nan_count++;
+            } else if (!std::isfinite(v)) {
+                inf_count++;
+            } else {
+                finite_count++;
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+        }
+        std::cerr << "[NUMERIC] final_norm_out"
+                  << " finite=" << finite_count
+                  << " nan=" << nan_count
+                  << " inf=" << inf_count
+                  << " min=" << min_v
+                  << " max=" << max_v
+                  << std::endl;
+    }
+
     arm_neon::ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
         t_norm_out->ptr<fp16_t>(),
         lm_head,
