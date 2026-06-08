@@ -4,10 +4,52 @@
 #include "llm_engine/tensor.h"
 #include <cassert>
 #include <cmath>
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string>
 #include <arm_neon.h>
 
 namespace llm_engine {
 namespace arm_neon {
+
+namespace {
+bool debug_numeric_enabled() {
+    const char* v = std::getenv("LLM_DEBUG_NUMERIC");
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+void dump_f16_stats(const char* tag, int layer_id, const fp16_t* data, int n) {
+    int finite_count = 0;
+    int nan_count = 0;
+    int inf_count = 0;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        float v = (float)data[i];
+        if (std::isnan(v)) {
+            nan_count++;
+        } else if (!std::isfinite(v)) {
+            inf_count++;
+        } else {
+            finite_count++;
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+        }
+    }
+    std::cerr << "[NUMERIC] layer=" << layer_id
+              << " stage=" << tag
+              << " finite=" << finite_count
+              << " nan=" << nan_count
+              << " inf=" << inf_count
+              << " min=" << min_v
+              << " max=" << max_v
+              << std::endl;
+}
+} // namespace
 
 Status attention_neon(
     const Tensor& hidden_states, // [1, hidden_dim]
@@ -259,6 +301,7 @@ Status attention_f16_gptq_neon(
     const AttentionConfig& config,
     Workspace& workspace
 ) {
+    bool debug_numeric = debug_numeric_enabled();
     if (hidden_states.dtype != DataType::FP16 || attn_output.dtype != DataType::FP16) {
         return Status::INVALID_ARGUMENT;
     }
@@ -297,12 +340,22 @@ Status attention_f16_gptq_neon(
     status = linear_gptq_int8_decode_neon(
         hidden_states.ptr<fp16_t>(), v_proj, v_ptr, v_bias, nullptr, 0);
     if (status != Status::SUCCESS) return status;
+    if (debug_numeric) {
+        dump_f16_stats("attn_norm_in", layer_id, hidden_states.ptr<fp16_t>(), hidden_dim);
+        dump_f16_stats("q_decode", layer_id, q_ptr, q_size);
+        dump_f16_stats("k_decode", layer_id, k_ptr, kv_size);
+        dump_f16_stats("v_decode", layer_id, v_ptr, kv_size);
+    }
 
     for (int h = 0; h < config.num_q_heads; ++h) {
         rope_f16_neon(q_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
     }
     for (int h = 0; h < config.num_kv_heads; ++h) {
         rope_f16_neon(k_ptr + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+    }
+    if (debug_numeric) {
+        dump_f16_stats("q_rope", layer_id, q_ptr, q_size);
+        dump_f16_stats("k_rope", layer_id, k_ptr, kv_size);
     }
 
     kv_cache.update(layer_id, current_pos, k_ptr, v_ptr);
@@ -324,21 +377,37 @@ Status attention_f16_gptq_neon(
 
         status = matmul_f16_neon(Q_group, K_cache, Score, matmul_ws, true, nullptr);
         if (status != Status::SUCCESS) return status;
+        if (debug_numeric) {
+            dump_f16_stats("score_matmul", layer_id, score_ptr, num_rep * current_seq_len);
+        }
 
         int total_score = num_rep * current_seq_len;
         for (int i = 0; i < total_score; ++i) {
             score_ptr[i] = (fp16_t)((float)score_ptr[i] * scale);
         }
+        if (debug_numeric) {
+            dump_f16_stats("score_scaled", layer_id, score_ptr, total_score);
+        }
 
         status = softmax_f16_neon(Score, Score);
         if (status != Status::SUCCESS) return status;
+        if (debug_numeric) {
+            dump_f16_stats("score_softmax", layer_id, score_ptr, total_score);
+        }
 
         status = matmul_f16_neon(Score, V_cache, Out_group, matmul_ws, false, nullptr);
         if (status != Status::SUCCESS) return status;
+        if (debug_numeric) {
+            dump_f16_stats("attn_group_out", layer_id, out_group_ptr, num_rep * config.head_dim);
+        }
     }
 
-    return linear_gptq_int8_decode_neon(
+    status = linear_gptq_int8_decode_neon(
         attn_out_ptr, o_proj, attn_output.ptr<fp16_t>(), nullptr, nullptr, 0);
+    if (debug_numeric) {
+        dump_f16_stats("o_proj_out", layer_id, attn_output.ptr<fp16_t>(), hidden_dim);
+    }
+    return status;
 }
 
 } // namespace arm_neon
