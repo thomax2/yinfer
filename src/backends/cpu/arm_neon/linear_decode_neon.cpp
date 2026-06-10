@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 #include <arm_neon.h>
 
@@ -361,25 +362,33 @@ static inline int gptq_group_for_k(const GPTQInt8Weight& w, int k) {
     return k / w.group_size;
 }
 
-Status linear_gptq_int8_decode_neon(
+constexpr int GPTQ_PARALLEL_N_THRESHOLD = 4096;
+constexpr int GPTQ_FUSED_PARALLEL_N_THRESHOLD = 1024;
+constexpr int GPTQ_PARALLEL_GRAIN_PANELS = 16;
+
+static Status linear_gptq_int8_decode_range_neon(
     const fp16_t* x,
     const GPTQInt8Weight& w,
     fp16_t* y,
     const fp16_t* bias,
-    void*,
-    size_t
+    int panel_begin,
+    int panel_end
 ) {
     if (!x || !y || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (panel_begin < 0 || panel_end < panel_begin) {
         return Status::INVALID_ARGUMENT;
     }
 
     const int K_pad = ((w.K + 7) / 8) * 8;
     const int np = (w.N + NR_F16 - 1) / NR_F16;
+    if (panel_end > np) panel_end = np;
     const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
     const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
     const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
 
-    for (int panel = 0; panel < np; ++panel) {
+    for (int panel = panel_begin; panel < panel_end; ++panel) {
         // One panel owns 16 contiguous output channels. Keep four FP32
         // accumulators so W8A16 dequantization does not lose range while the
         // output panel stays in registers.
@@ -459,13 +468,44 @@ Status linear_gptq_int8_decode_neon(
     return Status::SUCCESS;
 }
 
-Status fused_gate_up_swiglu_gptq_int8_decode_neon(
+Status linear_gptq_int8_decode_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    void*,
+    size_t
+) {
+    if (!x || !y || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int np = (w.N + NR_F16 - 1) / NR_F16;
+    if (g_thread_pool == nullptr ||
+        g_thread_pool->num_threads() <= 1 ||
+        w.N < GPTQ_PARALLEL_N_THRESHOLD) {
+        return linear_gptq_int8_decode_range_neon(x, w, y, bias, 0, np);
+    }
+
+    std::atomic<int> err_flag(0);
+    g_thread_pool->parallel_for(0, np, GPTQ_PARALLEL_GRAIN_PANELS, [&](int pb, int pe) {
+        Status s = linear_gptq_int8_decode_range_neon(x, w, y, bias, pb, pe);
+        if (s != Status::SUCCESS) {
+            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
+        }
+    });
+
+    int err = err_flag.load(std::memory_order_relaxed);
+    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+}
+
+static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
     const fp16_t* x,
     const GPTQInt8Weight& gate_proj,
     const GPTQInt8Weight& up_proj,
     fp16_t* y,
-    void*,
-    size_t
+    int panel_begin,
+    int panel_end
 ) {
     if (!x || !y ||
         !gate_proj.qweight_pack.data || !gate_proj.scales_pack.data ||
@@ -474,11 +514,15 @@ Status fused_gate_up_swiglu_gptq_int8_decode_neon(
         gate_proj.K != up_proj.K || gate_proj.N != up_proj.N) {
         return Status::INVALID_ARGUMENT;
     }
+    if (panel_begin < 0 || panel_end < panel_begin) {
+        return Status::INVALID_ARGUMENT;
+    }
 
     const int K = gate_proj.K;
     const int N = gate_proj.N;
     const int K_pad = ((K + 7) / 8) * 8;
     const int np = (N + NR_F16 - 1) / NR_F16;
+    if (panel_end > np) panel_end = np;
 
     const int8_t* g_qpack = gate_proj.qweight_pack.ptr<int8_t>();
     const fp16_t* g_spack = gate_proj.scales_pack.ptr<fp16_t>();
@@ -488,7 +532,7 @@ Status fused_gate_up_swiglu_gptq_int8_decode_neon(
     const fp16_t* u_spack = up_proj.scales_pack.ptr<fp16_t>();
     const int8_t* u_zpack = up_proj.zeros_pack.data ? up_proj.zeros_pack.ptr<int8_t>() : nullptr;
 
-    for (int panel = 0; panel < np; ++panel) {
+    for (int panel = panel_begin; panel < panel_end; ++panel) {
         float32x4_t g0 = vdupq_n_f32(0.0f);
         float32x4_t g1 = vdupq_n_f32(0.0f);
         float32x4_t g2 = vdupq_n_f32(0.0f);
@@ -597,29 +641,78 @@ Status fused_gate_up_swiglu_gptq_int8_decode_neon(
     return Status::SUCCESS;
 }
 
-ArgmaxResult linear_gptq_int8_decode_argmax_neon(
+Status fused_gate_up_swiglu_gptq_int8_decode_neon(
     const fp16_t* x,
-    const GPTQInt8Weight& w,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    fp16_t* y,
     void*,
     size_t
+) {
+    if (!x || !y ||
+        !gate_proj.qweight_pack.data || !gate_proj.scales_pack.data ||
+        !up_proj.qweight_pack.data || !up_proj.scales_pack.data ||
+        gate_proj.K <= 0 || gate_proj.N <= 0 ||
+        gate_proj.K != up_proj.K || gate_proj.N != up_proj.N) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int np = (gate_proj.N + NR_F16 - 1) / NR_F16;
+    if (g_thread_pool == nullptr ||
+        g_thread_pool->num_threads() <= 1 ||
+        gate_proj.N < GPTQ_FUSED_PARALLEL_N_THRESHOLD) {
+        return fused_gate_up_swiglu_gptq_int8_decode_range_neon(
+            x, gate_proj, up_proj, y, 0, np);
+    }
+
+    std::atomic<int> err_flag(0);
+    g_thread_pool->parallel_for(0, np, GPTQ_PARALLEL_GRAIN_PANELS, [&](int pb, int pe) {
+        Status s = fused_gate_up_swiglu_gptq_int8_decode_range_neon(
+            x, gate_proj, up_proj, y, pb, pe);
+        if (s != Status::SUCCESS) {
+            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
+        }
+    });
+
+    int err = err_flag.load(std::memory_order_relaxed);
+    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+}
+
+struct GptqArgmaxDebugStats {
+    int x_nan = 0;
+    int scale_nan = 0;
+    int logit_nan = 0;
+    int logit_finite = 0;
+};
+
+static ArgmaxResult linear_gptq_int8_decode_argmax_range_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    int panel_begin,
+    int panel_end,
+    bool debug_numeric,
+    GptqArgmaxDebugStats* stats
 ) {
     ArgmaxResult result{-1, -std::numeric_limits<float>::infinity()};
     if (!x || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
         return result;
     }
+    if (panel_begin < 0 || panel_end < panel_begin) {
+        return result;
+    }
 
     const int K_pad = ((w.K + 7) / 8) * 8;
     const int np = (w.N + NR_F16 - 1) / NR_F16;
+    if (panel_end > np) panel_end = np;
     const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
     const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
     const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
-    bool debug_numeric = debug_numeric_enabled();
     int x_nan = 0;
     int scale_nan = 0;
     int logit_nan = 0;
     int logit_finite = 0;
 
-    for (int panel = 0; panel < np; ++panel) {
+    for (int panel = panel_begin; panel < panel_end; ++panel) {
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
         float32x4_t acc2 = vdupq_n_f32(0.0f);
@@ -689,12 +782,93 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
         }
     }
 
+    if (debug_numeric && stats) {
+        stats->x_nan += x_nan;
+        stats->scale_nan += scale_nan;
+        stats->logit_nan += logit_nan;
+        stats->logit_finite += logit_finite;
+    }
+
+    return result;
+}
+
+ArgmaxResult linear_gptq_int8_decode_argmax_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    void*,
+    size_t
+) {
+    ArgmaxResult result{-1, -std::numeric_limits<float>::infinity()};
+    if (!x || !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0) {
+        return result;
+    }
+
+    const int np = (w.N + NR_F16 - 1) / NR_F16;
+    bool debug_numeric = debug_numeric_enabled();
+    GptqArgmaxDebugStats total_stats;
+
+    if (g_thread_pool == nullptr ||
+        g_thread_pool->num_threads() <= 1 ||
+        w.N < GPTQ_PARALLEL_N_THRESHOLD) {
+        result = linear_gptq_int8_decode_argmax_range_neon(
+            x, w, 0, np, debug_numeric, &total_stats);
+    } else {
+        int n_threads = g_thread_pool->num_threads();
+        int max_chunks = (np + GPTQ_PARALLEL_GRAIN_PANELS - 1) / GPTQ_PARALLEL_GRAIN_PANELS;
+        int n_chunks = std::min(n_threads, max_chunks);
+        if (n_chunks <= 1) {
+            result = linear_gptq_int8_decode_argmax_range_neon(
+                x, w, 0, np, debug_numeric, &total_stats);
+        } else {
+            std::vector<ArgmaxResult> partials(
+                n_chunks, ArgmaxResult{-1, -std::numeric_limits<float>::infinity()});
+            std::vector<GptqArgmaxDebugStats> partial_stats(n_chunks);
+            std::vector<std::pair<int, int>> ranges;
+            ranges.reserve(n_chunks);
+
+            int base = np / n_chunks;
+            int rem = np % n_chunks;
+            int cursor = 0;
+            for (int i = 0; i < n_chunks; ++i) {
+                int len = base + (i < rem ? 1 : 0);
+                ranges.push_back({cursor, cursor + len});
+                cursor += len;
+            }
+
+            g_thread_pool->parallel_for(0, n_chunks, 1, [&](int sb, int se) {
+                for (int slot = sb; slot < se; ++slot) {
+                    partials[slot] = linear_gptq_int8_decode_argmax_range_neon(
+                        x, w,
+                        ranges[slot].first,
+                        ranges[slot].second,
+                        debug_numeric,
+                        &partial_stats[slot]);
+                }
+            });
+
+            for (int i = 0; i < n_chunks; ++i) {
+                const auto& p = partials[i];
+                if (p.index >= 0 &&
+                    (p.value > result.value ||
+                     (p.value == result.value && (result.index < 0 || p.index < result.index)))) {
+                    result = p;
+                }
+                if (debug_numeric) {
+                    total_stats.x_nan += partial_stats[i].x_nan;
+                    total_stats.scale_nan += partial_stats[i].scale_nan;
+                    total_stats.logit_nan += partial_stats[i].logit_nan;
+                    total_stats.logit_finite += partial_stats[i].logit_finite;
+                }
+            }
+        }
+    }
+
     if (debug_numeric) {
         std::cerr << "[NUMERIC] lm_head_argmax"
-                  << " x_nan=" << x_nan
-                  << " scale_nan=" << scale_nan
-                  << " logit_nan=" << logit_nan
-                  << " logit_finite=" << logit_finite
+                  << " x_nan=" << total_stats.x_nan
+                  << " scale_nan=" << total_stats.scale_nan
+                  << " logit_nan=" << total_stats.logit_nan
+                  << " logit_finite=" << total_stats.logit_finite
                   << " result_index=" << result.index
                   << " result_value=" << result.value
                   << std::endl;
