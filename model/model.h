@@ -119,6 +119,8 @@ private:
     bool load_gptq_weight_from_bins(const std::string& prefix, arm_neon::GPTQInt8Weight& w);
     void init_rope_cache();
     void build_graph(KVCache& kv_cache);
+    void ensure_block_workspace();
+    int prefill_prompt_batch(const std::vector<int>& input_tokens, int start_pos, KVCache& kv_cache);
 
     // ========== Debug 辅助 ==========
     static bool env_flag(const char* name);

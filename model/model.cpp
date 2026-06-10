@@ -228,6 +228,28 @@ void QwenModel::init_rope_cache() {
     }
 }
 
+void QwenModel::ensure_block_workspace() {
+    size_t row_bytes = align_size((size_t)config.hidden_dim * sizeof(fp16_t));
+    size_t required_block_workspace = 2 * row_bytes + 64ULL * 1024 * 1024 + 64;
+    if (block_workspace_bytes >= required_block_workspace) {
+        return;
+    }
+
+    if (block_workspace) {
+        g_memory_pool->free_block(block_workspace);
+        block_workspace = nullptr;
+        block_workspace_bytes = 0;
+    }
+
+    block_workspace = g_memory_pool->allocate(required_block_workspace);
+    if (!block_workspace) {
+        throw std::runtime_error("MemoryPool allocation failed: block_workspace");
+    }
+    block_workspace_bytes = required_block_workspace;
+    std::cerr << "[WORKSPACE] persistent_block_workspace_mb="
+              << (block_workspace_bytes / 1024.0 / 1024.0) << std::endl;
+}
+
 void QwenModel::build_graph(KVCache& cache) {
     ext_hidden_states.assign(config.hidden_dim, (fp16_t)0);
     ext_norm_out.assign(config.hidden_dim, (fp16_t)0);
@@ -244,22 +266,7 @@ void QwenModel::build_graph(KVCache& cache) {
         config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim};
     arm_neon::FFNConfig ffn_config{config.hidden_dim, config.intermediate_size};
 
-    size_t row_bytes = align_size((size_t)config.hidden_dim * sizeof(fp16_t));
-    size_t required_block_workspace = 2 * row_bytes + 64ULL * 1024 * 1024 + 64;
-    if (block_workspace_bytes < required_block_workspace) {
-        if (block_workspace) {
-            g_memory_pool->free_block(block_workspace);
-            block_workspace = nullptr;
-            block_workspace_bytes = 0;
-        }
-        block_workspace = g_memory_pool->allocate(required_block_workspace);
-        if (!block_workspace) {
-            throw std::runtime_error("MemoryPool allocation failed: block_workspace");
-        }
-        block_workspace_bytes = required_block_workspace;
-        std::cerr << "[WORKSPACE] persistent_block_workspace_mb="
-                  << (block_workspace_bytes / 1024.0 / 1024.0) << std::endl;
-    }
+    ensure_block_workspace();
 
     for (int i = 0; i < config.num_layers; ++i) {
         auto& layer = layers[i];
@@ -284,6 +291,109 @@ void QwenModel::build_graph(KVCache& cache) {
 
     plan = compiler.compile(graph);
     is_graph_built = true;
+}
+
+int QwenModel::prefill_prompt_batch(
+    const std::vector<int>& input_tokens,
+    int start_pos,
+    KVCache& cache
+) {
+    if (input_tokens.empty()) {
+        return -1;
+    }
+    if (start_pos < 0 ||
+        start_pos + static_cast<int>(input_tokens.size()) > config.max_seq_len) {
+        return -1;
+    }
+
+    ensure_block_workspace();
+
+    const int T = static_cast<int>(input_tokens.size());
+    const int H = config.hidden_dim;
+    std::vector<fp16_t> hidden((size_t)T * H);
+
+    for (int t = 0; t < T; ++t) {
+        int token_id = input_tokens[t];
+        if (token_id < 0 || token_id >= config.vocab_size) {
+            return -1;
+        }
+        const fp16_t* embed = embed_tokens_w.ptr<fp16_t>() + (size_t)token_id * H;
+        std::memcpy(hidden.data() + (size_t)t * H, embed, (size_t)H * sizeof(fp16_t));
+    }
+
+    arm_neon::AttentionConfig attn_config{
+        config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim};
+    arm_neon::FFNConfig ffn_config{config.hidden_dim, config.intermediate_size};
+    Workspace block_ws(block_workspace, block_workspace_bytes);
+
+    for (int layer_id = 0; layer_id < config.num_layers; ++layer_id) {
+        auto& layer = layers[layer_id];
+        for (int t = 0; t < T; ++t) {
+            int pos = start_pos + t;
+            Tensor row({1, H}, hidden.data() + (size_t)t * H, DataType::FP16);
+            const fp16_t* cos_ptr = cos_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
+            const fp16_t* sin_ptr = sin_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
+
+            Status status = arm_neon::qwen_block_f16_gptq_neon(
+                row,
+                layer.norm1_w,
+                layer.q_proj,
+                layer.k_proj,
+                layer.v_proj,
+                layer.o_proj,
+                layer.b_q.ptr<fp16_t>(),
+                layer.b_k.ptr<fp16_t>(),
+                layer.b_v.ptr<fp16_t>(),
+                cos_ptr,
+                sin_ptr,
+                layer.norm2_w,
+                layer.gate_proj,
+                layer.up_proj,
+                layer.down_proj,
+                cache,
+                layer_id,
+                pos,
+                attn_config,
+                ffn_config,
+                config.rms_norm_eps,
+                block_ws);
+            if (status != Status::SUCCESS) {
+                std::cerr << "[ERROR] batch prefill block failed"
+                          << " layer=" << layer_id
+                          << " token_index=" << t
+                          << " pos=" << pos
+                          << " status=" << StatusToString(status)
+                          << std::endl;
+                return -1;
+            }
+        }
+    }
+
+    current_pos = start_pos + T - 1;
+    const fp16_t* last_hidden = hidden.data() + (size_t)(T - 1) * H;
+    std::vector<fp16_t> norm_out(H);
+    arm_neon::rmsnorm_f16_neon(
+        last_hidden,
+        final_norm_w.ptr<fp16_t>(),
+        norm_out.data(),
+        H,
+        config.rms_norm_eps);
+
+    arm_neon::ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
+        norm_out.data(),
+        lm_head,
+        nullptr,
+        0);
+    forward_debug_last_result.token_id = result.index;
+    forward_debug_last_result.logit = result.value;
+    if (result.index < 0 || result.index >= config.vocab_size) {
+        std::cerr << "[ERROR] batch prefill lm_head argmax failed"
+                  << " index=" << result.index
+                  << " value=" << result.value
+                  << std::endl;
+        return -1;
+    }
+    return result.index;
 }
 
 int QwenModel::forward(int token_id, int pos, KVCache& cache) {
@@ -363,16 +473,33 @@ void QwenModel::generate(
     if (!kv_cache) return;
 
     int next_token = -1;
-    for (int tok : input_tokens) {
-        if (history_pos >= config.max_seq_len) return;
-        next_token = forward(tok, history_pos, *kv_cache);
-        history_pos++;
-        if (next_token < 0) {
-            std::cerr << "[ERROR] prompt forward failed"
-                      << " token=" << tok
-                      << " pos=" << (history_pos - 1)
-                      << std::endl;
-            return;
+    if (!input_tokens.empty()) {
+        if (env_flag("LLM_DISABLE_BATCH_PREFILL")) {
+            for (int tok : input_tokens) {
+                if (history_pos >= config.max_seq_len) return;
+                next_token = forward(tok, history_pos, *kv_cache);
+                history_pos++;
+                if (next_token < 0) {
+                    std::cerr << "[ERROR] prompt forward failed"
+                              << " token=" << tok
+                              << " pos=" << (history_pos - 1)
+                              << std::endl;
+                    return;
+                }
+            }
+        } else {
+            if (history_pos + static_cast<int>(input_tokens.size()) > config.max_seq_len) {
+                return;
+            }
+            next_token = prefill_prompt_batch(input_tokens, history_pos, *kv_cache);
+            if (next_token < 0) {
+                std::cerr << "[ERROR] batch prefill failed"
+                          << " start_pos=" << history_pos
+                          << " tokens=" << input_tokens.size()
+                          << std::endl;
+                return;
+            }
+            history_pos += static_cast<int>(input_tokens.size());
         }
     }
 
