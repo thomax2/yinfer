@@ -363,8 +363,10 @@ static inline int gptq_group_for_k(const GPTQInt8Weight& w, int k) {
 }
 
 constexpr int GPTQ_PARALLEL_N_THRESHOLD = 4096;
+constexpr int64_t GPTQ_PARALLEL_WORK_THRESHOLD = 2LL * 1024 * 1024;
 constexpr int GPTQ_FUSED_PARALLEL_N_THRESHOLD = 1024;
 constexpr int GPTQ_PARALLEL_GRAIN_PANELS = 16;
+constexpr int GPTQ_LINEAR_PARALLEL_GRAIN_PANELS = 8;
 
 static Status linear_gptq_int8_decode_range_neon(
     const fp16_t* x,
@@ -481,14 +483,15 @@ Status linear_gptq_int8_decode_neon(
     }
 
     int np = (w.N + NR_F16 - 1) / NR_F16;
+    int64_t work = (int64_t)w.K * w.N;
     if (g_thread_pool == nullptr ||
         g_thread_pool->num_threads() <= 1 ||
-        w.N < GPTQ_PARALLEL_N_THRESHOLD) {
+        (w.N < GPTQ_PARALLEL_N_THRESHOLD && work < GPTQ_PARALLEL_WORK_THRESHOLD)) {
         return linear_gptq_int8_decode_range_neon(x, w, y, bias, 0, np);
     }
 
     std::atomic<int> err_flag(0);
-    g_thread_pool->parallel_for(0, np, GPTQ_PARALLEL_GRAIN_PANELS, [&](int pb, int pe) {
+    g_thread_pool->parallel_for(0, np, GPTQ_LINEAR_PARALLEL_GRAIN_PANELS, [&](int pb, int pe) {
         Status s = linear_gptq_int8_decode_range_neon(x, w, y, bias, pb, pe);
         if (s != Status::SUCCESS) {
             err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
