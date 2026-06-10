@@ -162,7 +162,85 @@ void attention_decode_value_f16_neon(
     int seq_len,
     int head_dim
 ) {
-    for (int qh = 0; qh < num_rep; ++qh) {
+    int qh = 0;
+    for (; qh + 1 < num_rep; qh += 2) {
+        const fp16_t* score0 = score + (size_t)qh * seq_len;
+        const fp16_t* score1 = score + (size_t)(qh + 1) * seq_len;
+        fp16_t* out0 = out_group + (size_t)qh * head_dim;
+        fp16_t* out1 = out_group + (size_t)(qh + 1) * head_dim;
+
+        int d = 0;
+        for (; d <= head_dim - 16; d += 16) {
+            float32x4_t a00 = vdupq_n_f32(0.0f);
+            float32x4_t a01 = vdupq_n_f32(0.0f);
+            float32x4_t a02 = vdupq_n_f32(0.0f);
+            float32x4_t a03 = vdupq_n_f32(0.0f);
+            float32x4_t a10 = vdupq_n_f32(0.0f);
+            float32x4_t a11 = vdupq_n_f32(0.0f);
+            float32x4_t a12 = vdupq_n_f32(0.0f);
+            float32x4_t a13 = vdupq_n_f32(0.0f);
+
+            for (int t = 0; t < seq_len; ++t) {
+                float32x4_t s0 = vdupq_n_f32((float)score0[t]);
+                float32x4_t s1 = vdupq_n_f32((float)score1[t]);
+                const fp16_t* v = v_cache + (size_t)t * head_dim + d;
+                float16x8_t v0 = vld1q_f16(v);
+                float16x8_t v1 = vld1q_f16(v + 8);
+                float32x4_t vlo0 = vcvt_f32_f16(vget_low_f16(v0));
+                float32x4_t vhi0 = vcvt_f32_f16(vget_high_f16(v0));
+                float32x4_t vlo1 = vcvt_f32_f16(vget_low_f16(v1));
+                float32x4_t vhi1 = vcvt_f32_f16(vget_high_f16(v1));
+                a00 = vfmaq_f32(a00, vlo0, s0);
+                a01 = vfmaq_f32(a01, vhi0, s0);
+                a02 = vfmaq_f32(a02, vlo1, s0);
+                a03 = vfmaq_f32(a03, vhi1, s0);
+                a10 = vfmaq_f32(a10, vlo0, s1);
+                a11 = vfmaq_f32(a11, vhi0, s1);
+                a12 = vfmaq_f32(a12, vlo1, s1);
+                a13 = vfmaq_f32(a13, vhi1, s1);
+            }
+
+            vst1q_f16(out0 + d, vcombine_f16(vcvt_f16_f32(a00), vcvt_f16_f32(a01)));
+            vst1q_f16(out0 + d + 8, vcombine_f16(vcvt_f16_f32(a02), vcvt_f16_f32(a03)));
+            vst1q_f16(out1 + d, vcombine_f16(vcvt_f16_f32(a10), vcvt_f16_f32(a11)));
+            vst1q_f16(out1 + d + 8, vcombine_f16(vcvt_f16_f32(a12), vcvt_f16_f32(a13)));
+        }
+
+        for (; d <= head_dim - 8; d += 8) {
+            float32x4_t a00 = vdupq_n_f32(0.0f);
+            float32x4_t a01 = vdupq_n_f32(0.0f);
+            float32x4_t a10 = vdupq_n_f32(0.0f);
+            float32x4_t a11 = vdupq_n_f32(0.0f);
+            for (int t = 0; t < seq_len; ++t) {
+                float32x4_t s0 = vdupq_n_f32((float)score0[t]);
+                float32x4_t s1 = vdupq_n_f32((float)score1[t]);
+                const fp16_t* v = v_cache + (size_t)t * head_dim + d;
+                float16x8_t vv = vld1q_f16(v);
+                float32x4_t vlo = vcvt_f32_f16(vget_low_f16(vv));
+                float32x4_t vhi = vcvt_f32_f16(vget_high_f16(vv));
+                a00 = vfmaq_f32(a00, vlo, s0);
+                a01 = vfmaq_f32(a01, vhi, s0);
+                a10 = vfmaq_f32(a10, vlo, s1);
+                a11 = vfmaq_f32(a11, vhi, s1);
+            }
+            vst1q_f16(out0 + d, vcombine_f16(vcvt_f16_f32(a00), vcvt_f16_f32(a01)));
+            vst1q_f16(out1 + d, vcombine_f16(vcvt_f16_f32(a10), vcvt_f16_f32(a11)));
+        }
+
+        for (; d < head_dim; ++d) {
+            float sum0 = 0.0f;
+            float sum1 = 0.0f;
+            for (int t = 0; t < seq_len; ++t) {
+                float vv = (float)v_cache[(size_t)t * head_dim + d];
+                sum0 += (float)score0[t] * vv;
+                sum1 += (float)score1[t] * vv;
+            }
+            out0[d] = (fp16_t)sum0;
+            out1[d] = (fp16_t)sum1;
+        }
+    }
+
+    for (; qh < num_rep; ++qh) {
         const fp16_t* score_row = score + (size_t)qh * seq_len;
         fp16_t* out = out_group + (size_t)qh * head_dim;
 
