@@ -22,6 +22,31 @@ bool debug_numeric_enabled() {
     std::string s(v);
     return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
 }
+
+inline float32x4_t exp_neon_f32(float32x4_t x) {
+    x = vmaxq_f32(x, vdupq_n_f32(-87.3365f));
+    x = vminq_f32(x, vdupq_n_f32(88.0296f));
+
+    float32x4_t y = vmulq_f32(x, vdupq_n_f32(1.44269504f));
+    int32x4_t n = vcvtnq_s32_f32(y);
+    float32x4_t fn = vcvtq_f32_s32(n);
+    float32x4_t r = vmlsq_f32(x, fn, vdupq_n_f32(0.69314718f));
+
+    float32x4_t poly = vdupq_n_f32(0.00833333f);
+    poly = vfmaq_f32(vdupq_n_f32(0.04166667f), poly, r);
+    poly = vfmaq_f32(vdupq_n_f32(0.16666667f), poly, r);
+    poly = vfmaq_f32(vdupq_n_f32(0.5f), poly, r);
+    poly = vfmaq_f32(vdupq_n_f32(1.0f), poly, r);
+    poly = vfmaq_f32(vdupq_n_f32(1.0f), poly, r);
+
+    int32x4_t exp_int = vshlq_n_s32(vaddq_s32(n, vdupq_n_s32(127)), 23);
+    return vmulq_f32(poly, vreinterpretq_f32_s32(exp_int));
+}
+
+inline float32x4_t sigmoid_neon_f32(float32x4_t x) {
+    float32x4_t one = vdupq_n_f32(1.0f);
+    return vdivq_f32(one, vaddq_f32(one, exp_neon_f32(vnegq_f32(x))));
+}
 } // namespace
 
 // =============================================================================
@@ -434,6 +459,144 @@ Status linear_gptq_int8_decode_neon(
     return Status::SUCCESS;
 }
 
+Status fused_gate_up_swiglu_gptq_int8_decode_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    fp16_t* y,
+    void*,
+    size_t
+) {
+    if (!x || !y ||
+        !gate_proj.qweight_pack.data || !gate_proj.scales_pack.data ||
+        !up_proj.qweight_pack.data || !up_proj.scales_pack.data ||
+        gate_proj.K <= 0 || gate_proj.N <= 0 ||
+        gate_proj.K != up_proj.K || gate_proj.N != up_proj.N) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int K = gate_proj.K;
+    const int N = gate_proj.N;
+    const int K_pad = ((K + 7) / 8) * 8;
+    const int np = (N + NR_F16 - 1) / NR_F16;
+
+    const int8_t* g_qpack = gate_proj.qweight_pack.ptr<int8_t>();
+    const fp16_t* g_spack = gate_proj.scales_pack.ptr<fp16_t>();
+    const int8_t* g_zpack = gate_proj.zeros_pack.data ? gate_proj.zeros_pack.ptr<int8_t>() : nullptr;
+
+    const int8_t* u_qpack = up_proj.qweight_pack.ptr<int8_t>();
+    const fp16_t* u_spack = up_proj.scales_pack.ptr<fp16_t>();
+    const int8_t* u_zpack = up_proj.zeros_pack.data ? up_proj.zeros_pack.ptr<int8_t>() : nullptr;
+
+    for (int panel = 0; panel < np; ++panel) {
+        float32x4_t g0 = vdupq_n_f32(0.0f);
+        float32x4_t g1 = vdupq_n_f32(0.0f);
+        float32x4_t g2 = vdupq_n_f32(0.0f);
+        float32x4_t g3 = vdupq_n_f32(0.0f);
+
+        float32x4_t u0 = vdupq_n_f32(0.0f);
+        float32x4_t u1 = vdupq_n_f32(0.0f);
+        float32x4_t u2 = vdupq_n_f32(0.0f);
+        float32x4_t u3 = vdupq_n_f32(0.0f);
+
+        for (int k = 0; k < K; ++k) {
+            float32x4_t xv = vdupq_n_f32((float)x[k]);
+
+            {
+                int group = gptq_group_for_k(gate_proj, k);
+                const int8_t* q = g_qpack + ((size_t)panel * K_pad + k) * NR_F16;
+                const fp16_t* s = g_spack + ((size_t)panel * gate_proj.num_groups + group) * NR_F16;
+                const int8_t* z = g_zpack ? g_zpack + ((size_t)panel * gate_proj.num_groups + group) * NR_F16 : nullptr;
+
+                int8x16_t qv = vld1q_s8(q);
+                int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+                int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+                if (z) {
+                    int8x16_t zv = vld1q_s8(z);
+                    d0 = vsubq_s16(d0, vmovl_s8(vget_low_s8(zv)));
+                    d1 = vsubq_s16(d1, vmovl_s8(vget_high_s8(zv)));
+                }
+
+                float16x8_t sv0 = vld1q_f16(s);
+                float16x8_t sv1 = vld1q_f16(s + 8);
+                g0 = vfmaq_f32(g0,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))),
+                                          vcvt_f32_f16(vget_low_f16(sv0))),
+                                xv);
+                g1 = vfmaq_f32(g1,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))),
+                                          vcvt_f32_f16(vget_high_f16(sv0))),
+                                xv);
+                g2 = vfmaq_f32(g2,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))),
+                                          vcvt_f32_f16(vget_low_f16(sv1))),
+                                xv);
+                g3 = vfmaq_f32(g3,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))),
+                                          vcvt_f32_f16(vget_high_f16(sv1))),
+                                xv);
+            }
+
+            {
+                int group = gptq_group_for_k(up_proj, k);
+                const int8_t* q = u_qpack + ((size_t)panel * K_pad + k) * NR_F16;
+                const fp16_t* s = u_spack + ((size_t)panel * up_proj.num_groups + group) * NR_F16;
+                const int8_t* z = u_zpack ? u_zpack + ((size_t)panel * up_proj.num_groups + group) * NR_F16 : nullptr;
+
+                int8x16_t qv = vld1q_s8(q);
+                int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+                int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+                if (z) {
+                    int8x16_t zv = vld1q_s8(z);
+                    d0 = vsubq_s16(d0, vmovl_s8(vget_low_s8(zv)));
+                    d1 = vsubq_s16(d1, vmovl_s8(vget_high_s8(zv)));
+                }
+
+                float16x8_t sv0 = vld1q_f16(s);
+                float16x8_t sv1 = vld1q_f16(s + 8);
+                u0 = vfmaq_f32(u0,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))),
+                                          vcvt_f32_f16(vget_low_f16(sv0))),
+                                xv);
+                u1 = vfmaq_f32(u1,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))),
+                                          vcvt_f32_f16(vget_high_f16(sv0))),
+                                xv);
+                u2 = vfmaq_f32(u2,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))),
+                                          vcvt_f32_f16(vget_low_f16(sv1))),
+                                xv);
+                u3 = vfmaq_f32(u3,
+                                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))),
+                                          vcvt_f32_f16(vget_high_f16(sv1))),
+                                xv);
+            }
+        }
+
+        // y = silu(gate) * up, computed in FP32 vectors and narrowed once.
+        float32x4_t y0 = vmulq_f32(vmulq_f32(g0, sigmoid_neon_f32(g0)), u0);
+        float32x4_t y1 = vmulq_f32(vmulq_f32(g1, sigmoid_neon_f32(g1)), u1);
+        float32x4_t y2 = vmulq_f32(vmulq_f32(g2, sigmoid_neon_f32(g2)), u2);
+        float32x4_t y3 = vmulq_f32(vmulq_f32(g3, sigmoid_neon_f32(g3)), u3);
+
+        int col = panel * NR_F16;
+        int actual_n = std::min(NR_F16, N - col);
+        if (actual_n == NR_F16) {
+            vst1q_f16(y + col, vcombine_f16(vcvt_f16_f32(y0), vcvt_f16_f32(y1)));
+            vst1q_f16(y + col + 8, vcombine_f16(vcvt_f16_f32(y2), vcvt_f16_f32(y3)));
+        } else {
+            fp16_t tmp[NR_F16];
+            vst1q_f16(tmp, vcombine_f16(vcvt_f16_f32(y0), vcvt_f16_f32(y1)));
+            vst1q_f16(tmp + 8, vcombine_f16(vcvt_f16_f32(y2), vcvt_f16_f32(y3)));
+            for (int lane = 0; lane < actual_n; ++lane) {
+                y[col + lane] = tmp[lane];
+            }
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
 ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     const fp16_t* x,
     const GPTQInt8Weight& w,
@@ -457,7 +620,10 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     int logit_finite = 0;
 
     for (int panel = 0; panel < np; ++panel) {
-        float acc[NR_F16] = {0.0f};
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
 
         for (int k = 0; k < w.K; ++k) {
             int group = gptq_group_for_k(w, k);
@@ -467,19 +633,50 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
 
             float xv = (float)x[k];
             if (debug_numeric && std::isnan(xv)) x_nan++;
-            for (int lane = 0; lane < NR_F16; ++lane) {
-                if (debug_numeric) {
+            int8x16_t qv = vld1q_s8(q);
+            int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+            int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+            if (z) {
+                int8x16_t zv = vld1q_s8(z);
+                d0 = vsubq_s16(d0, vmovl_s8(vget_low_s8(zv)));
+                d1 = vsubq_s16(d1, vmovl_s8(vget_high_s8(zv)));
+            }
+
+            float16x8_t sv0 = vld1q_f16(s);
+            float16x8_t sv1 = vld1q_f16(s + 8);
+            if (debug_numeric) {
+                for (int lane = 0; lane < NR_F16; ++lane) {
                     if (std::isnan((float)s[lane])) scale_nan++;
                 }
-                int zero = z ? z[lane] : 0;
-                acc[lane] += xv * (float)(q[lane] - zero) * (float)s[lane];
             }
+
+            float32x4_t xvv = vdupq_n_f32(xv);
+            float32x4_t q0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0)));
+            float32x4_t q1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0)));
+            float32x4_t q2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1)));
+            float32x4_t q3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1)));
+
+            float32x4_t s0 = vcvt_f32_f16(vget_low_f16(sv0));
+            float32x4_t s1 = vcvt_f32_f16(vget_high_f16(sv0));
+            float32x4_t s2 = vcvt_f32_f16(vget_low_f16(sv1));
+            float32x4_t s3 = vcvt_f32_f16(vget_high_f16(sv1));
+
+            acc0 = vfmaq_f32(acc0, vmulq_f32(q0, s0), xvv);
+            acc1 = vfmaq_f32(acc1, vmulq_f32(q1, s1), xvv);
+            acc2 = vfmaq_f32(acc2, vmulq_f32(q2, s2), xvv);
+            acc3 = vfmaq_f32(acc3, vmulq_f32(q3, s3), xvv);
         }
 
         int col = panel * NR_F16;
         int actual_n = std::min(NR_F16, w.N - col);
+        float logits[NR_F16];
+        vst1q_f32(logits, acc0);
+        vst1q_f32(logits + 4, acc1);
+        vst1q_f32(logits + 8, acc2);
+        vst1q_f32(logits + 12, acc3);
+
         for (int lane = 0; lane < actual_n; ++lane) {
-            float v = acc[lane];
+            float v = logits[lane];
             if (debug_numeric) {
                 if (std::isnan(v)) logit_nan++;
                 else if (std::isfinite(v)) logit_finite++;

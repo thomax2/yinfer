@@ -177,8 +177,27 @@ Status softmax_f16_neon(const Tensor& input, Tensor& output) {
             continue;
         }
 
-        float sum = 0.0f;
-        for (i = 0; i < seq_len; ++i) {
+        float32x4_t vmax = vdupq_n_f32(max_val);
+        float32x4_t sum0 = vdupq_n_f32(0.0f);
+        float32x4_t sum1 = vdupq_n_f32(0.0f);
+
+        i = 0;
+        for (; i <= seq_len - 8; i += 8) {
+            float16x8_t hv = vld1q_f16(in + i);
+            float32x4_t x0 = vsubq_f32(vcvt_f32_f16(vget_low_f16(hv)), vmax);
+            float32x4_t x1 = vsubq_f32(vcvt_f32_f16(vget_high_f16(hv)), vmax);
+
+            // Compute exp in FP32 vector registers, accumulate the FP32 sum,
+            // and narrow only the temporary output stored for normalization.
+            float32x4_t e0 = exp_neon_f32(x0);
+            float32x4_t e1 = exp_neon_f32(x1);
+            sum0 = vaddq_f32(sum0, e0);
+            sum1 = vaddq_f32(sum1, e1);
+            vst1q_f16(out + i, vcombine_f16(vcvt_f16_f32(e0), vcvt_f16_f32(e1)));
+        }
+
+        float sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+        for (; i < seq_len; ++i) {
             float e = std::exp((float)in[i] - max_val);
             out[i] = (fp16_t)e;
             sum += e;

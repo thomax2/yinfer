@@ -382,7 +382,15 @@ Status attention_f16_gptq_neon(
         }
 
         int total_score = num_rep * current_seq_len;
-        for (int i = 0; i < total_score; ++i) {
+        float32x4_t v_scale = vdupq_n_f32(scale);
+        int i = 0;
+        for (; i <= total_score - 8; i += 8) {
+            float16x8_t h = vld1q_f16(score_ptr + i);
+            float32x4_t lo = vmulq_f32(vcvt_f32_f16(vget_low_f16(h)), v_scale);
+            float32x4_t hi = vmulq_f32(vcvt_f32_f16(vget_high_f16(h)), v_scale);
+            vst1q_f16(score_ptr + i, vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi)));
+        }
+        for (; i < total_score; ++i) {
             score_ptr[i] = (fp16_t)((float)score_ptr[i] * scale);
         }
         if (debug_numeric) {

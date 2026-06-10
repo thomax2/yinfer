@@ -137,8 +137,7 @@ Status ffn_f16_gptq_neon(
     }
 
     size_t gate_bytes = align_size((size_t)config.intermediate_size * sizeof(fp16_t));
-    size_t up_bytes = align_size((size_t)config.intermediate_size * sizeof(fp16_t));
-    size_t required = gate_bytes + up_bytes;
+    size_t required = gate_bytes;
     if (workspace.size() < required) {
         return Status::OUT_OF_MEMORY;
     }
@@ -146,19 +145,10 @@ Status ffn_f16_gptq_neon(
     char* base = static_cast<char*>(workspace.data());
     base = align_ptr(base);
     fp16_t* gate = reinterpret_cast<fp16_t*>(base);
-    base += gate_bytes;
-    base = align_ptr(base);
-    fp16_t* up = reinterpret_cast<fp16_t*>(base);
 
-    Status status = linear_gptq_int8_decode_neon(
-        hidden_states.ptr<fp16_t>(), gate_proj, gate, nullptr, nullptr, 0);
+    Status status = fused_gate_up_swiglu_gptq_int8_decode_neon(
+        hidden_states.ptr<fp16_t>(), gate_proj, up_proj, gate, nullptr, 0);
     if (status != Status::SUCCESS) return status;
-
-    status = linear_gptq_int8_decode_neon(
-        hidden_states.ptr<fp16_t>(), up_proj, up, nullptr, nullptr, 0);
-    if (status != Status::SUCCESS) return status;
-
-    swiglu_f16_neon(gate, up, gate, config.intermediate_size);
 
     return linear_gptq_int8_decode_neon(
         gate, down_proj, ffn_output.ptr<fp16_t>(), nullptr, nullptr, 0);

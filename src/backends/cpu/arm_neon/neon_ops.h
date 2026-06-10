@@ -107,6 +107,15 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     size_t workspace_bytes = 0
 );
 
+Status fused_gate_up_swiglu_gptq_int8_decode_neon(
+    const fp16_t* x,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    fp16_t* y,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
+);
+
 // FFN 专用：在 [panel_begin, panel_end) 范围内同时计算 gate / up，
 // 并 fused 完成 SwiGLU。y[i] = silu(gate[i]) * up[i]。
 // w_gate_pack / w_up_pack 与 linear_decode_prepacked_neon 使用同一种 packed 布局。
