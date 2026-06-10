@@ -54,6 +54,17 @@ bool read_exact_file(const std::string& path, void* dst, size_t bytes) {
     return static_cast<bool>(fin.read(reinterpret_cast<char*>(dst), size));
 }
 
+int model_env_int(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+
+    char* end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v) return default_value;
+    if (x < 1) return 1;
+    return static_cast<int>(x);
+}
+
 } // namespace
 
 QwenModel::QwenModel(const QwenConfig& cfg)
@@ -61,9 +72,11 @@ QwenModel::QwenModel(const QwenConfig& cfg)
       layers(cfg.num_layers),
       kv_cache(std::make_unique<KVCache>(
           cfg.num_layers, cfg.max_seq_len, cfg.num_kv_heads, cfg.head_dim)),
+      num_threads(model_env_int("LLM_NUM_THREADS", 4)),
       thread_pool(std::make_unique<ThreadPool>(num_threads))
 {
     g_thread_pool = thread_pool.get();
+    std::cerr << "[THREAD_POOL] num_threads=" << num_threads << std::endl;
 
     allocate_tensor(embed_tokens_w, {config.vocab_size, config.hidden_dim}, DataType::FP16);
 

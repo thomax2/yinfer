@@ -76,8 +76,8 @@ public:
     std::unique_ptr<KVCache> kv_cache;
 
     // ========== 持久线程池（算子内部并行复用）==========
-    std::unique_ptr<ThreadPool> thread_pool;
     int num_threads = 4;
+    std::unique_ptr<ThreadPool> thread_pool;
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 
