@@ -100,6 +100,16 @@ Status linear_gptq_int8_decode_neon(
     size_t workspace_bytes = 0
 );
 
+Status linear_gptq_int8_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias = nullptr,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
+);
+
 ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     const fp16_t* x,
     const GPTQInt8Weight& w,
@@ -140,6 +150,16 @@ Status fused_gate_up_swiglu_prepacked_parallel_neon(
     float* y,
     int K,
     int N
+);
+
+Status fused_gate_up_swiglu_gptq_int8_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    fp16_t* y,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
 );
 
 Status bmm_neon(
@@ -256,6 +276,25 @@ Status attention_f16_gptq_neon(
     Workspace& workspace
 );
 
+Status attention_f16_gptq_prefill_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_base,
+    const fp16_t* sin_base,
+    KVCache& kv_cache,
+    int layer_id,
+    int start_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+);
+
 Status attention_neon(
     const Tensor& hidden_states,
     Tensor& attn_output,
@@ -288,6 +327,16 @@ Status ffn_neon(
 );
 
 Status ffn_f16_gptq_neon(
+    const Tensor& hidden_states,
+    Tensor& ffn_output,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
+    const FFNConfig& config,
+    Workspace& workspace
+);
+
+Status ffn_f16_gptq_batch_neon(
     const Tensor& hidden_states,
     Tensor& ffn_output,
     const GPTQInt8Weight& gate_proj,
@@ -345,6 +394,31 @@ Status qwen_block_f16_gptq_neon(
     KVCache& kv_cache,
     int layer_id,
     int current_pos,
+    const AttentionConfig& attn_config,
+    const FFNConfig& ffn_config,
+    float rms_norm_eps,
+    Workspace& workspace
+);
+
+Status qwen_block_f16_gptq_prefill_neon(
+    Tensor& hidden_states,
+    const Tensor& norm1_weight,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_base,
+    const fp16_t* sin_base,
+    const Tensor& norm2_weight,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
+    KVCache& kv_cache,
+    int layer_id,
+    int start_pos,
     const AttentionConfig& attn_config,
     const FFNConfig& ffn_config,
     float rms_norm_eps,

@@ -647,5 +647,153 @@ Status attention_f16_gptq_neon(
     return status;
 }
 
+Status attention_f16_gptq_prefill_neon(
+    const Tensor& hidden_states,
+    Tensor& attn_output,
+    const GPTQInt8Weight& q_proj,
+    const GPTQInt8Weight& k_proj,
+    const GPTQInt8Weight& v_proj,
+    const GPTQInt8Weight& o_proj,
+    const fp16_t* q_bias,
+    const fp16_t* k_bias,
+    const fp16_t* v_bias,
+    const fp16_t* cos_base,
+    const fp16_t* sin_base,
+    KVCache& kv_cache,
+    int layer_id,
+    int start_pos,
+    const AttentionConfig& config,
+    Workspace& workspace
+) {
+    bool debug_numeric = debug_numeric_enabled();
+    if (hidden_states.dtype != DataType::FP16 || attn_output.dtype != DataType::FP16) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (hidden_states.shape.size() < 2 || attn_output.shape.size() < 2) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int rows = hidden_states.shape[0];
+    const int hidden_dim = hidden_states.shape[1];
+    const int q_size = config.num_q_heads * config.head_dim;
+    const int kv_size = config.num_kv_heads * config.head_dim;
+    const int num_rep = config.num_q_heads / config.num_kv_heads;
+    const int max_seq_len = kv_cache.get_max_seq_len();
+    if (rows <= 0 ||
+        attn_output.shape[0] != rows ||
+        attn_output.shape[1] != hidden_dim ||
+        start_pos < 0 ||
+        start_pos + rows > max_seq_len) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    if (rows == 1) {
+        const fp16_t* cos_ptr = cos_base + (size_t)start_pos * config.head_dim;
+        const fp16_t* sin_ptr = sin_base + (size_t)start_pos * config.head_dim;
+        return attention_f16_gptq_neon(
+            hidden_states, attn_output,
+            q_proj, k_proj, v_proj, o_proj,
+            q_bias, k_bias, v_bias,
+            cos_ptr, sin_ptr,
+            kv_cache, layer_id, start_pos,
+            config, workspace);
+    }
+
+    size_t q_bytes = align_size((size_t)rows * q_size * sizeof(fp16_t));
+    size_t k_bytes = align_size((size_t)rows * kv_size * sizeof(fp16_t));
+    size_t v_bytes = align_size((size_t)rows * kv_size * sizeof(fp16_t));
+    size_t score_bytes = align_size((size_t)num_rep * max_seq_len * sizeof(fp16_t));
+    size_t attn_bytes = align_size((size_t)rows * q_size * sizeof(fp16_t));
+    size_t required = q_bytes + k_bytes + v_bytes + score_bytes + attn_bytes + 5 * 64;
+    if (workspace.size() < required) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    char* base = static_cast<char*>(workspace.data());
+    base = align_ptr(base); fp16_t* q_ptr = reinterpret_cast<fp16_t*>(base); base += q_bytes;
+    base = align_ptr(base); fp16_t* k_ptr = reinterpret_cast<fp16_t*>(base); base += k_bytes;
+    base = align_ptr(base); fp16_t* v_ptr = reinterpret_cast<fp16_t*>(base); base += v_bytes;
+    base = align_ptr(base); fp16_t* score_ptr = reinterpret_cast<fp16_t*>(base); base += score_bytes;
+    base = align_ptr(base); fp16_t* attn_out_ptr = reinterpret_cast<fp16_t*>(base); base += attn_bytes;
+
+    Status status = linear_gptq_int8_batch_neon(
+        hidden_states.ptr<fp16_t>(), rows, q_proj, q_ptr, q_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    status = linear_gptq_int8_batch_neon(
+        hidden_states.ptr<fp16_t>(), rows, k_proj, k_ptr, k_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    status = linear_gptq_int8_batch_neon(
+        hidden_states.ptr<fp16_t>(), rows, v_proj, v_ptr, v_bias, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+
+    for (int t = 0; t < rows; ++t) {
+        int pos = start_pos + t;
+        const fp16_t* cos_ptr = cos_base + (size_t)pos * config.head_dim;
+        const fp16_t* sin_ptr = sin_base + (size_t)pos * config.head_dim;
+        fp16_t* q_row = q_ptr + (size_t)t * q_size;
+        fp16_t* k_row = k_ptr + (size_t)t * kv_size;
+
+        for (int h = 0; h < config.num_q_heads; ++h) {
+            rope_f16_neon(q_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+        }
+        for (int h = 0; h < config.num_kv_heads; ++h) {
+            rope_f16_neon(k_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+        }
+
+        kv_cache.update(
+            layer_id,
+            pos,
+            k_row,
+            v_ptr + (size_t)t * kv_size);
+    }
+
+    float scale = 1.0f / std::sqrt((float)config.head_dim);
+    for (int t = 0; t < rows; ++t) {
+        int pos = start_pos + t;
+        int current_seq_len = pos + 1;
+        fp16_t* q_row = q_ptr + (size_t)t * q_size;
+        fp16_t* out_row = attn_out_ptr + (size_t)t * q_size;
+
+        for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
+            fp16_t* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
+            fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
+            fp16_t* q_group_ptr = q_row + kv_head * num_rep * config.head_dim;
+            fp16_t* out_group_ptr = out_row + kv_head * num_rep * config.head_dim;
+
+            Tensor Score({num_rep, current_seq_len}, score_ptr, DataType::FP16);
+            attention_decode_score_f16_neon(
+                q_group_ptr,
+                k_cache_ptr,
+                score_ptr,
+                num_rep,
+                current_seq_len,
+                config.head_dim,
+                scale);
+
+            status = softmax_f16_neon(Score, Score);
+            if (status != Status::SUCCESS) return status;
+
+            attention_decode_value_f16_neon(
+                score_ptr,
+                v_cache_ptr,
+                out_group_ptr,
+                num_rep,
+                current_seq_len,
+                config.head_dim);
+        }
+    }
+
+    if (debug_numeric) {
+        dump_f16_stats("prefill_attn_out_pre_o", layer_id, attn_out_ptr, rows * q_size);
+    }
+
+    status = linear_gptq_int8_batch_neon(
+        attn_out_ptr, rows, o_proj, attn_output.ptr<fp16_t>(), nullptr, nullptr, 0);
+    if (debug_numeric) {
+        dump_f16_stats("prefill_o_proj_out", layer_id, attn_output.ptr<fp16_t>(), rows * hidden_dim);
+    }
+    return status;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

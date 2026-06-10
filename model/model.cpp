@@ -328,44 +328,38 @@ int QwenModel::prefill_prompt_batch(
 
     for (int layer_id = 0; layer_id < config.num_layers; ++layer_id) {
         auto& layer = layers[layer_id];
-        for (int t = 0; t < T; ++t) {
-            int pos = start_pos + t;
-            Tensor row({1, H}, hidden.data() + (size_t)t * H, DataType::FP16);
-            const fp16_t* cos_ptr = cos_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
-            const fp16_t* sin_ptr = sin_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
-
-            Status status = arm_neon::qwen_block_f16_gptq_neon(
-                row,
-                layer.norm1_w,
-                layer.q_proj,
-                layer.k_proj,
-                layer.v_proj,
-                layer.o_proj,
-                layer.b_q.ptr<fp16_t>(),
-                layer.b_k.ptr<fp16_t>(),
-                layer.b_v.ptr<fp16_t>(),
-                cos_ptr,
-                sin_ptr,
-                layer.norm2_w,
-                layer.gate_proj,
-                layer.up_proj,
-                layer.down_proj,
-                cache,
-                layer_id,
-                pos,
-                attn_config,
-                ffn_config,
-                config.rms_norm_eps,
-                block_ws);
-            if (status != Status::SUCCESS) {
-                std::cerr << "[ERROR] batch prefill block failed"
-                          << " layer=" << layer_id
-                          << " token_index=" << t
-                          << " pos=" << pos
-                          << " status=" << StatusToString(status)
-                          << std::endl;
-                return -1;
-            }
+        Tensor batch_hidden({T, H}, hidden.data(), DataType::FP16);
+        Status status = arm_neon::qwen_block_f16_gptq_prefill_neon(
+            batch_hidden,
+            layer.norm1_w,
+            layer.q_proj,
+            layer.k_proj,
+            layer.v_proj,
+            layer.o_proj,
+            layer.b_q.ptr<fp16_t>(),
+            layer.b_k.ptr<fp16_t>(),
+            layer.b_v.ptr<fp16_t>(),
+            cos_cache.ptr<fp16_t>(),
+            sin_cache.ptr<fp16_t>(),
+            layer.norm2_w,
+            layer.gate_proj,
+            layer.up_proj,
+            layer.down_proj,
+            cache,
+            layer_id,
+            start_pos,
+            attn_config,
+            ffn_config,
+            config.rms_norm_eps,
+            block_ws);
+        if (status != Status::SUCCESS) {
+            std::cerr << "[ERROR] batch prefill block failed"
+                      << " layer=" << layer_id
+                      << " start_pos=" << start_pos
+                      << " tokens=" << T
+                      << " status=" << StatusToString(status)
+                      << std::endl;
+            return -1;
         }
     }
 

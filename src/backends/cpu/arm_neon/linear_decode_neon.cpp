@@ -763,6 +763,63 @@ Status linear_gptq_int8_decode_neon(
     return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
 }
 
+Status linear_gptq_int8_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    void*,
+    size_t
+) {
+    if (!x || !y || rows <= 0 ||
+        !w.qweight_pack.data || !w.scales_pack.data ||
+        w.K <= 0 || w.N <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    if (rows == 1) {
+        return linear_gptq_int8_decode_neon(x, w, y, bias, nullptr, 0);
+    }
+
+    const int np = (w.N + NR_F16 - 1) / NR_F16;
+    const int panel_grain = GPTQ_LINEAR_PARALLEL_GRAIN_PANELS;
+    const int chunks_per_row = (np + panel_grain - 1) / panel_grain;
+    const int total_tasks = rows * chunks_per_row;
+    const int64_t work = (int64_t)rows * w.K * w.N;
+
+    auto run_task_range = [&](int tb, int te) -> Status {
+        for (int task = tb; task < te; ++task) {
+            int row = task / chunks_per_row;
+            int chunk = task - row * chunks_per_row;
+            int pb = chunk * panel_grain;
+            int pe = std::min(pb + panel_grain, np);
+            const fp16_t* row_x = x + (size_t)row * w.K;
+            fp16_t* row_y = y + (size_t)row * w.N;
+            Status s = linear_gptq_int8_decode_range_neon(row_x, w, row_y, bias, pb, pe);
+            if (s != Status::SUCCESS) return s;
+        }
+        return Status::SUCCESS;
+    };
+
+    if (g_thread_pool == nullptr ||
+        g_thread_pool->num_threads() <= 1 ||
+        (w.N < GPTQ_PARALLEL_N_THRESHOLD && work < GPTQ_PARALLEL_WORK_THRESHOLD)) {
+        return run_task_range(0, total_tasks);
+    }
+
+    std::atomic<int> err_flag(0);
+    g_thread_pool->parallel_for(0, total_tasks, 1, [&](int tb, int te) {
+        Status s = run_task_range(tb, te);
+        if (s != Status::SUCCESS) {
+            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
+        }
+    });
+
+    int err = err_flag.load(std::memory_order_relaxed);
+    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+}
+
 static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
     const fp16_t* x,
     const GPTQInt8Weight& gate_proj,
@@ -821,6 +878,10 @@ static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
                 float32x4_t gsum1 = vdupq_n_f32(0.0f);
                 float32x4_t gsum2 = vdupq_n_f32(0.0f);
                 float32x4_t gsum3 = vdupq_n_f32(0.0f);
+                float32x4_t usum0 = vdupq_n_f32(0.0f);
+                float32x4_t usum1 = vdupq_n_f32(0.0f);
+                float32x4_t usum2 = vdupq_n_f32(0.0f);
+                float32x4_t usum3 = vdupq_n_f32(0.0f);
 
                 for (int k = k_begin; k < k_end; ++k) {
                     float xv_scalar = (float)x[k];
@@ -836,6 +897,16 @@ static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
                     gsum1 = vfmaq_f32(gsum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))), xv);
                     gsum2 = vfmaq_f32(gsum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))), xv);
                     gsum3 = vfmaq_f32(gsum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))), xv);
+
+                    const int8_t* uq = u_qpack + ((size_t)panel * K_pad + k) * NR_F16;
+                    int8x16_t uqv = vld1q_s8(uq);
+                    int16x8_t ud0 = vmovl_s8(vget_low_s8(uqv));
+                    int16x8_t ud1 = vmovl_s8(vget_high_s8(uqv));
+
+                    usum0 = vfmaq_f32(usum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(ud0))), xv);
+                    usum1 = vfmaq_f32(usum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(ud0))), xv);
+                    usum2 = vfmaq_f32(usum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(ud1))), xv);
+                    usum3 = vfmaq_f32(usum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(ud1))), xv);
                 }
 
                 const fp16_t* gs = g_spack + ((size_t)panel * gate_proj.num_groups + group) * NR_F16;
@@ -844,25 +915,6 @@ static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
                     g0, g1, g2, g3,
                     gsum0, gsum1, gsum2, gsum3,
                     gs, gz, xsum);
-
-                float32x4_t usum0 = vdupq_n_f32(0.0f);
-                float32x4_t usum1 = vdupq_n_f32(0.0f);
-                float32x4_t usum2 = vdupq_n_f32(0.0f);
-                float32x4_t usum3 = vdupq_n_f32(0.0f);
-
-                for (int k = k_begin; k < k_end; ++k) {
-                    float32x4_t xv = vdupq_n_f32((float)x[k]);
-
-                    const int8_t* q = u_qpack + ((size_t)panel * K_pad + k) * NR_F16;
-                    int8x16_t qv = vld1q_s8(q);
-                    int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
-                    int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
-
-                    usum0 = vfmaq_f32(usum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))), xv);
-                    usum1 = vfmaq_f32(usum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))), xv);
-                    usum2 = vfmaq_f32(usum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))), xv);
-                    usum3 = vfmaq_f32(usum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))), xv);
-                }
 
                 const fp16_t* us = u_spack + ((size_t)panel * up_proj.num_groups + group) * NR_F16;
                 const int8_t* uz = u_zpack ? u_zpack + ((size_t)panel * up_proj.num_groups + group) * NR_F16 : nullptr;
@@ -1033,6 +1085,66 @@ Status fused_gate_up_swiglu_gptq_int8_decode_neon(
     g_thread_pool->parallel_for(0, np, GPTQ_PARALLEL_GRAIN_PANELS, [&](int pb, int pe) {
         Status s = fused_gate_up_swiglu_gptq_int8_decode_range_neon(
             x, gate_proj, up_proj, y, pb, pe);
+        if (s != Status::SUCCESS) {
+            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
+        }
+    });
+
+    int err = err_flag.load(std::memory_order_relaxed);
+    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+}
+
+Status fused_gate_up_swiglu_gptq_int8_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    fp16_t* y,
+    void*,
+    size_t
+) {
+    if (!x || !y || rows <= 0 ||
+        !gate_proj.qweight_pack.data || !gate_proj.scales_pack.data ||
+        !up_proj.qweight_pack.data || !up_proj.scales_pack.data ||
+        gate_proj.K <= 0 || gate_proj.N <= 0 ||
+        gate_proj.K != up_proj.K || gate_proj.N != up_proj.N) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    if (rows == 1) {
+        return fused_gate_up_swiglu_gptq_int8_decode_neon(
+            x, gate_proj, up_proj, y, nullptr, 0);
+    }
+
+    const int np = (gate_proj.N + NR_F16 - 1) / NR_F16;
+    const int panel_grain = GPTQ_PARALLEL_GRAIN_PANELS;
+    const int chunks_per_row = (np + panel_grain - 1) / panel_grain;
+    const int total_tasks = rows * chunks_per_row;
+
+    auto run_task_range = [&](int tb, int te) -> Status {
+        for (int task = tb; task < te; ++task) {
+            int row = task / chunks_per_row;
+            int chunk = task - row * chunks_per_row;
+            int pb = chunk * panel_grain;
+            int pe = std::min(pb + panel_grain, np);
+            const fp16_t* row_x = x + (size_t)row * gate_proj.K;
+            fp16_t* row_y = y + (size_t)row * gate_proj.N;
+            Status s = fused_gate_up_swiglu_gptq_int8_decode_range_neon(
+                row_x, gate_proj, up_proj, row_y, pb, pe);
+            if (s != Status::SUCCESS) return s;
+        }
+        return Status::SUCCESS;
+    };
+
+    if (g_thread_pool == nullptr ||
+        g_thread_pool->num_threads() <= 1 ||
+        gate_proj.N < GPTQ_FUSED_PARALLEL_N_THRESHOLD) {
+        return run_task_range(0, total_tasks);
+    }
+
+    std::atomic<int> err_flag(0);
+    g_thread_pool->parallel_for(0, total_tasks, 1, [&](int tb, int te) {
+        Status s = run_task_range(tb, te);
         if (s != Status::SUCCESS) {
             err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
         }

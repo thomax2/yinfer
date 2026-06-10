@@ -154,5 +154,66 @@ Status ffn_f16_gptq_neon(
         gate, down_proj, ffn_output.ptr<fp16_t>(), nullptr, nullptr, 0);
 }
 
+Status ffn_f16_gptq_batch_neon(
+    const Tensor& hidden_states,
+    Tensor& ffn_output,
+    const GPTQInt8Weight& gate_proj,
+    const GPTQInt8Weight& up_proj,
+    const GPTQInt8Weight& down_proj,
+    const FFNConfig& config,
+    Workspace& workspace
+) {
+    if (hidden_states.dtype != DataType::FP16 || ffn_output.dtype != DataType::FP16) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (hidden_states.shape.size() < 2 || ffn_output.shape.size() < 2) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int rows = hidden_states.shape[0];
+    const int hidden_dim = hidden_states.shape[1];
+    if (rows <= 0 ||
+        hidden_dim != config.hidden_dim ||
+        ffn_output.shape[0] != rows ||
+        ffn_output.shape[1] != config.hidden_dim) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    if (rows == 1) {
+        return ffn_f16_gptq_neon(
+            hidden_states, ffn_output,
+            gate_proj, up_proj, down_proj,
+            config, workspace);
+    }
+
+    size_t gate_bytes = align_size((size_t)rows * config.intermediate_size * sizeof(fp16_t));
+    if (workspace.size() < gate_bytes) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    char* base = static_cast<char*>(workspace.data());
+    base = align_ptr(base);
+    fp16_t* gate = reinterpret_cast<fp16_t*>(base);
+
+    Status status = fused_gate_up_swiglu_gptq_int8_batch_neon(
+        hidden_states.ptr<fp16_t>(),
+        rows,
+        gate_proj,
+        up_proj,
+        gate,
+        nullptr,
+        0);
+    if (status != Status::SUCCESS) return status;
+
+    return linear_gptq_int8_batch_neon(
+        gate,
+        rows,
+        down_proj,
+        ffn_output.ptr<fp16_t>(),
+        nullptr,
+        nullptr,
+        0);
+}
+
 } // namespace arm_neon
 } // namespace llm_engine
