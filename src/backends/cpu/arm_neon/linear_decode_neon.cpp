@@ -362,6 +362,44 @@ static inline int gptq_group_for_k(const GPTQInt8Weight& w, int k) {
     return k / w.group_size;
 }
 
+static inline void gptq_apply_group_accum_f16(
+    float32x4_t& acc0,
+    float32x4_t& acc1,
+    float32x4_t& acc2,
+    float32x4_t& acc3,
+    float32x4_t sum0,
+    float32x4_t sum1,
+    float32x4_t sum2,
+    float32x4_t sum3,
+    const fp16_t* scale,
+    const int8_t* zero,
+    float xsum
+) {
+    float16x8_t sv0 = vld1q_f16(scale);
+    float16x8_t sv1 = vld1q_f16(scale + 8);
+    float32x4_t s0 = vcvt_f32_f16(vget_low_f16(sv0));
+    float32x4_t s1 = vcvt_f32_f16(vget_high_f16(sv0));
+    float32x4_t s2 = vcvt_f32_f16(vget_low_f16(sv1));
+    float32x4_t s3 = vcvt_f32_f16(vget_high_f16(sv1));
+
+    if (zero) {
+        int8x16_t zv = vld1q_s8(zero);
+        int16x8_t z16_0 = vmovl_s8(vget_low_s8(zv));
+        int16x8_t z16_1 = vmovl_s8(vget_high_s8(zv));
+        float32x4_t xsumv = vdupq_n_f32(xsum);
+
+        sum0 = vmlsq_f32(sum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(z16_0))), xsumv);
+        sum1 = vmlsq_f32(sum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(z16_0))), xsumv);
+        sum2 = vmlsq_f32(sum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(z16_1))), xsumv);
+        sum3 = vmlsq_f32(sum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(z16_1))), xsumv);
+    }
+
+    acc0 = vfmaq_f32(acc0, sum0, s0);
+    acc1 = vfmaq_f32(acc1, sum1, s1);
+    acc2 = vfmaq_f32(acc2, sum2, s2);
+    acc3 = vfmaq_f32(acc3, sum3, s3);
+}
+
 constexpr int GPTQ_PARALLEL_N_THRESHOLD = 4096;
 constexpr int64_t GPTQ_PARALLEL_WORK_THRESHOLD = 2LL * 1024 * 1024;
 constexpr int GPTQ_FUSED_PARALLEL_N_THRESHOLD = 1024;
@@ -430,6 +468,130 @@ static Status linear_gptq_int8_decode_range_neon(
     const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
     const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
     const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+
+    if (!w.has_g_idx) {
+        int panel = panel_begin;
+        for (; panel + 1 < panel_end; panel += 2) {
+            float32x4_t p0_acc0 = vdupq_n_f32(0.0f);
+            float32x4_t p0_acc1 = vdupq_n_f32(0.0f);
+            float32x4_t p0_acc2 = vdupq_n_f32(0.0f);
+            float32x4_t p0_acc3 = vdupq_n_f32(0.0f);
+            float32x4_t p1_acc0 = vdupq_n_f32(0.0f);
+            float32x4_t p1_acc1 = vdupq_n_f32(0.0f);
+            float32x4_t p1_acc2 = vdupq_n_f32(0.0f);
+            float32x4_t p1_acc3 = vdupq_n_f32(0.0f);
+
+            int panel1 = panel + 1;
+            for (int group = 0; group < w.num_groups; ++group) {
+                int k_begin = group * w.group_size;
+                int k_end = std::min(k_begin + w.group_size, w.K);
+                if (k_begin >= k_end) continue;
+
+                float xsum = 0.0f;
+                float32x4_t p0_sum0 = vdupq_n_f32(0.0f);
+                float32x4_t p0_sum1 = vdupq_n_f32(0.0f);
+                float32x4_t p0_sum2 = vdupq_n_f32(0.0f);
+                float32x4_t p0_sum3 = vdupq_n_f32(0.0f);
+                float32x4_t p1_sum0 = vdupq_n_f32(0.0f);
+                float32x4_t p1_sum1 = vdupq_n_f32(0.0f);
+                float32x4_t p1_sum2 = vdupq_n_f32(0.0f);
+                float32x4_t p1_sum3 = vdupq_n_f32(0.0f);
+
+                for (int k = k_begin; k < k_end; ++k) {
+                    float xv_scalar = (float)x[k];
+                    xsum += xv_scalar;
+                    float32x4_t xv = vdupq_n_f32(xv_scalar);
+
+                    {
+                        const int8_t* q = qpack + ((size_t)panel * K_pad + k) * NR_F16;
+                        int8x16_t qv = vld1q_s8(q);
+                        int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+                        int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+
+                        p0_sum0 = vfmaq_f32(p0_sum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))), xv);
+                        p0_sum1 = vfmaq_f32(p0_sum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))), xv);
+                        p0_sum2 = vfmaq_f32(p0_sum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))), xv);
+                        p0_sum3 = vfmaq_f32(p0_sum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))), xv);
+                    }
+
+                    {
+                        const int8_t* q = qpack + ((size_t)panel1 * K_pad + k) * NR_F16;
+                        int8x16_t qv = vld1q_s8(q);
+                        int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+                        int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+
+                        p1_sum0 = vfmaq_f32(p1_sum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))), xv);
+                        p1_sum1 = vfmaq_f32(p1_sum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))), xv);
+                        p1_sum2 = vfmaq_f32(p1_sum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))), xv);
+                        p1_sum3 = vfmaq_f32(p1_sum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))), xv);
+                    }
+                }
+
+                const fp16_t* p0_s = spack + ((size_t)panel * w.num_groups + group) * NR_F16;
+                const int8_t* p0_z = zpack ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 : nullptr;
+                gptq_apply_group_accum_f16(
+                    p0_acc0, p0_acc1, p0_acc2, p0_acc3,
+                    p0_sum0, p0_sum1, p0_sum2, p0_sum3,
+                    p0_s, p0_z, xsum);
+
+                const fp16_t* p1_s = spack + ((size_t)panel1 * w.num_groups + group) * NR_F16;
+                const int8_t* p1_z = zpack ? zpack + ((size_t)panel1 * w.num_groups + group) * NR_F16 : nullptr;
+                gptq_apply_group_accum_f16(
+                    p1_acc0, p1_acc1, p1_acc2, p1_acc3,
+                    p1_sum0, p1_sum1, p1_sum2, p1_sum3,
+                    p1_s, p1_z, xsum);
+            }
+
+            gptq_store_panel_f16(y, bias, w.N, panel, p0_acc0, p0_acc1, p0_acc2, p0_acc3);
+            gptq_store_panel_f16(y, bias, w.N, panel1, p1_acc0, p1_acc1, p1_acc2, p1_acc3);
+        }
+
+        for (; panel < panel_end; ++panel) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+            for (int group = 0; group < w.num_groups; ++group) {
+                int k_begin = group * w.group_size;
+                int k_end = std::min(k_begin + w.group_size, w.K);
+                if (k_begin >= k_end) continue;
+
+                float xsum = 0.0f;
+                float32x4_t sum0 = vdupq_n_f32(0.0f);
+                float32x4_t sum1 = vdupq_n_f32(0.0f);
+                float32x4_t sum2 = vdupq_n_f32(0.0f);
+                float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+                for (int k = k_begin; k < k_end; ++k) {
+                    float xv_scalar = (float)x[k];
+                    xsum += xv_scalar;
+                    float32x4_t xv = vdupq_n_f32(xv_scalar);
+
+                    const int8_t* q = qpack + ((size_t)panel * K_pad + k) * NR_F16;
+                    int8x16_t qv = vld1q_s8(q);
+                    int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+                    int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+
+                    sum0 = vfmaq_f32(sum0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0))), xv);
+                    sum1 = vfmaq_f32(sum1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0))), xv);
+                    sum2 = vfmaq_f32(sum2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1))), xv);
+                    sum3 = vfmaq_f32(sum3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1))), xv);
+                }
+
+                const fp16_t* s = spack + ((size_t)panel * w.num_groups + group) * NR_F16;
+                const int8_t* z = zpack ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 : nullptr;
+                gptq_apply_group_accum_f16(
+                    acc0, acc1, acc2, acc3,
+                    sum0, sum1, sum2, sum3,
+                    s, z, xsum);
+            }
+
+            gptq_store_panel_f16(y, bias, w.N, panel, acc0, acc1, acc2, acc3);
+        }
+
+        return Status::SUCCESS;
+    }
 
     int panel = panel_begin;
     for (; panel + 1 < panel_end; panel += 2) {
