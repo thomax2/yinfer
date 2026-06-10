@@ -78,6 +78,8 @@ public:
     // ========== 持久线程池（算子内部并行复用）==========
     int num_threads = 4;
     std::unique_ptr<ThreadPool> thread_pool;
+    void* block_workspace = nullptr;
+    size_t block_workspace_bytes = 0;
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 

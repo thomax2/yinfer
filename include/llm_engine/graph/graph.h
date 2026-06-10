@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -88,6 +89,8 @@ public:
     int layer_id;
     int* current_pos_ptr; // 💡 使用指针，方便外部的推理大循环统一更新位置
     KVCache* kv_cache;
+    void* external_workspace = nullptr;
+    size_t external_workspace_bytes = 0;
 
     // 构造函数：接收所有的参数和张量
     QwenBlockNode(
@@ -140,6 +143,7 @@ public:
     );
 
     Status forward() override;
+    void set_external_workspace(void* workspace, size_t bytes);
 };
 
 class ComputationGraph {

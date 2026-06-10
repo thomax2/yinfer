@@ -250,11 +250,18 @@ Status QwenBlockNode::forward() {
         int hidden_dim = hidden_states->shape[1];
         size_t buffer_bytes = 2 * align_size((size_t)num_tokens * hidden_dim * sizeof(fp16_t));
         size_t pack_bytes = 64ULL * 1024 * 1024;
-        size_t total_ws_size = buffer_bytes + pack_bytes;
-        void* raw_ptr = g_memory_pool->allocate(total_ws_size);
+        size_t total_ws_size = buffer_bytes + pack_bytes + 64;
+        bool owns_workspace = false;
+        void* raw_ptr = external_workspace;
+        size_t workspace_size = external_workspace_bytes;
+        if (!raw_ptr || workspace_size < total_ws_size) {
+            raw_ptr = g_memory_pool->allocate(total_ws_size);
+            workspace_size = total_ws_size;
+            owns_workspace = true;
+        }
         if (!raw_ptr) return Status::OUT_OF_MEMORY;
 
-        Workspace temp_workspace(raw_ptr, total_ws_size);
+        Workspace temp_workspace(raw_ptr, workspace_size);
         Status status = arm_neon::qwen_block_f16_gptq_neon(
             *hidden_states,
             *norm1_weight,
@@ -271,7 +278,9 @@ Status QwenBlockNode::forward() {
             rms_norm_eps,
             temp_workspace
         );
-        g_memory_pool->free_block(raw_ptr);
+        if (owns_workspace) {
+            g_memory_pool->free_block(raw_ptr);
+        }
         return status;
     }
 
@@ -368,6 +377,11 @@ Status QwenBlockNode::forward() {
     g_memory_pool->free_block(raw_ptr);
 
     return status;
+}
+
+void QwenBlockNode::set_external_workspace(void* workspace, size_t bytes) {
+    external_workspace = workspace;
+    external_workspace_bytes = bytes;
 }
 
 

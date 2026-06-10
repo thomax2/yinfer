@@ -105,6 +105,11 @@ QwenModel::QwenModel(const QwenConfig& cfg)
 }
 
 QwenModel::~QwenModel() {
+    if (block_workspace) {
+        g_memory_pool->free_block(block_workspace);
+        block_workspace = nullptr;
+        block_workspace_bytes = 0;
+    }
     for (void* p : weight_ptrs) {
         if (p) g_memory_pool->free_block(p);
     }
@@ -239,9 +244,26 @@ void QwenModel::build_graph(KVCache& cache) {
         config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim};
     arm_neon::FFNConfig ffn_config{config.hidden_dim, config.intermediate_size};
 
+    size_t row_bytes = align_size((size_t)config.hidden_dim * sizeof(fp16_t));
+    size_t required_block_workspace = 2 * row_bytes + 64ULL * 1024 * 1024 + 64;
+    if (block_workspace_bytes < required_block_workspace) {
+        if (block_workspace) {
+            g_memory_pool->free_block(block_workspace);
+            block_workspace = nullptr;
+            block_workspace_bytes = 0;
+        }
+        block_workspace = g_memory_pool->allocate(required_block_workspace);
+        if (!block_workspace) {
+            throw std::runtime_error("MemoryPool allocation failed: block_workspace");
+        }
+        block_workspace_bytes = required_block_workspace;
+        std::cerr << "[WORKSPACE] persistent_block_workspace_mb="
+                  << (block_workspace_bytes / 1024.0 / 1024.0) << std::endl;
+    }
+
     for (int i = 0; i < config.num_layers; ++i) {
         auto& layer = layers[i];
-        graph.add_qwen_block(
+        QwenBlockNode* block = graph.add_qwen_block(
             t_hidden_states, &layer.norm1_w,
             &layer.b_q, &layer.b_k, &layer.b_v,
             t_cos, t_sin,
@@ -253,6 +275,7 @@ void QwenModel::build_graph(KVCache& cache) {
             attn_config,
             ffn_config,
             config.rms_norm_eps);
+        block->set_external_workspace(block_workspace, block_workspace_bytes);
     }
 
     t_norm_out = graph.create_tensor_from_ptr(
