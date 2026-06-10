@@ -251,20 +251,148 @@ Status matmul_f16_neon(
     const fp16_t* b = B.ptr<fp16_t>();
     fp16_t* c = C.ptr<fp16_t>();
 
-    // Correctness-first FP32 accumulation. The old FP16 micro-kernel can overflow
-    // attention scores on Qwen2.5-1.5B and turn softmax into NaN.
+    // Correctness-first FP32 accumulation. Inputs/outputs stay FP16, but K
+    // reductions are held in float32x4_t registers to avoid the NaNs seen with
+    // the old pure-FP16 accumulator.
     (void)workspace;
-    for (int m = 0; m < M; ++m) {
-        for (int n = 0; n < N; ++n) {
-            float sum = bias ? (float)bias[n] : 0.0f;
-            for (int k = 0; k < K; ++k) {
-                float av = (float)a[(size_t)m * K + k];
-                float bv = transB
-                    ? (float)b[(size_t)n * K + k]
-                    : (float)b[(size_t)k * N + n];
-                sum += av * bv;
+
+    auto reduce_f32x8 = [](float32x4_t lo, float32x4_t hi) -> float {
+        return vaddvq_f32(vaddq_f32(lo, hi));
+    };
+
+    auto dot_contiguous_f16_fp32 = [&](const fp16_t* lhs, const fp16_t* rhs) -> float {
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+        int k = 0;
+        for (; k <= K - 8; k += 8) {
+            // Load 8 FP16 values from each contiguous vector, widen to two
+            // FP32 vectors, then accumulate in FP32.
+            float16x8_t av = vld1q_f16(lhs + k);
+            float16x8_t bv = vld1q_f16(rhs + k);
+            acc0 = vfmaq_f32(acc0,
+                             vcvt_f32_f16(vget_low_f16(av)),
+                             vcvt_f32_f16(vget_low_f16(bv)));
+            acc1 = vfmaq_f32(acc1,
+                             vcvt_f32_f16(vget_high_f16(av)),
+                             vcvt_f32_f16(vget_high_f16(bv)));
+        }
+
+        float sum = reduce_f32x8(acc0, acc1);
+        for (; k < K; ++k) {
+            sum += (float)lhs[k] * (float)rhs[k];
+        }
+        return sum;
+    };
+
+    if (transB) {
+        // B is logically transposed: each output column reads one contiguous
+        // row of B, so vectorize over K and compute four columns per pass.
+        for (int m = 0; m < M; ++m) {
+            const fp16_t* a_row = a + (size_t)m * K;
+            int n = 0;
+            for (; n <= N - 4; n += 4) {
+                float32x4_t acc00 = vdupq_n_f32(0.0f);
+                float32x4_t acc01 = vdupq_n_f32(0.0f);
+                float32x4_t acc10 = vdupq_n_f32(0.0f);
+                float32x4_t acc11 = vdupq_n_f32(0.0f);
+                float32x4_t acc20 = vdupq_n_f32(0.0f);
+                float32x4_t acc21 = vdupq_n_f32(0.0f);
+                float32x4_t acc30 = vdupq_n_f32(0.0f);
+                float32x4_t acc31 = vdupq_n_f32(0.0f);
+
+                const fp16_t* b0 = b + (size_t)(n + 0) * K;
+                const fp16_t* b1 = b + (size_t)(n + 1) * K;
+                const fp16_t* b2 = b + (size_t)(n + 2) * K;
+                const fp16_t* b3 = b + (size_t)(n + 3) * K;
+
+                int k = 0;
+                for (; k <= K - 8; k += 8) {
+                    float16x8_t av = vld1q_f16(a_row + k);
+                    float32x4_t alo = vcvt_f32_f16(vget_low_f16(av));
+                    float32x4_t ahi = vcvt_f32_f16(vget_high_f16(av));
+
+                    float16x8_t bv0 = vld1q_f16(b0 + k);
+                    acc00 = vfmaq_f32(acc00, alo, vcvt_f32_f16(vget_low_f16(bv0)));
+                    acc01 = vfmaq_f32(acc01, ahi, vcvt_f32_f16(vget_high_f16(bv0)));
+
+                    float16x8_t bv1 = vld1q_f16(b1 + k);
+                    acc10 = vfmaq_f32(acc10, alo, vcvt_f32_f16(vget_low_f16(bv1)));
+                    acc11 = vfmaq_f32(acc11, ahi, vcvt_f32_f16(vget_high_f16(bv1)));
+
+                    float16x8_t bv2 = vld1q_f16(b2 + k);
+                    acc20 = vfmaq_f32(acc20, alo, vcvt_f32_f16(vget_low_f16(bv2)));
+                    acc21 = vfmaq_f32(acc21, ahi, vcvt_f32_f16(vget_high_f16(bv2)));
+
+                    float16x8_t bv3 = vld1q_f16(b3 + k);
+                    acc30 = vfmaq_f32(acc30, alo, vcvt_f32_f16(vget_low_f16(bv3)));
+                    acc31 = vfmaq_f32(acc31, ahi, vcvt_f32_f16(vget_high_f16(bv3)));
+                }
+
+                float sum0 = reduce_f32x8(acc00, acc01);
+                float sum1 = reduce_f32x8(acc10, acc11);
+                float sum2 = reduce_f32x8(acc20, acc21);
+                float sum3 = reduce_f32x8(acc30, acc31);
+                for (; k < K; ++k) {
+                    float av = (float)a_row[k];
+                    sum0 += av * (float)b0[k];
+                    sum1 += av * (float)b1[k];
+                    sum2 += av * (float)b2[k];
+                    sum3 += av * (float)b3[k];
+                }
+
+                if (bias) {
+                    sum0 += (float)bias[n + 0];
+                    sum1 += (float)bias[n + 1];
+                    sum2 += (float)bias[n + 2];
+                    sum3 += (float)bias[n + 3];
+                }
+                c[(size_t)m * N + n + 0] = (fp16_t)sum0;
+                c[(size_t)m * N + n + 1] = (fp16_t)sum1;
+                c[(size_t)m * N + n + 2] = (fp16_t)sum2;
+                c[(size_t)m * N + n + 3] = (fp16_t)sum3;
             }
-            c[(size_t)m * N + n] = (fp16_t)sum;
+
+            for (; n < N; ++n) {
+                float sum = dot_contiguous_f16_fp32(a_row, b + (size_t)n * K);
+                if (bias) sum += (float)bias[n];
+                c[(size_t)m * N + n] = (fp16_t)sum;
+            }
+        }
+    } else {
+        // B is KxN row-major. For each output row, compute eight contiguous
+        // columns at once so every B load is a 128-bit contiguous FP16 access.
+        for (int m = 0; m < M; ++m) {
+            const fp16_t* a_row = a + (size_t)m * K;
+            int n = 0;
+            for (; n <= N - 8; n += 8) {
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+                for (int k = 0; k < K; ++k) {
+                    float32x4_t av = vdupq_n_f32((float)a_row[k]);
+                    float16x8_t bv = vld1q_f16(b + (size_t)k * N + n);
+                    acc0 = vfmaq_f32(acc0, av, vcvt_f32_f16(vget_low_f16(bv)));
+                    acc1 = vfmaq_f32(acc1, av, vcvt_f32_f16(vget_high_f16(bv)));
+                }
+
+                if (bias) {
+                    float16x8_t bv = vld1q_f16(bias + n);
+                    acc0 = vaddq_f32(acc0, vcvt_f32_f16(vget_low_f16(bv)));
+                    acc1 = vaddq_f32(acc1, vcvt_f32_f16(vget_high_f16(bv)));
+                }
+
+                float16x8_t out = vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1));
+                vst1q_f16(c + (size_t)m * N + n, out);
+            }
+
+            for (; n < N; ++n) {
+                float sum = bias ? (float)bias[n] : 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    sum += (float)a_row[k] * (float)b[(size_t)k * N + n];
+                }
+                c[(size_t)m * N + n] = (fp16_t)sum;
+            }
         }
     }
 

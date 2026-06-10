@@ -355,7 +355,13 @@ Status linear_gptq_int8_decode_neon(
     const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
 
     for (int panel = 0; panel < np; ++panel) {
-        float acc[NR_F16] = {0.0f};
+        // One panel owns 16 contiguous output channels. Keep four FP32
+        // accumulators so W8A16 dequantization does not lose range while the
+        // output panel stays in registers.
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
 
         for (int k = 0; k < w.K; ++k) {
             int group = gptq_group_for_k(w, k);
@@ -363,20 +369,65 @@ Status linear_gptq_int8_decode_neon(
             const fp16_t* s = spack + ((size_t)panel * w.num_groups + group) * NR_F16;
             const int8_t* z = zpack ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 : nullptr;
 
-            float xv = (float)x[k];
-            for (int lane = 0; lane < NR_F16; ++lane) {
-                int zero = z ? z[lane] : 0;
-                acc[lane] += xv * (float)(q[lane] - zero) * (float)s[lane];
+            // q/zero are int8, but q-zero may need 9 bits. Widen before
+            // subtracting, then widen again to FP32 for stable accumulation.
+            int8x16_t qv = vld1q_s8(q);
+            int16x8_t d0 = vmovl_s8(vget_low_s8(qv));
+            int16x8_t d1 = vmovl_s8(vget_high_s8(qv));
+            if (z) {
+                int8x16_t zv = vld1q_s8(z);
+                d0 = vsubq_s16(d0, vmovl_s8(vget_low_s8(zv)));
+                d1 = vsubq_s16(d1, vmovl_s8(vget_high_s8(zv)));
             }
+
+            float16x8_t sv0 = vld1q_f16(s);
+            float16x8_t sv1 = vld1q_f16(s + 8);
+            float32x4_t xv = vdupq_n_f32((float)x[k]);
+
+            float32x4_t q0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(d0)));
+            float32x4_t q1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(d0)));
+            float32x4_t q2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(d1)));
+            float32x4_t q3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(d1)));
+
+            float32x4_t s0 = vcvt_f32_f16(vget_low_f16(sv0));
+            float32x4_t s1 = vcvt_f32_f16(vget_high_f16(sv0));
+            float32x4_t s2 = vcvt_f32_f16(vget_low_f16(sv1));
+            float32x4_t s3 = vcvt_f32_f16(vget_high_f16(sv1));
+
+            acc0 = vfmaq_f32(acc0, vmulq_f32(q0, s0), xv);
+            acc1 = vfmaq_f32(acc1, vmulq_f32(q1, s1), xv);
+            acc2 = vfmaq_f32(acc2, vmulq_f32(q2, s2), xv);
+            acc3 = vfmaq_f32(acc3, vmulq_f32(q3, s3), xv);
         }
 
         int col = panel * NR_F16;
         int actual_n = std::min(NR_F16, w.N - col);
 
-        for (int lane = 0; lane < actual_n; ++lane) {
-            float v = acc[lane];
-            if (bias) v += (float)bias[col + lane];
-            y[col + lane] = (fp16_t)v;
+        if (bias && actual_n == NR_F16) {
+            float16x8_t bv0 = vld1q_f16(bias + col);
+            float16x8_t bv1 = vld1q_f16(bias + col + 8);
+            acc0 = vaddq_f32(acc0, vcvt_f32_f16(vget_low_f16(bv0)));
+            acc1 = vaddq_f32(acc1, vcvt_f32_f16(vget_high_f16(bv0)));
+            acc2 = vaddq_f32(acc2, vcvt_f32_f16(vget_low_f16(bv1)));
+            acc3 = vaddq_f32(acc3, vcvt_f32_f16(vget_high_f16(bv1)));
+        }
+
+        float16x8_t out0 = vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1));
+        float16x8_t out1 = vcombine_f16(vcvt_f16_f32(acc2), vcvt_f16_f32(acc3));
+        if (actual_n == NR_F16) {
+            vst1q_f16(y + col, out0);
+            vst1q_f16(y + col + 8, out1);
+        } else {
+            float tmp[NR_F16];
+            vst1q_f32(tmp, acc0);
+            vst1q_f32(tmp + 4, acc1);
+            vst1q_f32(tmp + 8, acc2);
+            vst1q_f32(tmp + 12, acc3);
+            for (int lane = 0; lane < actual_n; ++lane) {
+                float v = tmp[lane];
+                if (bias) v += (float)bias[col + lane];
+                y[col + lane] = (fp16_t)v;
+            }
         }
     }
 

@@ -98,7 +98,26 @@ void swiglu_f16_neon(
     fp16_t* y,
     int n
 ) {
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+    for (; i <= n - 8; i += 8) {
+        // Load eight FP16 values contiguously, widen to two FP32 vectors for
+        // sigmoid/exp, then narrow back to FP16. This preserves the previous
+        // FP32 nonlinear math while using NEON registers for the hot loop.
+        float16x8_t g16 = vld1q_f16(gate + i);
+        float16x8_t u16 = vld1q_f16(up + i);
+
+        float32x4_t g0 = vcvt_f32_f16(vget_low_f16(g16));
+        float32x4_t g1 = vcvt_f32_f16(vget_high_f16(g16));
+        float32x4_t u0 = vcvt_f32_f16(vget_low_f16(u16));
+        float32x4_t u1 = vcvt_f32_f16(vget_high_f16(u16));
+
+        float32x4_t y0 = vmulq_f32(vmulq_f32(g0, sigmoid_neon(g0)), u0);
+        float32x4_t y1 = vmulq_f32(vmulq_f32(g1, sigmoid_neon(g1)), u1);
+
+        vst1q_f16(y + i, vcombine_f16(vcvt_f16_f32(y0), vcvt_f16_f32(y1)));
+    }
+
+    for (; i < n; ++i) {
         float g = (float)gate[i];
         float u = (float)up[i];
         float silu = g / (1.0f + std::exp(-g));
