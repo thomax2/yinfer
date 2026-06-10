@@ -49,6 +49,167 @@ void dump_f16_stats(const char* tag, int layer_id, const fp16_t* data, int n) {
               << " max=" << max_v
               << std::endl;
 }
+
+inline float reduce_f32x8(float32x4_t lo, float32x4_t hi) {
+    return vaddvq_f32(vaddq_f32(lo, hi));
+}
+
+inline float dot_f16_fp32(const fp16_t* a, const fp16_t* b, int n) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+    int i = 0;
+    for (; i <= n - 8; i += 8) {
+        float16x8_t av = vld1q_f16(a + i);
+        float16x8_t bv = vld1q_f16(b + i);
+        acc0 = vfmaq_f32(acc0,
+                         vcvt_f32_f16(vget_low_f16(av)),
+                         vcvt_f32_f16(vget_low_f16(bv)));
+        acc1 = vfmaq_f32(acc1,
+                         vcvt_f32_f16(vget_high_f16(av)),
+                         vcvt_f32_f16(vget_high_f16(bv)));
+    }
+
+    float sum = reduce_f32x8(acc0, acc1);
+    for (; i < n; ++i) {
+        sum += (float)a[i] * (float)b[i];
+    }
+    return sum;
+}
+
+void attention_decode_score_f16_neon(
+    const fp16_t* q_group,
+    const fp16_t* k_cache,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale
+) {
+    for (int qh = 0; qh < num_rep; ++qh) {
+        const fp16_t* q = q_group + (size_t)qh * head_dim;
+        fp16_t* score_row = score + (size_t)qh * seq_len;
+
+        int t = 0;
+        for (; t <= seq_len - 4; t += 4) {
+            const fp16_t* k0 = k_cache + (size_t)(t + 0) * head_dim;
+            const fp16_t* k1 = k_cache + (size_t)(t + 1) * head_dim;
+            const fp16_t* k2 = k_cache + (size_t)(t + 2) * head_dim;
+            const fp16_t* k3 = k_cache + (size_t)(t + 3) * head_dim;
+
+            float32x4_t a00 = vdupq_n_f32(0.0f);
+            float32x4_t a01 = vdupq_n_f32(0.0f);
+            float32x4_t a10 = vdupq_n_f32(0.0f);
+            float32x4_t a11 = vdupq_n_f32(0.0f);
+            float32x4_t a20 = vdupq_n_f32(0.0f);
+            float32x4_t a21 = vdupq_n_f32(0.0f);
+            float32x4_t a30 = vdupq_n_f32(0.0f);
+            float32x4_t a31 = vdupq_n_f32(0.0f);
+
+            int d = 0;
+            for (; d <= head_dim - 8; d += 8) {
+                float16x8_t qv = vld1q_f16(q + d);
+                float32x4_t qlo = vcvt_f32_f16(vget_low_f16(qv));
+                float32x4_t qhi = vcvt_f32_f16(vget_high_f16(qv));
+
+                float16x8_t k0v = vld1q_f16(k0 + d);
+                a00 = vfmaq_f32(a00, qlo, vcvt_f32_f16(vget_low_f16(k0v)));
+                a01 = vfmaq_f32(a01, qhi, vcvt_f32_f16(vget_high_f16(k0v)));
+
+                float16x8_t k1v = vld1q_f16(k1 + d);
+                a10 = vfmaq_f32(a10, qlo, vcvt_f32_f16(vget_low_f16(k1v)));
+                a11 = vfmaq_f32(a11, qhi, vcvt_f32_f16(vget_high_f16(k1v)));
+
+                float16x8_t k2v = vld1q_f16(k2 + d);
+                a20 = vfmaq_f32(a20, qlo, vcvt_f32_f16(vget_low_f16(k2v)));
+                a21 = vfmaq_f32(a21, qhi, vcvt_f32_f16(vget_high_f16(k2v)));
+
+                float16x8_t k3v = vld1q_f16(k3 + d);
+                a30 = vfmaq_f32(a30, qlo, vcvt_f32_f16(vget_low_f16(k3v)));
+                a31 = vfmaq_f32(a31, qhi, vcvt_f32_f16(vget_high_f16(k3v)));
+            }
+
+            float s0 = reduce_f32x8(a00, a01);
+            float s1 = reduce_f32x8(a10, a11);
+            float s2 = reduce_f32x8(a20, a21);
+            float s3 = reduce_f32x8(a30, a31);
+            for (; d < head_dim; ++d) {
+                float qv = (float)q[d];
+                s0 += qv * (float)k0[d];
+                s1 += qv * (float)k1[d];
+                s2 += qv * (float)k2[d];
+                s3 += qv * (float)k3[d];
+            }
+
+            score_row[t + 0] = (fp16_t)(s0 * scale);
+            score_row[t + 1] = (fp16_t)(s1 * scale);
+            score_row[t + 2] = (fp16_t)(s2 * scale);
+            score_row[t + 3] = (fp16_t)(s3 * scale);
+        }
+
+        for (; t < seq_len; ++t) {
+            const fp16_t* k = k_cache + (size_t)t * head_dim;
+            score_row[t] = (fp16_t)(dot_f16_fp32(q, k, head_dim) * scale);
+        }
+    }
+}
+
+void attention_decode_value_f16_neon(
+    const fp16_t* score,
+    const fp16_t* v_cache,
+    fp16_t* out_group,
+    int num_rep,
+    int seq_len,
+    int head_dim
+) {
+    for (int qh = 0; qh < num_rep; ++qh) {
+        const fp16_t* score_row = score + (size_t)qh * seq_len;
+        fp16_t* out = out_group + (size_t)qh * head_dim;
+
+        int d = 0;
+        for (; d <= head_dim - 16; d += 16) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+            for (int t = 0; t < seq_len; ++t) {
+                float32x4_t sv = vdupq_n_f32((float)score_row[t]);
+                const fp16_t* v = v_cache + (size_t)t * head_dim + d;
+                float16x8_t v0 = vld1q_f16(v);
+                float16x8_t v1 = vld1q_f16(v + 8);
+                acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(v0)), sv);
+                acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(v0)), sv);
+                acc2 = vfmaq_f32(acc2, vcvt_f32_f16(vget_low_f16(v1)), sv);
+                acc3 = vfmaq_f32(acc3, vcvt_f32_f16(vget_high_f16(v1)), sv);
+            }
+
+            vst1q_f16(out + d, vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1)));
+            vst1q_f16(out + d + 8, vcombine_f16(vcvt_f16_f32(acc2), vcvt_f16_f32(acc3)));
+        }
+
+        for (; d <= head_dim - 8; d += 8) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            for (int t = 0; t < seq_len; ++t) {
+                float32x4_t sv = vdupq_n_f32((float)score_row[t]);
+                const fp16_t* v = v_cache + (size_t)t * head_dim + d;
+                float16x8_t vv = vld1q_f16(v);
+                acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(vv)), sv);
+                acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(vv)), sv);
+            }
+            vst1q_f16(out + d, vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1)));
+        }
+
+        for (; d < head_dim; ++d) {
+            float sum = 0.0f;
+            for (int t = 0; t < seq_len; ++t) {
+                sum += (float)score_row[t] * (float)v_cache[(size_t)t * head_dim + d];
+            }
+            out[d] = (fp16_t)sum;
+        }
+    }
+}
 } // namespace
 
 Status attention_neon(
@@ -317,8 +478,7 @@ Status attention_f16_gptq_neon(
     size_t v_bytes = align_size((size_t)kv_size * sizeof(fp16_t));
     size_t score_bytes = align_size((size_t)num_rep * max_seq_len * sizeof(fp16_t));
     size_t attn_bytes = align_size((size_t)q_size * sizeof(fp16_t));
-    size_t matmul_bytes = align_size(32ULL * 1024 * 1024);
-    size_t required = q_bytes + k_bytes + v_bytes + score_bytes + attn_bytes + matmul_bytes;
+    size_t required = q_bytes + k_bytes + v_bytes + score_bytes + attn_bytes + 5 * 64;
     if (workspace.size() < required) {
         return Status::OUT_OF_MEMORY;
     }
@@ -329,7 +489,6 @@ Status attention_f16_gptq_neon(
     base = align_ptr(base); fp16_t* v_ptr = reinterpret_cast<fp16_t*>(base); base += v_bytes;
     base = align_ptr(base); fp16_t* score_ptr = reinterpret_cast<fp16_t*>(base); base += score_bytes;
     base = align_ptr(base); fp16_t* attn_out_ptr = reinterpret_cast<fp16_t*>(base); base += attn_bytes;
-    base = align_ptr(base); fp16_t* matmul_ws = reinterpret_cast<fp16_t*>(base);
 
     Status status = linear_gptq_int8_decode_neon(
         hidden_states.ptr<fp16_t>(), q_proj, q_ptr, q_bias, nullptr, 0);
@@ -368,31 +527,18 @@ Status attention_f16_gptq_neon(
         fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
         fp16_t* q_group_ptr = q_ptr + kv_head * num_rep * config.head_dim;
         fp16_t* out_group_ptr = attn_out_ptr + kv_head * num_rep * config.head_dim;
-
-        Tensor Q_group({num_rep, config.head_dim}, q_group_ptr, DataType::FP16);
-        Tensor K_cache({current_seq_len, config.head_dim}, k_cache_ptr, DataType::FP16);
-        Tensor V_cache({current_seq_len, config.head_dim}, v_cache_ptr, DataType::FP16);
-        Tensor Score({num_rep, current_seq_len}, score_ptr, DataType::FP16);
-        Tensor Out_group({num_rep, config.head_dim}, out_group_ptr, DataType::FP16);
-
-        status = matmul_f16_neon(Q_group, K_cache, Score, matmul_ws, true, nullptr);
-        if (status != Status::SUCCESS) return status;
-        if (debug_numeric) {
-            dump_f16_stats("score_matmul", layer_id, score_ptr, num_rep * current_seq_len);
-        }
-
         int total_score = num_rep * current_seq_len;
-        float32x4_t v_scale = vdupq_n_f32(scale);
-        int i = 0;
-        for (; i <= total_score - 8; i += 8) {
-            float16x8_t h = vld1q_f16(score_ptr + i);
-            float32x4_t lo = vmulq_f32(vcvt_f32_f16(vget_low_f16(h)), v_scale);
-            float32x4_t hi = vmulq_f32(vcvt_f32_f16(vget_high_f16(h)), v_scale);
-            vst1q_f16(score_ptr + i, vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi)));
-        }
-        for (; i < total_score; ++i) {
-            score_ptr[i] = (fp16_t)((float)score_ptr[i] * scale);
-        }
+
+        Tensor Score({num_rep, current_seq_len}, score_ptr, DataType::FP16);
+
+        attention_decode_score_f16_neon(
+            q_group_ptr,
+            k_cache_ptr,
+            score_ptr,
+            num_rep,
+            current_seq_len,
+            config.head_dim,
+            scale);
         if (debug_numeric) {
             dump_f16_stats("score_scaled", layer_id, score_ptr, total_score);
         }
@@ -403,8 +549,13 @@ Status attention_f16_gptq_neon(
             dump_f16_stats("score_softmax", layer_id, score_ptr, total_score);
         }
 
-        status = matmul_f16_neon(Score, V_cache, Out_group, matmul_ws, false, nullptr);
-        if (status != Status::SUCCESS) return status;
+        attention_decode_value_f16_neon(
+            score_ptr,
+            v_cache_ptr,
+            out_group_ptr,
+            num_rep,
+            current_seq_len,
+            config.head_dim);
         if (debug_numeric) {
             dump_f16_stats("attn_group_out", layer_id, out_group_ptr, num_rep * config.head_dim);
         }
