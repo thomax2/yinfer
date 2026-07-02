@@ -64,6 +64,7 @@ file(GLOB TIKTOKEN_SRCS "third_party/cpp-tiktoken/*.cc")
 add_executable(qwen_model_loader
     model/main.cpp
     model/model.cpp
+    src/engine/llm_engine.cpp
     ${TIKTOKEN_SRCS}
 )
 

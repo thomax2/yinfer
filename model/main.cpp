@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include "llm_engine/engine/llm_engine.h"
 #include "tiktoken/encoding.h"
 
 using namespace llm_engine;
@@ -85,9 +86,10 @@ int main(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
 
+    LLMEngine engine(model);
 
     bool is_first_turn = true;
-    model.clear_history(); // 初始化时清空一次
+    engine.clear_history(); // 初始化时清空一次
 
     std::cout << "=========================================" << std::endl;
     std::cout << "欢迎使用 Qwen2.5-1.5B FP16+GPTQ-Int8 CPU 推理引擎！" << std::endl;
@@ -113,7 +115,7 @@ int main(int argc, const char** argv) {
 
         // 【如果用户输入 clear，手动清空记忆】
         if (input == "clear") {
-            model.clear_history();
+            engine.clear_history();
             is_first_turn = true;
             std::cout << "[System] History cleared." << std::endl;
             continue;
@@ -121,7 +123,7 @@ int main(int argc, const char** argv) {
 
         // LLM_STATELESS=1：每轮强制清空，单轮独立
         if (stateless) {
-            model.clear_history();
+            engine.clear_history();
             is_first_turn = true;
             std::cerr << "[MAIN_STATELESS_CLEAR]" << std::endl;
         }
@@ -148,7 +150,11 @@ int main(int argc, const char** argv) {
         int token_count = 0;
         auto start = std::chrono::steady_clock::now();
 
-        model.generate(input_tokens, max_new_tokens, [&](int token_id) {
+        SamplingParams params;
+        params.max_new_tokens = max_new_tokens;
+        params.greedy = true;
+
+        RequestId req_id = engine.submit(input_tokens, params, [&](int token_id) {
             // 【真实流式解码】：每当模型算出一个新 ID，立刻解码成中文打印到屏幕！
             std::string piece = real_decode(token_id);
             if (debug_text) {
@@ -161,6 +167,14 @@ int main(int argc, const char** argv) {
             token_count++;
             return true; // 返回 true 表示继续生成下一个字
         });
+
+        const RequestState* request = engine.get_request(req_id);
+        if (request && request->status == RequestStatus::FAILED) {
+            std::cerr << "[ERROR] request failed"
+                      << " id=" << req_id
+                      << " error=" << request->error_message
+                      << std::endl;
+        }
 
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
