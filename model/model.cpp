@@ -468,7 +468,15 @@ void QwenModel::generate(
 
     int next_token = -1;
     if (!input_tokens.empty()) {
-        if (env_flag("LLM_DISABLE_BATCH_PREFILL")) {
+        bool force_sequential_prefill = env_flag("LLM_DISABLE_BATCH_PREFILL");
+        if (kv_cache->is_paged()) {
+            if (!force_sequential_prefill && env_flag("LLM_DEBUG_KV")) {
+                std::cerr << "[KVCache] paged mode forces sequential prefill" << std::endl;
+            }
+            force_sequential_prefill = true;
+        }
+
+        if (force_sequential_prefill) {
             for (int tok : input_tokens) {
                 if (history_pos >= config.max_seq_len) return;
                 next_token = forward(tok, history_pos, *kv_cache);

@@ -1,43 +1,71 @@
 #pragma once
-#include <vector>
+
 #include <cstddef>
-#include <algorithm>
+#include <vector>
 
 #include "llm_engine/tensor.h"
 
 namespace llm_engine {
 
+enum class KVCacheLayout {
+    CONTIGUOUS,
+    PAGED
+};
+
 class KVCache {
 public:
-    // 构造函数：预分配最大容量的内存
     KVCache(int num_layers, int max_seq_len, int num_kv_heads, int head_dim);
 
-    // 将当前生成的 Token 的 K, V 写入到 Cache 中
-    // k_curr, v_curr 是当前 token 的输出，形状为 [num_kv_heads, head_dim]
-    // current_pos 是当前 Token 在序列中的位置索引 (例如：第一个字是 0，第二个字是 1)
     void update(int layer_id, int current_pos, const fp16_t* k_curr, const fp16_t* v_curr);
 
-    // 获取某一层的 K 和 V 缓存的首地址，用于传给 BMM 算子
     fp16_t* get_k_head_ptr(int layer_id, int kv_head_id);
     fp16_t* get_v_head_ptr(int layer_id, int kv_head_id);
-    
-    int get_max_seq_len() const { return max_seq_len; }
 
-    void clear() {
-        std::fill(k_cache.begin(), k_cache.end(), (fp16_t)0);
-        std::fill(v_cache.begin(), v_cache.end(), (fp16_t)0);
-    }
+    int get_max_seq_len() const { return max_seq_len; }
+    bool is_paged() const { return layout_ == KVCacheLayout::PAGED; }
+    int block_size() const { return block_size_; }
+    int num_blocks() const { return num_logical_blocks_; }
+    int allocated_blocks() const { return num_physical_blocks_; }
+    int max_written_pos() const { return max_written_pos_; }
+
+    void clear();
 
 private:
+    fp16_t* get_contiguous_k_head_ptr(int layer_id, int kv_head_id);
+    fp16_t* get_contiguous_v_head_ptr(int layer_id, int kv_head_id);
+
+    fp16_t* paged_k_token_ptr(int physical_block, int layer_id, int kv_head_id, int offset_in_block);
+    fp16_t* paged_v_token_ptr(int physical_block, int layer_id, int kv_head_id, int offset_in_block);
+    const fp16_t* paged_k_token_ptr(int physical_block, int layer_id, int kv_head_id, int offset_in_block) const;
+    const fp16_t* paged_v_token_ptr(int physical_block, int layer_id, int kv_head_id, int offset_in_block) const;
+
+    fp16_t* gather_head(bool gather_k, int layer_id, int kv_head_id);
+
+    bool debug_enabled() const;
+    bool debug_verbose_enabled() const;
+    void debug_log_config() const;
+    void debug_log_gather(bool gather_k, int layer_id, int kv_head_id, int valid_len);
+
     int num_layers;
     int max_seq_len;
     int num_kv_heads;
     int head_dim;
-    
-    // 我们用一维 std::vector 来模拟高维张量：
-    // 逻辑形状为: [num_layers, max_seq_len, num_kv_heads, head_dim]
+
+    KVCacheLayout layout_ = KVCacheLayout::CONTIGUOUS;
+    int block_size_ = 16;
+    int num_logical_blocks_ = 0;
+    int num_physical_blocks_ = 0;
+    int max_written_pos_ = -1;
+    int gather_log_count_ = 0;
+
     std::vector<fp16_t> k_cache;
     std::vector<fp16_t> v_cache;
+
+    std::vector<int> block_table_;
+    std::vector<fp16_t> k_pages_;
+    std::vector<fp16_t> v_pages_;
+    std::vector<fp16_t> gather_k_buffer_;
+    std::vector<fp16_t> gather_v_buffer_;
 };
 
-} // namespace llm_enginematmul_neon
+} // namespace llm_engine
