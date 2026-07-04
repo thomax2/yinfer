@@ -522,6 +522,127 @@ void QwenModel::generate(
     }
 }
 
+int QwenModel::prefill_one_for_sequence(
+    SequenceState& seq,
+    const std::vector<int>& prompt_tokens,
+    int prompt_index,
+    KVCacheManager& kv_manager,
+    PrefixCache* prefix_cache
+) {
+    if (!kv_cache) return -1;
+    if (prompt_index < 0 || prompt_index >= static_cast<int>(prompt_tokens.size())) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "prompt cursor out of range";
+        return -1;
+    }
+    if (seq.history_pos >= config.max_seq_len) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "sequence length exceeded";
+        return -1;
+    }
+    if (!kv_manager.ensure_block_for_position(seq, seq.history_pos)) {
+        seq.status = SequenceStatus::FAILED;
+        if (seq.error_message.empty()) {
+            seq.error_message = "KV block pool exhausted";
+        }
+        return -1;
+    }
+
+    int token_id = prompt_tokens[(size_t)prompt_index];
+    kv_cache->set_active_sequence(&seq.block_table, &seq.max_written_pos);
+    int next_token = forward(token_id, seq.history_pos, *kv_cache);
+    kv_cache->clear_active_sequence();
+    if (next_token < 0) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "prompt forward failed";
+        return -1;
+    }
+
+    seq.all_tokens.push_back(token_id);
+    seq.history_pos++;
+    seq.num_computed_tokens++;
+
+    if (prefix_cache && kv_cache->block_size() > 0 &&
+        seq.history_pos % kv_cache->block_size() == 0) {
+        int block_size = kv_cache->block_size();
+        int logical_block = (seq.history_pos / block_size) - 1;
+        int block_begin = logical_block * block_size;
+        if (logical_block >= 0 &&
+            block_begin >= 0 &&
+            block_begin + block_size <= static_cast<int>(seq.all_tokens.size()) &&
+            logical_block < static_cast<int>(seq.block_table.size())) {
+            int physical_block = seq.block_table[(size_t)logical_block];
+            if (physical_block >= 0 && !kv_manager.block_has_hash(physical_block)) {
+                HashValue parent_hash;
+                if (logical_block > 0) {
+                    int prev_block = seq.block_table[(size_t)(logical_block - 1)];
+                    if (prev_block < 0 || !kv_manager.block_has_hash(prev_block)) {
+                        return next_token;
+                    }
+                    parent_hash = kv_manager.block_hash(prev_block);
+                }
+
+                HashValue current_hash = hash_token_block(
+                    parent_hash,
+                    seq.all_tokens,
+                    block_begin,
+                    block_size,
+                    prefix_cache->config());
+                if (prefix_cache->insert(
+                        current_hash,
+                        parent_hash,
+                        seq.all_tokens,
+                        block_begin,
+                        block_size,
+                        physical_block)) {
+                    kv_manager.attach_hash_to_block(
+                        physical_block,
+                        current_hash,
+                        parent_hash,
+                        block_size);
+                    seq.last_prefix_hash = current_hash;
+                }
+            }
+        }
+    }
+
+    return next_token;
+}
+
+int QwenModel::decode_one_for_sequence(
+    SequenceState& seq,
+    int input_token,
+    KVCacheManager& kv_manager,
+    PrefixCache* /*prefix_cache*/
+) {
+    if (!kv_cache) return -1;
+    if (seq.history_pos >= config.max_seq_len) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "sequence length exceeded";
+        return -1;
+    }
+    if (!kv_manager.ensure_block_for_position(seq, seq.history_pos)) {
+        seq.status = SequenceStatus::FAILED;
+        if (seq.error_message.empty()) {
+            seq.error_message = "KV block pool exhausted";
+        }
+        return -1;
+    }
+
+    kv_cache->set_active_sequence(&seq.block_table, &seq.max_written_pos);
+    int next_token = forward(input_token, seq.history_pos, *kv_cache);
+    kv_cache->clear_active_sequence();
+    if (next_token < 0) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "decode forward failed";
+        return -1;
+    }
+
+    seq.all_tokens.push_back(input_token);
+    seq.history_pos++;
+    return next_token;
+}
+
 void QwenModel::generate_for_sequence(
     SequenceState& seq,
     const std::vector<int>& input_tokens,

@@ -101,6 +101,7 @@ int main(int argc, const char** argv) {
     bool debug_text = main_env_flag("LLM_DEBUG_TEXT");
     bool stateless = main_env_flag("LLM_STATELESS");
     int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
+    int test_abort_after_tokens = main_env_int("LLM_TEST_ABORT_AFTER_TOKENS", 0);
 
     while (true) {
         std::cout << "\nUser: ";
@@ -165,6 +166,12 @@ int main(int argc, const char** argv) {
             }
             std::cout << piece << std::flush;
             token_count++;
+            if (test_abort_after_tokens > 0 && token_count >= test_abort_after_tokens) {
+                std::cerr << "[MAIN_TEST_ABORT]"
+                          << " after_tokens=" << test_abort_after_tokens
+                          << std::endl;
+                return false;
+            }
             return true; // 返回 true 表示继续生成下一个字
         });
 

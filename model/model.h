@@ -122,6 +122,21 @@ public:
         std::function<bool(int)> callback
     );
 
+    int prefill_one_for_sequence(
+        SequenceState& seq,
+        const std::vector<int>& prompt_tokens,
+        int prompt_index,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache
+    );
+
+    int decode_one_for_sequence(
+        SequenceState& seq,
+        int input_token,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache
+    );
+
 private:
     // 内部辅助函数：分配固定内存并绑定给 Tensor
     void allocate_tensor(Tensor& t, const std::vector<int>& shape, DataType dtype);
