@@ -170,6 +170,27 @@ size_t KVCache::total_kv_bytes() const {
     return (size_t)num_layers * 2 * num_kv_heads * max_seq_len * head_dim * sizeof(fp16_t);
 }
 
+bool KVCache::valid_physical_block(int block_id) const {
+    return is_paged() && block_id >= 0 && block_id < num_physical_blocks_;
+}
+
+void KVCache::clear_physical_block(int block_id) {
+    if (!valid_physical_block(block_id)) {
+        return;
+    }
+
+    size_t elements_per_plane =
+        (size_t)num_layers * num_kv_heads * block_size_ * head_dim;
+    size_t begin = (size_t)block_id * elements_per_plane;
+    size_t end = begin + elements_per_plane;
+    if (end > k_pages_.size() || end > v_pages_.size()) {
+        return;
+    }
+
+    std::fill(k_pages_.begin() + begin, k_pages_.begin() + end, (fp16_t)0);
+    std::fill(v_pages_.begin() + begin, v_pages_.begin() + end, (fp16_t)0);
+}
+
 void KVCache::set_active_sequence(std::vector<int>* block_table, int* max_written_pos) {
     active_block_table_ = block_table;
     active_max_written_pos_ = max_written_pos;

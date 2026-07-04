@@ -29,6 +29,8 @@ public:
     int max_written_pos() const { return max_written_pos_; }
     size_t bytes_per_block() const;
     size_t total_kv_bytes() const;
+    bool valid_physical_block(int block_id) const;
+    void clear_physical_block(int block_id);
 
     void set_active_sequence(std::vector<int>* block_table, int* max_written_pos);
     void clear_active_sequence();

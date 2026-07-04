@@ -174,14 +174,21 @@ void LLMEngine::clear_session(SessionId session_id) {
 
     auto it = sessions_.find(session_id);
     if (it != sessions_.end()) {
+        bool discard_blocks = env_flag("LLM_SESSION_CLEAR_DISCARD");
         if (kv_manager_) {
-            kv_manager_->free_sequence(it->second);
+            if (discard_blocks) {
+                kv_manager_->discard_sequence(it->second);
+                kv_manager_->clear_cached_blocks();
+            } else {
+                kv_manager_->release_sequence_to_cache(it->second);
+            }
         }
         it->second.reset();
         it->second.session_id = session_id;
         if (debug_session_enabled()) {
             std::cerr << "[SESSION] clear"
                       << " session=" << session_id
+                      << " mode=" << (discard_blocks ? "discard" : "cache")
                       << std::endl;
         }
     }
