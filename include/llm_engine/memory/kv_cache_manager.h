@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "llm_engine/cache/hash.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/memory/kv_cache.h"
 
 namespace llm_engine {
+
+class PrefixCache;
 
 enum class KVBlockState {
     FREE,
@@ -24,6 +27,9 @@ struct KVBlockMeta {
     uint64_t last_access_tick = 0;
     bool has_hash = false;
     uint64_t debug_hash = 0;
+    HashValue block_hash;
+    HashValue parent_hash;
+    int token_count = 0;
 };
 
 class KVCacheManager {
@@ -44,6 +50,16 @@ public:
     void clear_cached_blocks();
     void clear_all();
     void reset();
+    void set_prefix_cache(PrefixCache* cache);
+    bool attach_hash_to_block(
+        int block_id,
+        const HashValue& block_hash,
+        const HashValue& parent_hash,
+        int token_count);
+    bool block_has_hash(int block_id) const;
+    HashValue block_hash(int block_id) const;
+    int block_token_count(int block_id) const;
+    int block_ref_count(int block_id) const;
 
     int total_blocks() const { return total_physical_blocks_; }
     int free_blocks() const { return static_cast<int>(free_list_.size()); }
@@ -58,6 +74,7 @@ private:
     int pop_free_block();
     void push_free_block(int block_id);
     void make_block_free(int block_id, bool clear_page);
+    void clear_block_hash(KVBlockMeta& block);
     void push_lru_tail(int block_id);
     void remove_from_lru(int block_id);
     int pop_lru_head();
@@ -69,6 +86,7 @@ private:
     const char* state_name(KVBlockState state) const;
 
     KVCache& cache_;
+    PrefixCache* prefix_cache_ = nullptr;
     int max_seq_len_ = 0;
     int block_size_ = 16;
     int num_logical_blocks_ = 0;

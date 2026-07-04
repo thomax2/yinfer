@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "llm_engine/cache/prefix_cache.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/memory/kv_cache_manager.h"
 
@@ -69,6 +70,8 @@ public:
 private:
     bool debug_enabled() const;
     bool debug_session_enabled() const;
+    bool debug_prefix_enabled() const;
+    void apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens);
     void debug_log_submit(const RequestState& request) const;
     void debug_log_finished(const RequestState& request) const;
     void debug_log_failed(const RequestState& request) const;
@@ -78,7 +81,9 @@ private:
     RequestId next_request_id_ = 1;
     SessionId default_session_id_ = 1;
     bool session_cache_enabled_ = false;
+    bool prefix_cache_enabled_ = false;
     std::unique_ptr<KVCacheManager> kv_manager_;
+    std::unique_ptr<PrefixCache> prefix_cache_;
     std::unordered_map<RequestId, RequestState> requests_;
     std::unordered_map<SessionId, SequenceState> sessions_;
 };

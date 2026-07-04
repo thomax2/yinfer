@@ -527,6 +527,7 @@ void QwenModel::generate_for_sequence(
     const std::vector<int>& input_tokens,
     int max_new_tokens,
     KVCacheManager& kv_manager,
+    PrefixCache* prefix_cache,
     std::function<bool(int)> callback
 ) {
     if (!kv_cache) return;
@@ -541,8 +542,76 @@ void QwenModel::generate_for_sequence(
         kv_cache->clear_active_sequence();
     };
 
+    auto maybe_register_completed_block = [&](int logical_block) {
+        if (!prefix_cache || logical_block < 0) {
+            return;
+        }
+        int block_size = kv_cache->block_size();
+        int block_begin = logical_block * block_size;
+        if (block_begin < 0 ||
+            block_begin + block_size > static_cast<int>(seq.all_tokens.size()) ||
+            logical_block >= static_cast<int>(seq.block_table.size())) {
+            return;
+        }
+
+        int physical_block = seq.block_table[(size_t)logical_block];
+        if (physical_block < 0 ||
+            kv_manager.block_has_hash(physical_block)) {
+            return;
+        }
+
+        HashValue parent_hash;
+        if (logical_block > 0) {
+            int prev_block = seq.block_table[(size_t)(logical_block - 1)];
+            if (prev_block < 0 || !kv_manager.block_has_hash(prev_block)) {
+                return;
+            }
+            parent_hash = kv_manager.block_hash(prev_block);
+        }
+
+        HashValue current_hash = hash_token_block(
+            parent_hash,
+            seq.all_tokens,
+            block_begin,
+            block_size,
+            prefix_cache->config());
+        if (prefix_cache->insert(
+                current_hash,
+                parent_hash,
+                seq.all_tokens,
+                block_begin,
+                block_size,
+                physical_block)) {
+            kv_manager.attach_hash_to_block(
+                physical_block,
+                current_hash,
+                parent_hash,
+                block_size);
+            seq.last_prefix_hash = current_hash;
+        }
+    };
+
+    int prefill_begin = (seq.cached_prefix_tokens > 0 &&
+                         seq.history_pos == seq.cached_prefix_tokens)
+        ? seq.cached_prefix_tokens
+        : 0;
+    if (prefill_begin < 0) {
+        prefill_begin = 0;
+    }
+    if (prefill_begin > static_cast<int>(input_tokens.size())) {
+        prefill_begin = static_cast<int>(input_tokens.size());
+    }
+    if (prefill_begin == static_cast<int>(input_tokens.size()) && !input_tokens.empty()) {
+        prefill_begin = static_cast<int>(input_tokens.size()) - 1;
+        seq.history_pos = prefill_begin;
+        if (seq.all_tokens.size() > (size_t)prefill_begin) {
+            seq.all_tokens.resize((size_t)prefill_begin);
+        }
+    }
+
     int next_token = -1;
-    for (int tok : input_tokens) {
+    for (int token_index = prefill_begin; token_index < static_cast<int>(input_tokens.size()); ++token_index) {
+        int tok = input_tokens[(size_t)token_index];
         if (seq.history_pos >= config.max_seq_len) {
             fail("sequence length exceeded");
             return;
@@ -562,6 +631,10 @@ void QwenModel::generate_for_sequence(
         }
         seq.all_tokens.push_back(tok);
         seq.history_pos++;
+        seq.num_computed_tokens++;
+        if (prefix_cache && seq.history_pos % kv_cache->block_size() == 0) {
+            maybe_register_completed_block((seq.history_pos / kv_cache->block_size()) - 1);
+        }
     }
 
     int current_token = next_token;

@@ -19,10 +19,20 @@ bool env_flag(const char* name) {
     return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
 }
 
+uint64_t env_u64(const char* name, uint64_t default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    char* end = nullptr;
+    unsigned long long x = std::strtoull(v, &end, 0);
+    if (end == v) return default_value;
+    return static_cast<uint64_t>(x);
+}
+
 } // namespace
 
 LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     bool requested_session_cache = env_flag("LLM_ENABLE_SESSION_CACHE");
+    bool requested_prefix_cache = env_flag("LLM_ENABLE_PREFIX_CACHE");
     if (requested_session_cache && model_.kv_cache && model_.kv_cache->is_paged()) {
         session_cache_enabled_ = true;
         kv_manager_ = std::make_unique<KVCacheManager>(
@@ -34,8 +44,22 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
             std::cerr << "[SESSION] enabled default_session=" << default_session_id_
                       << std::endl;
         }
+        if (requested_prefix_cache) {
+            PrefixCacheConfig config;
+            config.model_hash = env_u64("LLM_MODEL_HASH", 0x2515b0015b8f1001ULL);
+            config.tokenizer_hash = env_u64("LLM_TOKENIZER_HASH", 0x746f6b656e697a31ULL);
+            config.chat_template_hash = env_u64("LLM_CHAT_TEMPLATE_HASH", 0x636861746d6c0001ULL);
+            config.cache_salt = env_u64("LLM_PREFIX_CACHE_SALT", 0);
+            prefix_cache_ = std::make_unique<PrefixCache>(config);
+            kv_manager_->set_prefix_cache(prefix_cache_.get());
+            prefix_cache_enabled_ = true;
+        }
     } else if (requested_session_cache) {
         std::cerr << "[SESSION] LLM_ENABLE_SESSION_CACHE ignored because paged KV is not enabled"
+                  << std::endl;
+    }
+    if (requested_prefix_cache && !prefix_cache_enabled_) {
+        std::cerr << "[PREFIX] LLM_ENABLE_PREFIX_CACHE ignored because paged session cache is not enabled"
                   << std::endl;
     }
 }
@@ -103,11 +127,13 @@ RequestId LLMEngine::submit(
                           << " prompt_tokens=" << state.prompt_tokens.size()
                           << std::endl;
             }
+            apply_prefix_cache(seq, state.prompt_tokens);
             model_.generate_for_sequence(
                 seq,
                 state.prompt_tokens,
                 state.sampling.max_new_tokens,
                 *kv_manager_,
+                prefix_cache_.get(),
                 wrapped_callback);
             if (seq.status == SequenceStatus::FAILED) {
                 state.status = RequestStatus::FAILED;
@@ -125,6 +151,9 @@ RequestId LLMEngine::submit(
                           << " request=" << id
                           << " history_pos=" << seq.history_pos
                           << " max_written_pos=" << seq.max_written_pos
+                          << " cached_prefix_tokens=" << seq.cached_prefix_tokens
+                          << " cached_prefix_blocks=" << seq.cached_prefix_blocks
+                          << " computed_tokens=" << seq.num_computed_tokens
                           << std::endl;
             }
         } else {
@@ -219,6 +248,92 @@ bool LLMEngine::debug_enabled() const {
 
 bool LLMEngine::debug_session_enabled() const {
     return env_flag("LLM_DEBUG_SESSION");
+}
+
+bool LLMEngine::debug_prefix_enabled() const {
+    return env_flag("LLM_DEBUG_PREFIX_CACHE");
+}
+
+void LLMEngine::apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens) {
+    if (!prefix_cache_enabled_ || !prefix_cache_ || !kv_manager_) {
+        return;
+    }
+    if (seq.history_pos != 0) {
+        if (debug_prefix_enabled()) {
+            std::cerr << "[PREFIX] skip lookup reason=session_history"
+                      << " history_pos=" << seq.history_pos
+                      << std::endl;
+        }
+        return;
+    }
+
+    kv_manager_->init_sequence(seq);
+    seq.cached_prefix_tokens = 0;
+    seq.cached_prefix_blocks = 0;
+    seq.num_computed_tokens = 0;
+    seq.last_prefix_hash = {};
+    seq.all_tokens.clear();
+
+    int block_size = model_.kv_cache ? model_.kv_cache->block_size() : 0;
+    if (block_size <= 0) {
+        return;
+    }
+    int full_blocks = static_cast<int>(prompt_tokens.size()) / block_size;
+    HashValue parent_hash;
+    for (int block_idx = 0; block_idx < full_blocks; ++block_idx) {
+        if (block_idx >= static_cast<int>(seq.block_table.size())) {
+            break;
+        }
+        int begin = block_idx * block_size;
+        HashValue h = hash_token_block(
+            parent_hash,
+            prompt_tokens,
+            begin,
+            block_size,
+            prefix_cache_->config());
+
+        PrefixCacheEntry entry;
+        if (!prefix_cache_->lookup(h, prompt_tokens, begin, block_size, &entry)) {
+            if (debug_prefix_enabled()) {
+                std::cerr << "[PREFIX] stop lookup"
+                          << " block=" << block_idx
+                          << " reason=miss"
+                          << std::endl;
+            }
+            break;
+        }
+        if (!kv_manager_->retain_block(entry.physical_block)) {
+            if (debug_prefix_enabled()) {
+                std::cerr << "[PREFIX] stop lookup"
+                          << " block=" << block_idx
+                          << " reason=retain_failed"
+                          << " physical=" << entry.physical_block
+                          << std::endl;
+            }
+            break;
+        }
+
+        seq.block_table[(size_t)block_idx] = entry.physical_block;
+        seq.history_pos += block_size;
+        seq.max_written_pos = seq.history_pos - 1;
+        seq.cached_prefix_blocks++;
+        seq.cached_prefix_tokens += block_size;
+        seq.last_prefix_hash = h;
+        seq.all_tokens.insert(
+            seq.all_tokens.end(),
+            prompt_tokens.begin() + begin,
+            prompt_tokens.begin() + begin + block_size);
+        parent_hash = h;
+
+        if (debug_prefix_enabled()) {
+            std::cerr << "[PREFIX] retain"
+                      << " block=" << block_idx
+                      << " physical=" << entry.physical_block
+                      << " ref_count=" << kv_manager_->block_ref_count(entry.physical_block)
+                      << " cached_tokens=" << seq.cached_prefix_tokens
+                      << std::endl;
+        }
+    }
 }
 
 void LLMEngine::debug_log_submit(const RequestState& request) const {

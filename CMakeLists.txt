@@ -16,6 +16,7 @@ set(LLM_ENGINE_SOURCES
     src/graph/compiler.cpp
 
     # Sprint 4: 内存管理
+    src/cache/prefix_cache.cpp
     src/memory/memory_pool.cpp
     src/memory/workspace.cpp
     src/memory/kv_cache.cpp

@@ -1,5 +1,7 @@
 #include "llm_engine/memory/kv_cache_manager.h"
 
+#include "llm_engine/cache/prefix_cache.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -34,6 +36,7 @@ KVCacheManager::KVCacheManager(
         blocks_[(size_t)i].block_id = i;
         blocks_[(size_t)i].state = KVBlockState::FREE;
         blocks_[(size_t)i].ref_count = 0;
+        clear_block_hash(blocks_[(size_t)i]);
         free_list_.push_back(i);
     }
 
@@ -322,8 +325,10 @@ void KVCacheManager::clear_all() {
         block.lru_prev = -1;
         block.lru_next = -1;
         block.last_access_tick = 0;
-        block.has_hash = false;
-        block.debug_hash = 0;
+        if (prefix_cache_ && block.has_hash) {
+            prefix_cache_->erase_block(i);
+        }
+        clear_block_hash(block);
         free_list_.push_back(i);
         if (evict_zero_enabled()) {
             cache_.clear_physical_block(i);
@@ -356,8 +361,7 @@ int KVCacheManager::allocate_block() {
     block.lru_prev = -1;
     block.lru_next = -1;
     block.last_access_tick = ++access_tick_;
-    block.has_hash = false;
-    block.debug_hash = 0;
+    clear_block_hash(block);
     maybe_check_invariants("allocate_block");
     return block_id;
 }
@@ -394,13 +398,23 @@ void KVCacheManager::make_block_free(int block_id, bool clear_page) {
     block.lru_prev = -1;
     block.lru_next = -1;
     block.last_access_tick = ++access_tick_;
-    block.has_hash = false;
-    block.debug_hash = 0;
+    if (prefix_cache_ && block.has_hash) {
+        prefix_cache_->erase_block(block_id);
+    }
+    clear_block_hash(block);
 
     if (clear_page) {
         cache_.clear_physical_block(block_id);
     }
     push_free_block(block_id);
+}
+
+void KVCacheManager::clear_block_hash(KVBlockMeta& block) {
+    block.has_hash = false;
+    block.debug_hash = 0;
+    block.block_hash = {};
+    block.parent_hash = {};
+    block.token_count = 0;
 }
 
 void KVCacheManager::push_lru_tail(int block_id) {
@@ -460,6 +474,60 @@ int KVCacheManager::pop_lru_head() {
         remove_from_lru(block_id);
     }
     return block_id;
+}
+
+void KVCacheManager::set_prefix_cache(PrefixCache* cache) {
+    prefix_cache_ = cache;
+}
+
+bool KVCacheManager::attach_hash_to_block(
+    int block_id,
+    const HashValue& block_hash,
+    const HashValue& parent_hash,
+    int token_count) {
+    if (block_id < 0 || block_id >= total_physical_blocks_ ||
+        token_count != block_size_) {
+        return false;
+    }
+    KVBlockMeta& block = blocks_[(size_t)block_id];
+    if (block.state == KVBlockState::FREE) {
+        return false;
+    }
+
+    block.has_hash = true;
+    block.debug_hash = block_hash.lo;
+    block.block_hash = block_hash;
+    block.parent_hash = parent_hash;
+    block.token_count = token_count;
+    return true;
+}
+
+bool KVCacheManager::block_has_hash(int block_id) const {
+    if (block_id < 0 || block_id >= total_physical_blocks_) {
+        return false;
+    }
+    return blocks_[(size_t)block_id].has_hash;
+}
+
+HashValue KVCacheManager::block_hash(int block_id) const {
+    if (block_id < 0 || block_id >= total_physical_blocks_) {
+        return {};
+    }
+    return blocks_[(size_t)block_id].block_hash;
+}
+
+int KVCacheManager::block_token_count(int block_id) const {
+    if (block_id < 0 || block_id >= total_physical_blocks_) {
+        return 0;
+    }
+    return blocks_[(size_t)block_id].token_count;
+}
+
+int KVCacheManager::block_ref_count(int block_id) const {
+    if (block_id < 0 || block_id >= total_physical_blocks_) {
+        return 0;
+    }
+    return blocks_[(size_t)block_id].ref_count;
 }
 
 int KVCacheManager::active_blocks() const {

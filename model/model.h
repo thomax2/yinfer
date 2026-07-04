@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llm_engine/tensor.h"
+#include "llm_engine/cache/prefix_cache.h"
 #include "llm_engine/memory/kv_cache.h"
 #include "llm_engine/memory/kv_cache_manager.h"
 #include "llm_engine/memory/workspace.h"
@@ -117,6 +118,7 @@ public:
         const std::vector<int>& input_tokens,
         int max_new_tokens,
         KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache,
         std::function<bool(int)> callback
     );
 
