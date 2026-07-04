@@ -37,11 +37,11 @@ KVCache::KVCache(int num_layers, int max_seq_len, int num_kv_heads, int head_dim
     if (layout_ == KVCacheLayout::PAGED) {
         block_size_ = env_int("LLM_KV_BLOCK_SIZE", 16);
         num_logical_blocks_ = (max_seq_len + block_size_ - 1) / block_size_;
-        num_physical_blocks_ = num_logical_blocks_;
+        num_physical_blocks_ = env_int("LLM_KV_MAX_BLOCKS", num_logical_blocks_);
 
         block_table_.resize((size_t)num_logical_blocks_);
         for (int i = 0; i < num_logical_blocks_; ++i) {
-            block_table_[(size_t)i] = i;
+            block_table_[(size_t)i] = i < num_physical_blocks_ ? i : -1;
         }
 
         size_t page_elements =
@@ -84,9 +84,28 @@ void KVCache::update(int layer_id, int current_pos, const fp16_t* k_curr, const 
         return;
     }
 
+    std::vector<int>* active_table = active_block_table_ ? active_block_table_ : &block_table_;
     int logical_block = current_pos / block_size_;
     int offset_in_block = current_pos % block_size_;
-    int physical_block = block_table_[(size_t)logical_block];
+    if (logical_block < 0 || logical_block >= static_cast<int>(active_table->size())) {
+        if (debug_enabled()) {
+            std::cerr << "[KVCache] update missing logical block"
+                      << " logical_block=" << logical_block
+                      << " table_size=" << active_table->size()
+                      << std::endl;
+        }
+        return;
+    }
+    int physical_block = (*active_table)[(size_t)logical_block];
+    if (physical_block < 0 || physical_block >= num_physical_blocks_) {
+        if (debug_enabled()) {
+            std::cerr << "[KVCache] update missing physical block"
+                      << " logical_block=" << logical_block
+                      << " physical_block=" << physical_block
+                      << std::endl;
+        }
+        return;
+    }
 
     for (int h = 0; h < num_kv_heads; ++h) {
         fp16_t* k_dest = paged_k_token_ptr(physical_block, layer_id, h, offset_in_block);
@@ -96,7 +115,11 @@ void KVCache::update(int layer_id, int current_pos, const fp16_t* k_curr, const 
         std::memcpy(k_dest, k_src, (size_t)head_dim * sizeof(fp16_t));
         std::memcpy(v_dest, v_src, (size_t)head_dim * sizeof(fp16_t));
     }
-    max_written_pos_ = std::max(max_written_pos_, current_pos);
+    if (active_max_written_pos_) {
+        *active_max_written_pos_ = std::max(*active_max_written_pos_, current_pos);
+    } else {
+        max_written_pos_ = std::max(max_written_pos_, current_pos);
+    }
 }
 
 fp16_t* KVCache::get_k_head_ptr(int layer_id, int kv_head_id) {
@@ -131,6 +154,30 @@ void KVCache::clear() {
                   << (is_paged() ? "paged" : "contiguous")
                   << std::endl;
     }
+}
+
+size_t KVCache::bytes_per_block() const {
+    if (!is_paged()) {
+        return 0;
+    }
+    return (size_t)num_layers * 2 * num_kv_heads * block_size_ * head_dim * sizeof(fp16_t);
+}
+
+size_t KVCache::total_kv_bytes() const {
+    if (is_paged()) {
+        return bytes_per_block() * (size_t)num_physical_blocks_;
+    }
+    return (size_t)num_layers * 2 * num_kv_heads * max_seq_len * head_dim * sizeof(fp16_t);
+}
+
+void KVCache::set_active_sequence(std::vector<int>* block_table, int* max_written_pos) {
+    active_block_table_ = block_table;
+    active_max_written_pos_ = max_written_pos;
+}
+
+void KVCache::clear_active_sequence() {
+    active_block_table_ = nullptr;
+    active_max_written_pos_ = nullptr;
 }
 
 fp16_t* KVCache::get_contiguous_k_head_ptr(int layer_id, int kv_head_id) {
@@ -185,14 +232,34 @@ fp16_t* KVCache::gather_head(bool gather_k, int layer_id, int kv_head_id) {
     std::vector<fp16_t>& buffer = gather_k ? gather_k_buffer_ : gather_v_buffer_;
     std::fill(buffer.begin(), buffer.end(), (fp16_t)0);
 
-    int valid_len = max_written_pos_ + 1;
+    std::vector<int>* active_table = active_block_table_ ? active_block_table_ : &block_table_;
+    int max_written = active_max_written_pos_ ? *active_max_written_pos_ : max_written_pos_;
+    int valid_len = max_written + 1;
     if (valid_len < 0) valid_len = 0;
     if (valid_len > max_seq_len) valid_len = max_seq_len;
 
     for (int pos = 0; pos < valid_len; ++pos) {
         int logical_block = pos / block_size_;
         int offset_in_block = pos % block_size_;
-        int physical_block = block_table_[(size_t)logical_block];
+        if (logical_block < 0 || logical_block >= static_cast<int>(active_table->size())) {
+            if (debug_enabled()) {
+                std::cerr << "[KVCache] gather missing logical block"
+                          << " logical_block=" << logical_block
+                          << " table_size=" << active_table->size()
+                          << std::endl;
+            }
+            continue;
+        }
+        int physical_block = (*active_table)[(size_t)logical_block];
+        if (physical_block < 0 || physical_block >= num_physical_blocks_) {
+            if (debug_enabled()) {
+                std::cerr << "[KVCache] gather missing physical block"
+                          << " logical_block=" << logical_block
+                          << " physical_block=" << physical_block
+                          << std::endl;
+            }
+            continue;
+        }
         const fp16_t* src = gather_k
             ? paged_k_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block)
             : paged_v_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block);
@@ -215,16 +282,14 @@ bool KVCache::debug_verbose_enabled() const {
 void KVCache::debug_log_config() const {
     if (!debug_enabled()) return;
 
-    size_t elements = is_paged()
-        ? (size_t)num_physical_blocks_ * num_layers * num_kv_heads * block_size_ * head_dim
-        : (size_t)num_layers * num_kv_heads * max_seq_len * head_dim;
-    double kv_mb = (2.0 * elements * sizeof(fp16_t)) / 1024.0 / 1024.0;
+    double kv_mb = total_kv_bytes() / 1024.0 / 1024.0;
 
     std::cerr << "[KVCache] layout=" << (is_paged() ? "paged" : "contiguous")
               << " max_seq_len=" << max_seq_len
               << " layers=" << num_layers
               << " kv_heads=" << num_kv_heads
               << " head_dim=" << head_dim
+              << " total_kv_bytes=" << total_kv_bytes()
               << " kv_mb=" << kv_mb
               << std::endl;
 
@@ -232,6 +297,7 @@ void KVCache::debug_log_config() const {
         std::cerr << "[KVCache] block_size=" << block_size_
                   << " logical_blocks=" << num_logical_blocks_
                   << " physical_blocks=" << num_physical_blocks_
+                  << " bytes_per_block=" << bytes_per_block()
                   << std::endl;
     }
 }

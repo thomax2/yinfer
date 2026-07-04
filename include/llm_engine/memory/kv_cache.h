@@ -27,6 +27,11 @@ public:
     int num_blocks() const { return num_logical_blocks_; }
     int allocated_blocks() const { return num_physical_blocks_; }
     int max_written_pos() const { return max_written_pos_; }
+    size_t bytes_per_block() const;
+    size_t total_kv_bytes() const;
+
+    void set_active_sequence(std::vector<int>* block_table, int* max_written_pos);
+    void clear_active_sequence();
 
     void clear();
 
@@ -57,6 +62,8 @@ private:
     int num_physical_blocks_ = 0;
     int max_written_pos_ = -1;
     int gather_log_count_ = 0;
+    std::vector<int>* active_block_table_ = nullptr;
+    int* active_max_written_pos_ = nullptr;
 
     std::vector<fp16_t> k_cache;
     std::vector<fp16_t> v_cache;

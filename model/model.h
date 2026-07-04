@@ -2,9 +2,11 @@
 
 #include "llm_engine/tensor.h"
 #include "llm_engine/memory/kv_cache.h"
+#include "llm_engine/memory/kv_cache_manager.h"
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
+#include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/runtime/thread_pool.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include <memory>
@@ -107,6 +109,14 @@ public:
     void generate(
         const std::vector<int>& input_tokens, 
         int max_new_tokens, 
+        std::function<bool(int)> callback
+    );
+
+    void generate_for_sequence(
+        SequenceState& seq,
+        const std::vector<int>& input_tokens,
+        int max_new_tokens,
+        KVCacheManager& kv_manager,
         std::function<bool(int)> callback
     );
 

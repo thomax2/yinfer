@@ -19,6 +19,7 @@ set(LLM_ENGINE_SOURCES
     src/memory/memory_pool.cpp
     src/memory/workspace.cpp
     src/memory/kv_cache.cpp
+    src/memory/kv_cache_manager.cpp
 
     # Sprint 5: 持久线程池（算子内部并行）
     src/runtime/thread_pool.cpp
