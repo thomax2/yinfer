@@ -21,6 +21,7 @@ set(LLM_ENGINE_SOURCES
     src/memory/workspace.cpp
     src/memory/kv_cache.cpp
     src/memory/kv_cache_manager.cpp
+    src/metrics/metrics.cpp
 
     # Sprint 5: 持久线程池（算子内部并行）
     src/runtime/thread_pool.cpp
@@ -68,6 +69,7 @@ add_executable(qwen_model_loader
     model/model.cpp
     src/engine/llm_engine.cpp
     src/engine/engine_service.cpp
+    src/server/tcp_jsonl_server.cpp
     ${TIKTOKEN_SRCS}
 )
 

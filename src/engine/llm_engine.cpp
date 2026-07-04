@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -52,9 +53,17 @@ bool is_stop_token(int token_id) {
 LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     scheduler_enabled_ = env_flag("LLM_ENABLE_SCHEDULER");
     prefill_step_tokens_ = env_int("LLM_PREFILL_STEP_TOKENS", 1);
+    chunked_prefill_enabled_ = env_flag("LLM_ENABLE_CHUNKED_PREFILL");
+    chunked_prefill_strict_ = env_flag("LLM_CHUNKED_PREFILL_STRICT");
+    prefill_chunk_size_ = env_int("LLM_PREFILL_CHUNK_SIZE", prefill_step_tokens_);
+    if (prefill_chunk_size_ <= 0) {
+        prefill_chunk_size_ = 1;
+    }
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] enabled=" << (scheduler_enabled_ ? 1 : 0)
                   << " prefill_step_tokens=" << prefill_step_tokens_
+                  << " chunked_prefill=" << (chunked_prefill_enabled_ ? 1 : 0)
+                  << " prefill_chunk_size=" << prefill_chunk_size_
                   << std::endl;
     }
 
@@ -120,6 +129,13 @@ RequestId LLMEngine::submit(
     request.sampling = sampling;
     request.callback = std::move(callback);
     request.status = RequestStatus::RUNNING_PREFILL;
+    request.enqueue_time_us = now_us();
+    request.schedule_time_us = request.enqueue_time_us;
+    request.paged_attention_baseline = snapshot_paged_attention_stats();
+    request.metrics.request_id = id;
+    request.metrics.session_id = session_id;
+    request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
+    request.metrics.max_new_tokens = sampling.max_new_tokens;
 
     auto inserted = requests_.emplace(id, std::move(request));
     RequestState& state = inserted.first->second;
@@ -142,6 +158,8 @@ RequestId LLMEngine::submit(
 
             active.generated_tokens.push_back(token_id);
             active.token_count++;
+            active.num_generated_tokens++;
+            mark_first_token(active);
 
             if (active.callback && !active.callback(token_id)) {
                 callback_stopped = true;
@@ -161,6 +179,8 @@ RequestId LLMEngine::submit(
                           << std::endl;
             }
             apply_prefix_cache(seq, state.prompt_tokens);
+            state.metrics.cached_prefix_tokens = seq.cached_prefix_tokens;
+            state.metrics.cached_prefix_blocks = seq.cached_prefix_blocks;
             model_.generate_for_sequence(
                 seq,
                 state.prompt_tokens,
@@ -172,12 +192,11 @@ RequestId LLMEngine::submit(
                 state.status = RequestStatus::FAILED;
                 state.error_message = seq.error_message;
                 debug_log_failed(state);
-                state.callback = TokenCallback{};
-                return id;
-            }
-            if (seq.status == SequenceStatus::ABORTED) {
+                callback_stopped = false;
+            } else if (seq.status == SequenceStatus::ABORTED) {
                 callback_stopped = true;
             }
+            state.metrics.computed_prefill_tokens = seq.num_computed_tokens;
             if (debug_session_enabled()) {
                 std::cerr << "[SESSION] finished"
                           << " session=" << session_id
@@ -196,8 +215,11 @@ RequestId LLMEngine::submit(
                 wrapped_callback);
         }
 
-        state.status = callback_stopped ? RequestStatus::ABORTED : RequestStatus::FINISHED;
-        debug_log_finished(state);
+        if (state.status != RequestStatus::FAILED) {
+            state.status = callback_stopped ? RequestStatus::ABORTED : RequestStatus::FINISHED;
+            debug_log_finished(state);
+        }
+        state.metrics.generated_tokens = state.num_generated_tokens;
     } catch (const std::exception& e) {
         state.status = RequestStatus::FAILED;
         state.error_message = e.what();
@@ -209,6 +231,7 @@ RequestId LLMEngine::submit(
     }
 
     state.callback = TokenCallback{};
+    emit_metrics_once(state);
     return id;
 }
 
@@ -235,6 +258,12 @@ RequestId LLMEngine::submit_async(
     request.sampling = sampling;
     request.callback = std::move(callback);
     request.status = RequestStatus::WAITING;
+    request.enqueue_time_us = now_us();
+    request.paged_attention_baseline = snapshot_paged_attention_stats();
+    request.metrics.request_id = id;
+    request.metrics.session_id = session_id;
+    request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
+    request.metrics.max_new_tokens = sampling.max_new_tokens;
 
     requests_.emplace(id, std::move(request));
     waiting_queue_.push_back(id);
@@ -258,6 +287,7 @@ void LLMEngine::abort(RequestId id) {
         it->second.status != RequestStatus::ABORTED &&
         it->second.status != RequestStatus::FAILED) {
         it->second.status = RequestStatus::ABORTED;
+        emit_metrics_once(it->second);
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] abort"
                       << " id=" << id
@@ -443,6 +473,10 @@ bool LLMEngine::debug_scheduler_enabled() const {
     return env_flag("LLM_DEBUG_SCHEDULER");
 }
 
+bool LLMEngine::debug_chunked_prefill_enabled() const {
+    return env_flag("LLM_DEBUG_CHUNKED_PREFILL");
+}
+
 void LLMEngine::apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens) {
     if (!prefix_cache_enabled_ || !prefix_cache_ || !kv_manager_) {
         return;
@@ -551,9 +585,13 @@ void LLMEngine::schedule_next_request() {
             request.cached_prefix_tokens = seq.cached_prefix_tokens;
             request.cached_prefix_blocks = seq.cached_prefix_blocks;
             request.prompt_cursor = seq.cached_prefix_tokens;
+            request.metrics.cached_prefix_tokens = seq.cached_prefix_tokens;
+            request.metrics.cached_prefix_blocks = seq.cached_prefix_blocks;
         }
 
         request.status = RequestStatus::RUNNING_PREFILL;
+        request.schedule_time_us = now_us();
+        request.metrics.queue_wait_ms = elapsed_ms(request.enqueue_time_us, request.schedule_time_us);
         active_request_id_ = request.id;
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] schedule"
@@ -578,15 +616,57 @@ void LLMEngine::step_prefill(RequestState& request) {
     }
 
     SequenceState& seq = get_or_create_session(request.session_id);
-    int budget = prefill_step_tokens_;
+    int budget = std::max(1, prefill_step_tokens_);
     while (budget-- > 0 &&
            request.prompt_cursor < static_cast<int>(request.prompt_tokens.size())) {
-        int next = model_.prefill_one_for_sequence(
-            seq,
-            request.prompt_tokens,
-            request.prompt_cursor,
-            *kv_manager_,
-            prefix_cache_.get());
+        int begin = request.prompt_cursor;
+        int end = begin + 1;
+        bool used_chunk = false;
+        int next = -1;
+
+        if (chunked_prefill_enabled_) {
+            int remaining = static_cast<int>(request.prompt_tokens.size()) - begin;
+            int chunk = std::max(1, std::min(prefill_chunk_size_, remaining));
+            end = begin + chunk;
+            {
+                ScopedTimer timer(&request.metrics.prefill_ms);
+                next = model_.prefill_chunk_for_sequence(
+                    seq,
+                    request.prompt_tokens,
+                    begin,
+                    end,
+                    *kv_manager_,
+                    prefix_cache_.get());
+            }
+            used_chunk = next >= 0 && seq.status != SequenceStatus::FAILED;
+            if (!used_chunk && !chunked_prefill_strict_ && seq.history_pos == begin) {
+                if (debug_chunked_prefill_enabled()) {
+                    std::cerr << "[CHUNKED_PREFILL] fallback"
+                              << " id=" << request.id
+                              << " begin=" << begin
+                              << " end=" << end
+                              << std::endl;
+                }
+                seq.status = SequenceStatus::RUNNING;
+                seq.error_message.clear();
+                end = begin + 1;
+                ScopedTimer timer(&request.metrics.prefill_ms);
+                next = model_.prefill_one_for_sequence(
+                    seq,
+                    request.prompt_tokens,
+                    begin,
+                    *kv_manager_,
+                    prefix_cache_.get());
+            }
+        } else {
+            ScopedTimer timer(&request.metrics.prefill_ms);
+            next = model_.prefill_one_for_sequence(
+                seq,
+                request.prompt_tokens,
+                begin,
+                *kv_manager_,
+                prefix_cache_.get());
+        }
         if (seq.status == SequenceStatus::FAILED) {
             fail_request(request, seq.error_message.empty() ? "prefill failed" : seq.error_message);
             return;
@@ -596,14 +676,19 @@ void LLMEngine::step_prefill(RequestState& request) {
             return;
         }
         request.next_token = next;
-        request.prompt_cursor++;
+        request.prompt_cursor = end;
+        request.metrics.computed_prefill_tokens += (end - begin);
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] prefill"
                       << " id=" << request.id
                       << " prompt_cursor=" << request.prompt_cursor
                       << " prompt_tokens=" << request.prompt_tokens.size()
                       << " next_token=" << request.next_token
+                      << " chunk=" << (used_chunk ? (end - begin) : 1)
                       << std::endl;
+        }
+        if (chunked_prefill_enabled_) {
+            break;
         }
     }
 
@@ -637,6 +722,7 @@ void LLMEngine::step_decode(RequestState& request) {
     }
 
     SequenceState& seq = get_or_create_session(request.session_id);
+    ScopedTimer decode_timer(&request.metrics.decode_ms);
     int token_id = request.next_token;
     if (is_stop_token(token_id)) {
         model_.decode_one_for_sequence(seq, token_id, *kv_manager_, prefix_cache_.get());
@@ -652,6 +738,7 @@ void LLMEngine::step_decode(RequestState& request) {
     request.token_count++;
     request.num_generated_tokens++;
     seq.generated_tokens.push_back(token_id);
+    mark_first_token(request);
 
     bool keep_going = true;
     if (request.callback) {
@@ -665,6 +752,7 @@ void LLMEngine::step_decode(RequestState& request) {
         if (active_request_id_ == request.id) {
             active_request_id_ = 0;
         }
+        emit_metrics_once(request);
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] aborted"
                       << " id=" << request.id
@@ -722,6 +810,7 @@ void LLMEngine::run_legacy_request(RequestState& request) {
         request.generated_tokens.push_back(token_id);
         request.token_count++;
         request.num_generated_tokens++;
+        mark_first_token(request);
         if (request.callback && !request.callback(token_id)) {
             callback_stopped = true;
             return false;
@@ -730,6 +819,7 @@ void LLMEngine::run_legacy_request(RequestState& request) {
     };
 
     try {
+        ScopedTimer timer(&request.metrics.decode_ms);
         model_.generate(request.prompt_tokens, request.sampling.max_new_tokens, wrapped_callback);
         request.callback_stopped = callback_stopped;
         if (callback_stopped) {
@@ -738,6 +828,7 @@ void LLMEngine::run_legacy_request(RequestState& request) {
             if (active_request_id_ == request.id) {
                 active_request_id_ = 0;
             }
+            emit_metrics_once(request);
             if (debug_scheduler_enabled()) {
                 std::cerr << "[SCHED] aborted"
                           << " id=" << request.id
@@ -764,6 +855,7 @@ void LLMEngine::fail_request(RequestState& request, const std::string& error) {
     if (active_request_id_ == request.id) {
         active_request_id_ = 0;
     }
+    emit_metrics_once(request);
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] failed"
                   << " id=" << request.id
@@ -782,12 +874,69 @@ void LLMEngine::finish_request(RequestState& request) {
     if (active_request_id_ == request.id) {
         active_request_id_ = 0;
     }
+    emit_metrics_once(request);
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] finished"
                   << " id=" << request.id
                   << " generated=" << request.num_generated_tokens
                   << std::endl;
     }
+}
+
+void LLMEngine::emit_metrics_once(RequestState& request) {
+    if (request.metrics_emitted) {
+        return;
+    }
+    request.metrics_emitted = true;
+    request.finish_time_us = now_us();
+
+    request.metrics.request_id = request.id;
+    request.metrics.session_id = request.session_id;
+    request.metrics.prompt_tokens = static_cast<int>(request.prompt_tokens.size());
+    request.metrics.generated_tokens = request.num_generated_tokens;
+    request.metrics.max_new_tokens = request.sampling.max_new_tokens;
+    request.metrics.cached_prefix_tokens = request.cached_prefix_tokens;
+    request.metrics.cached_prefix_blocks = request.cached_prefix_blocks;
+    request.metrics.final_status = request_status_name(request.status);
+    request.metrics.error_message = request.error_message;
+    request.metrics.total_ms = elapsed_ms(request.enqueue_time_us, request.finish_time_us);
+    if (request.metrics.first_token_ms <= 0.0 && request.first_token_time_us > 0) {
+        request.metrics.first_token_ms =
+            elapsed_ms(request.enqueue_time_us, request.first_token_time_us);
+    }
+    if (request.metrics.total_ms > 0.0 && request.metrics.generated_tokens > 0) {
+        request.metrics.tokens_per_second =
+            static_cast<double>(request.metrics.generated_tokens) /
+            (request.metrics.total_ms / 1000.0);
+    }
+
+    if (kv_manager_) {
+        request.metrics.kv_total_blocks = kv_manager_->total_blocks();
+        request.metrics.kv_free_blocks = kv_manager_->free_blocks();
+        request.metrics.kv_active_blocks = kv_manager_->active_blocks();
+        request.metrics.kv_cached_blocks = kv_manager_->cached_blocks();
+        request.metrics.kv_lru_size = kv_manager_->lru_size();
+    }
+
+    PagedAttentionStats end = snapshot_paged_attention_stats();
+    PagedAttentionStats delta = diff_paged_attention_stats(
+        request.paged_attention_baseline,
+        end);
+    request.metrics.paged_attention_calls = delta.calls;
+    request.metrics.paged_attention_fallbacks = delta.fallbacks;
+    request.metrics.paged_attention_compare_warnings = delta.compare_warnings;
+
+    emit_request_metrics(request.metrics);
+}
+
+void LLMEngine::mark_first_token(RequestState& request) {
+    if (request.first_token_emitted) {
+        return;
+    }
+    request.first_token_emitted = true;
+    request.first_token_time_us = now_us();
+    request.metrics.first_token_ms =
+        elapsed_ms(request.enqueue_time_us, request.first_token_time_us);
 }
 
 bool LLMEngine::is_terminal(RequestStatus status) const {

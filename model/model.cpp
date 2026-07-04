@@ -609,6 +609,40 @@ int QwenModel::prefill_one_for_sequence(
     return next_token;
 }
 
+int QwenModel::prefill_chunk_for_sequence(
+    SequenceState& seq,
+    const std::vector<int>& prompt_tokens,
+    int prompt_begin,
+    int prompt_end,
+    KVCacheManager& kv_manager,
+    PrefixCache* prefix_cache
+) {
+    if (prompt_begin < 0 ||
+        prompt_end < prompt_begin ||
+        prompt_end > static_cast<int>(prompt_tokens.size())) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "prefill chunk range out of bounds";
+        return -1;
+    }
+    if (prompt_begin == prompt_end) {
+        return -1;
+    }
+
+    int next_token = -1;
+    for (int index = prompt_begin; index < prompt_end; ++index) {
+        next_token = prefill_one_for_sequence(
+            seq,
+            prompt_tokens,
+            index,
+            kv_manager,
+            prefix_cache);
+        if (seq.status == SequenceStatus::FAILED || next_token < 0) {
+            return -1;
+        }
+    }
+    return next_token;
+}
+
 int QwenModel::decode_one_for_sequence(
     SequenceState& seq,
     int input_token,

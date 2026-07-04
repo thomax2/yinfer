@@ -11,6 +11,7 @@
 #include <atomic>
 #include "llm_engine/engine/llm_engine.h"
 #include "llm_engine/engine/engine_service.h"
+#include "llm_engine/server/tcp_jsonl_server.h"
 #include "tiktoken/encoding.h"
 
 using namespace llm_engine;
@@ -33,6 +34,12 @@ static int main_env_int(const char* name, int default_value) {
     long x = std::strtol(v, &end, 10);
     if (end == v) return default_value;
     return static_cast<int>(x);
+}
+
+static std::string main_env_string(const char* name, const std::string& default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    return std::string(v);
 }
 
 
@@ -205,6 +212,17 @@ int main(int argc, const char** argv) {
     engine.clear_history(); // 初始化时清空一次
 
     bool use_service = main_env_flag("LLM_ENABLE_SERVICE");
+    bool use_tcp_server = main_env_flag("LLM_ENABLE_TCP_SERVER");
+    if (use_tcp_server && !use_service) {
+        std::cerr << "[SERVER] LLM_ENABLE_TCP_SERVER=1 requires LLM_ENABLE_SERVICE=1"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (use_tcp_server && !engine.scheduler_enabled()) {
+        std::cerr << "[SERVER] LLM_ENABLE_TCP_SERVER=1 requires LLM_ENABLE_SCHEDULER=1"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
     std::unique_ptr<EngineService> service;
     if (use_service) {
         try {
@@ -216,6 +234,20 @@ int main(int argc, const char** argv) {
         }
     }
 
+    int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
+    if (use_tcp_server) {
+        std::string host = main_env_string("LLM_SERVER_HOST", "0.0.0.0");
+        int port = main_env_int("LLM_SERVER_PORT", 8080);
+        TcpJsonlServer server(
+            *service,
+            [](const std::string& text) { return real_encode(text); },
+            [](int token_id) { return real_decode(token_id); },
+            max_new_tokens);
+        bool ok = server.run_forever(host, port);
+        service->stop();
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     std::cout << "=========================================" << std::endl;
     std::cout << "欢迎使用 Qwen2.5-1.5B FP16+GPTQ-Int8 CPU 推理引擎！" << std::endl;
     std::cout << "✅ 真实 Tokenizer (cpp-tiktoken) 已成功接入。" << std::endl;
@@ -225,7 +257,6 @@ int main(int argc, const char** argv) {
     // 3. 进入交互式对话大循环
     bool debug_text = main_env_flag("LLM_DEBUG_TEXT");
     bool stateless = main_env_flag("LLM_STATELESS");
-    int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
     int test_abort_after_tokens = main_env_int("LLM_TEST_ABORT_AFTER_TOKENS", 0);
     bool test_service_multi_submit = main_env_flag("LLM_TEST_SERVICE_MULTI_SUBMIT");
 

@@ -11,6 +11,7 @@
 #include "llm_engine/cache/prefix_cache.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/memory/kv_cache_manager.h"
+#include "llm_engine/metrics/metrics.h"
 
 namespace llm_engine {
 
@@ -53,6 +54,14 @@ struct RequestState {
     bool prefix_applied = false;
     int cached_prefix_tokens = 0;
     int cached_prefix_blocks = 0;
+    RequestMetrics metrics;
+    PagedAttentionStats paged_attention_baseline;
+    uint64_t enqueue_time_us = 0;
+    uint64_t schedule_time_us = 0;
+    uint64_t first_token_time_us = 0;
+    uint64_t finish_time_us = 0;
+    bool first_token_emitted = false;
+    bool metrics_emitted = false;
 };
 
 class LLMEngine {
@@ -97,6 +106,7 @@ private:
     bool debug_session_enabled() const;
     bool debug_prefix_enabled() const;
     bool debug_scheduler_enabled() const;
+    bool debug_chunked_prefill_enabled() const;
     void apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens);
     void schedule_next_request();
     void step_prefill(RequestState& request);
@@ -104,6 +114,8 @@ private:
     void run_legacy_request(RequestState& request);
     void fail_request(RequestState& request, const std::string& error);
     void finish_request(RequestState& request);
+    void emit_metrics_once(RequestState& request);
+    void mark_first_token(RequestState& request);
     bool is_terminal(RequestStatus status) const;
     const char* request_status_name(RequestStatus status) const;
     void debug_log_submit(const RequestState& request) const;
@@ -117,7 +129,10 @@ private:
     bool session_cache_enabled_ = false;
     bool prefix_cache_enabled_ = false;
     bool scheduler_enabled_ = false;
+    bool chunked_prefill_enabled_ = false;
+    bool chunked_prefill_strict_ = false;
     int prefill_step_tokens_ = 1;
+    int prefill_chunk_size_ = 1;
     RequestId active_request_id_ = 0;
     std::unique_ptr<KVCacheManager> kv_manager_;
     std::unique_ptr<PrefixCache> prefix_cache_;

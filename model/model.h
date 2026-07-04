@@ -130,6 +130,15 @@ public:
         PrefixCache* prefix_cache
     );
 
+    int prefill_chunk_for_sequence(
+        SequenceState& seq,
+        const std::vector<int>& prompt_tokens,
+        int prompt_begin,
+        int prompt_end,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache
+    );
+
     int decode_one_for_sequence(
         SequenceState& seq,
         int input_token,

@@ -1,6 +1,7 @@
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include "llm_engine/memory/kv_cache.h"
 #include "llm_engine/memory/workspace.h"
+#include "llm_engine/metrics/metrics.h"
 #include "llm_engine/tensor.h"
 #include <cassert>
 #include <cmath>
@@ -619,6 +620,7 @@ void compare_paged_attention_output(
     if (max_abs > tolerance) {
         std::cerr << " warning=diff_exceeds_tolerance"
                   << " tolerance=" << tolerance;
+        record_paged_attention_compare_warning();
     }
     std::cerr << std::endl;
 }
@@ -999,6 +1001,9 @@ Status attention_f16_gptq_neon(
             paged_attention_log_count++;
         }
     }
+    if (paged_attention_requested && !use_paged_attention) {
+        record_paged_attention_fallback();
+    }
 
     for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
         fp16_t* q_group_ptr = q_ptr + kv_head * num_rep * config.head_dim;
@@ -1054,6 +1059,7 @@ Status attention_f16_gptq_neon(
 
             if (paged_status == Status::SUCCESS) {
                 used_paged_group = true;
+                record_paged_attention_call();
                 if (compare_paged_attention) {
                     int group_elements = num_rep * config.head_dim;
                     std::vector<fp16_t> paged_out((size_t)group_elements);
@@ -1096,6 +1102,7 @@ Status attention_f16_gptq_neon(
                         (size_t)group_elements * sizeof(fp16_t));
                 }
             } else {
+                record_paged_attention_fallback();
                 if (debug_paged_attention) {
                     std::cerr << "[PAGED_ATTN] fallback"
                               << " layer=" << layer_id
