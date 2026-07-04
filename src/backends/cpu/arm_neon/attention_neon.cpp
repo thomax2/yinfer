@@ -6,9 +6,11 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 #include <arm_neon.h>
 
 namespace llm_engine {
@@ -20,6 +22,22 @@ bool debug_numeric_enabled() {
     if (!v) return false;
     std::string s(v);
     return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+bool attention_env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
+}
+
+float attention_env_float(const char* name, float default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    char* end = nullptr;
+    float x = std::strtof(v, &end);
+    if (end == v) return default_value;
+    return x;
 }
 
 void dump_f16_stats(const char* tag, int layer_id, const fp16_t* data, int n) {
@@ -48,6 +66,24 @@ void dump_f16_stats(const char* tag, int layer_id, const fp16_t* data, int n) {
               << " min=" << min_v
               << " max=" << max_v
               << std::endl;
+}
+
+inline const fp16_t* paged_kv_token_ptr(
+    const fp16_t* pages,
+    int physical_block,
+    int layer_id,
+    int kv_head_id,
+    int offset_in_block,
+    int num_layers,
+    int num_kv_heads,
+    int block_size,
+    int head_dim
+) {
+    return pages +
+           (((((size_t)physical_block * num_layers + layer_id) * num_kv_heads + kv_head_id) *
+                 block_size +
+             offset_in_block) *
+            head_dim);
 }
 
 inline float reduce_f32x8(float32x4_t lo, float32x4_t hi) {
@@ -287,6 +323,304 @@ void attention_decode_value_f16_neon(
             out[d] = (fp16_t)sum;
         }
     }
+}
+
+Status attention_decode_score_paged_f16_neon(
+    const fp16_t* q_group,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale,
+    const fp16_t* k_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head_id,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+) {
+    if (!q_group || !score || !k_pages || !block_table ||
+        num_rep <= 0 || seq_len <= 0 || head_dim <= 0 ||
+        block_size <= 0 || block_table_size <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int logical_blocks_needed = (seq_len + block_size - 1) / block_size;
+    if (logical_blocks_needed > block_table_size) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    for (int qh = 0; qh < num_rep; ++qh) {
+        const fp16_t* q = q_group + (size_t)qh * head_dim;
+        fp16_t* score_row = score + (size_t)qh * seq_len;
+
+        for (int logical_block = 0; logical_block < logical_blocks_needed; ++logical_block) {
+            int physical_block = block_table[logical_block];
+            if (physical_block < 0 || physical_block >= num_physical_blocks) {
+                return Status::INVALID_ARGUMENT;
+            }
+
+            int token_begin = logical_block * block_size;
+            int valid_tokens = std::min(block_size, seq_len - token_begin);
+            const fp16_t* k_block = paged_kv_token_ptr(
+                k_pages,
+                physical_block,
+                layer_id,
+                kv_head_id,
+                0,
+                num_layers,
+                num_kv_heads,
+                block_size,
+                head_dim);
+
+            int offset = 0;
+            for (; offset <= valid_tokens - 4; offset += 4) {
+                const fp16_t* k0 = k_block + (size_t)(offset + 0) * head_dim;
+                const fp16_t* k1 = k_block + (size_t)(offset + 1) * head_dim;
+                const fp16_t* k2 = k_block + (size_t)(offset + 2) * head_dim;
+                const fp16_t* k3 = k_block + (size_t)(offset + 3) * head_dim;
+
+                float32x4_t a00 = vdupq_n_f32(0.0f);
+                float32x4_t a01 = vdupq_n_f32(0.0f);
+                float32x4_t a10 = vdupq_n_f32(0.0f);
+                float32x4_t a11 = vdupq_n_f32(0.0f);
+                float32x4_t a20 = vdupq_n_f32(0.0f);
+                float32x4_t a21 = vdupq_n_f32(0.0f);
+                float32x4_t a30 = vdupq_n_f32(0.0f);
+                float32x4_t a31 = vdupq_n_f32(0.0f);
+
+                int d = 0;
+                for (; d <= head_dim - 8; d += 8) {
+                    float16x8_t qv = vld1q_f16(q + d);
+                    float32x4_t qlo = vcvt_f32_f16(vget_low_f16(qv));
+                    float32x4_t qhi = vcvt_f32_f16(vget_high_f16(qv));
+
+                    float16x8_t k0v = vld1q_f16(k0 + d);
+                    a00 = vfmaq_f32(a00, qlo, vcvt_f32_f16(vget_low_f16(k0v)));
+                    a01 = vfmaq_f32(a01, qhi, vcvt_f32_f16(vget_high_f16(k0v)));
+
+                    float16x8_t k1v = vld1q_f16(k1 + d);
+                    a10 = vfmaq_f32(a10, qlo, vcvt_f32_f16(vget_low_f16(k1v)));
+                    a11 = vfmaq_f32(a11, qhi, vcvt_f32_f16(vget_high_f16(k1v)));
+
+                    float16x8_t k2v = vld1q_f16(k2 + d);
+                    a20 = vfmaq_f32(a20, qlo, vcvt_f32_f16(vget_low_f16(k2v)));
+                    a21 = vfmaq_f32(a21, qhi, vcvt_f32_f16(vget_high_f16(k2v)));
+
+                    float16x8_t k3v = vld1q_f16(k3 + d);
+                    a30 = vfmaq_f32(a30, qlo, vcvt_f32_f16(vget_low_f16(k3v)));
+                    a31 = vfmaq_f32(a31, qhi, vcvt_f32_f16(vget_high_f16(k3v)));
+                }
+
+                float s0 = reduce_f32x8(a00, a01);
+                float s1 = reduce_f32x8(a10, a11);
+                float s2 = reduce_f32x8(a20, a21);
+                float s3 = reduce_f32x8(a30, a31);
+                for (; d < head_dim; ++d) {
+                    float qv = (float)q[d];
+                    s0 += qv * (float)k0[d];
+                    s1 += qv * (float)k1[d];
+                    s2 += qv * (float)k2[d];
+                    s3 += qv * (float)k3[d];
+                }
+
+                int t = token_begin + offset;
+                score_row[t + 0] = (fp16_t)(s0 * scale);
+                score_row[t + 1] = (fp16_t)(s1 * scale);
+                score_row[t + 2] = (fp16_t)(s2 * scale);
+                score_row[t + 3] = (fp16_t)(s3 * scale);
+            }
+
+            for (; offset < valid_tokens; ++offset) {
+                const fp16_t* k = k_block + (size_t)offset * head_dim;
+                score_row[token_begin + offset] =
+                    (fp16_t)(dot_f16_fp32(q, k, head_dim) * scale);
+            }
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
+Status attention_decode_value_paged_f16_neon(
+    const fp16_t* score,
+    fp16_t* out_group,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    const fp16_t* v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head_id,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+) {
+    if (!score || !out_group || !v_pages || !block_table ||
+        num_rep <= 0 || seq_len <= 0 || head_dim <= 0 ||
+        block_size <= 0 || block_table_size <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    int logical_blocks_needed = (seq_len + block_size - 1) / block_size;
+    if (logical_blocks_needed > block_table_size) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    for (int qh = 0; qh < num_rep; ++qh) {
+        const fp16_t* score_row = score + (size_t)qh * seq_len;
+        fp16_t* out = out_group + (size_t)qh * head_dim;
+
+        int d = 0;
+        for (; d <= head_dim - 16; d += 16) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+            for (int logical_block = 0; logical_block < logical_blocks_needed; ++logical_block) {
+                int physical_block = block_table[logical_block];
+                if (physical_block < 0 || physical_block >= num_physical_blocks) {
+                    return Status::INVALID_ARGUMENT;
+                }
+                int token_begin = logical_block * block_size;
+                int valid_tokens = std::min(block_size, seq_len - token_begin);
+                const fp16_t* v_block = paged_kv_token_ptr(
+                    v_pages,
+                    physical_block,
+                    layer_id,
+                    kv_head_id,
+                    0,
+                    num_layers,
+                    num_kv_heads,
+                    block_size,
+                    head_dim);
+
+                for (int offset = 0; offset < valid_tokens; ++offset) {
+                    float32x4_t sv = vdupq_n_f32((float)score_row[token_begin + offset]);
+                    const fp16_t* v = v_block + (size_t)offset * head_dim + d;
+                    float16x8_t v0 = vld1q_f16(v);
+                    float16x8_t v1 = vld1q_f16(v + 8);
+                    acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(v0)), sv);
+                    acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(v0)), sv);
+                    acc2 = vfmaq_f32(acc2, vcvt_f32_f16(vget_low_f16(v1)), sv);
+                    acc3 = vfmaq_f32(acc3, vcvt_f32_f16(vget_high_f16(v1)), sv);
+                }
+            }
+
+            vst1q_f16(out + d, vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1)));
+            vst1q_f16(out + d + 8, vcombine_f16(vcvt_f16_f32(acc2), vcvt_f16_f32(acc3)));
+        }
+
+        for (; d <= head_dim - 8; d += 8) {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+            for (int logical_block = 0; logical_block < logical_blocks_needed; ++logical_block) {
+                int physical_block = block_table[logical_block];
+                if (physical_block < 0 || physical_block >= num_physical_blocks) {
+                    return Status::INVALID_ARGUMENT;
+                }
+                int token_begin = logical_block * block_size;
+                int valid_tokens = std::min(block_size, seq_len - token_begin);
+                const fp16_t* v_block = paged_kv_token_ptr(
+                    v_pages,
+                    physical_block,
+                    layer_id,
+                    kv_head_id,
+                    0,
+                    num_layers,
+                    num_kv_heads,
+                    block_size,
+                    head_dim);
+
+                for (int offset = 0; offset < valid_tokens; ++offset) {
+                    float32x4_t sv = vdupq_n_f32((float)score_row[token_begin + offset]);
+                    const fp16_t* v = v_block + (size_t)offset * head_dim + d;
+                    float16x8_t vv = vld1q_f16(v);
+                    acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(vv)), sv);
+                    acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(vv)), sv);
+                }
+            }
+
+            vst1q_f16(out + d, vcombine_f16(vcvt_f16_f32(acc0), vcvt_f16_f32(acc1)));
+        }
+
+        for (; d < head_dim; ++d) {
+            float sum = 0.0f;
+            for (int logical_block = 0; logical_block < logical_blocks_needed; ++logical_block) {
+                int physical_block = block_table[logical_block];
+                if (physical_block < 0 || physical_block >= num_physical_blocks) {
+                    return Status::INVALID_ARGUMENT;
+                }
+                int token_begin = logical_block * block_size;
+                int valid_tokens = std::min(block_size, seq_len - token_begin);
+                const fp16_t* v_block = paged_kv_token_ptr(
+                    v_pages,
+                    physical_block,
+                    layer_id,
+                    kv_head_id,
+                    0,
+                    num_layers,
+                    num_kv_heads,
+                    block_size,
+                    head_dim);
+                for (int offset = 0; offset < valid_tokens; ++offset) {
+                    sum += (float)score_row[token_begin + offset] *
+                           (float)v_block[(size_t)offset * head_dim + d];
+                }
+            }
+            out[d] = (fp16_t)sum;
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
+void compare_paged_attention_output(
+    const fp16_t* paged,
+    const fp16_t* gather,
+    int n,
+    int layer_id,
+    int kv_head_id,
+    int seq_len,
+    float tolerance
+) {
+    if (!paged || !gather || n <= 0) {
+        return;
+    }
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    float max_rel = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float a = (float)paged[i];
+        float b = (float)gather[i];
+        float abs_diff = std::fabs(a - b);
+        float denom = std::max(std::fabs(b), 1e-6f);
+        max_abs = std::max(max_abs, abs_diff);
+        mean_abs += abs_diff;
+        max_rel = std::max(max_rel, abs_diff / denom);
+    }
+    mean_abs /= (float)n;
+
+    std::cerr << "[PAGED_ATTN_COMPARE]"
+              << " layer=" << layer_id
+              << " kv_head=" << kv_head_id
+              << " seq_len=" << seq_len
+              << " max_abs=" << max_abs
+              << " mean_abs=" << mean_abs
+              << " max_rel=" << max_rel;
+    if (max_abs > tolerance) {
+        std::cerr << " warning=diff_exceeds_tolerance"
+                  << " tolerance=" << tolerance;
+    }
+    std::cerr << std::endl;
 }
 } // namespace
 
@@ -599,41 +933,212 @@ Status attention_f16_gptq_neon(
 
     int current_seq_len = current_pos + 1;
     float scale = 1.0f / std::sqrt((float)config.head_dim);
+    int num_tokens = hidden_states.shape.empty() ? 0 : hidden_states.shape[0];
+
+    PagedKVView paged_view;
+    bool paged_attention_requested = attention_env_flag("LLM_ENABLE_PAGED_ATTENTION");
+    bool debug_paged_attention = attention_env_flag("LLM_DEBUG_PAGED_ATTENTION");
+    bool strict_paged_attention = attention_env_flag("LLM_PAGED_ATTENTION_STRICT");
+    bool compare_paged_attention = attention_env_flag("LLM_PAGED_ATTENTION_COMPARE");
+    bool use_paged_attention = false;
+    const fp16_t* raw_k_pages = nullptr;
+    const fp16_t* raw_v_pages = nullptr;
+    const int* paged_block_table = nullptr;
+    int paged_block_table_size = 0;
+    const char* paged_fallback_reason = nullptr;
+
+    if (paged_attention_requested) {
+        if (num_tokens != 1) {
+            paged_fallback_reason = "not_decode";
+        } else if (!kv_cache.is_paged()) {
+            paged_fallback_reason = "not_paged_kv";
+        } else if (!kv_cache.get_active_paged_view(&paged_view)) {
+            paged_fallback_reason = "no_active_sequence";
+        } else if (!paged_view.block_table) {
+            paged_fallback_reason = "missing_block_table";
+        } else if (paged_view.seq_len < current_seq_len) {
+            paged_fallback_reason = "seq_len_too_short";
+        } else if (paged_view.head_dim != config.head_dim ||
+                   paged_view.num_kv_heads != config.num_kv_heads ||
+                   paged_view.block_size <= 0 ||
+                   paged_view.num_layers <= layer_id) {
+            paged_fallback_reason = "view_config_mismatch";
+        } else {
+            raw_k_pages = kv_cache.raw_k_pages();
+            raw_v_pages = kv_cache.raw_v_pages();
+            if (!raw_k_pages || !raw_v_pages) {
+                paged_fallback_reason = "missing_raw_pages";
+            } else {
+                paged_block_table = paged_view.block_table->data();
+                paged_block_table_size = static_cast<int>(paged_view.block_table->size());
+                use_paged_attention = true;
+            }
+        }
+    }
+
+    if (debug_paged_attention && paged_attention_requested) {
+        static int paged_attention_log_count = 0;
+        if (paged_attention_log_count < 64) {
+            if (use_paged_attention) {
+                int logical_blocks = (current_seq_len + paged_view.block_size - 1) /
+                                     paged_view.block_size;
+                std::cerr << "[PAGED_ATTN] enabled"
+                          << " layer=" << layer_id
+                          << " pos=" << current_pos
+                          << " seq_len=" << current_seq_len
+                          << " block_size=" << paged_view.block_size
+                          << " logical_blocks=" << logical_blocks
+                          << " physical_blocks=" << paged_view.num_physical_blocks
+                          << std::endl;
+            } else {
+                std::cerr << "[PAGED_ATTN] fallback"
+                          << " layer=" << layer_id
+                          << " reason=" << (paged_fallback_reason ? paged_fallback_reason : "disabled")
+                          << std::endl;
+            }
+            paged_attention_log_count++;
+        }
+    }
 
     for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
-        fp16_t* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
-        fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
         fp16_t* q_group_ptr = q_ptr + kv_head * num_rep * config.head_dim;
         fp16_t* out_group_ptr = attn_out_ptr + kv_head * num_rep * config.head_dim;
         int total_score = num_rep * current_seq_len;
 
         Tensor Score({num_rep, current_seq_len}, score_ptr, DataType::FP16);
+        bool used_paged_group = false;
 
-        attention_decode_score_f16_neon(
-            q_group_ptr,
-            k_cache_ptr,
-            score_ptr,
-            num_rep,
-            current_seq_len,
-            config.head_dim,
-            scale);
-        if (debug_numeric) {
-            dump_f16_stats("score_scaled", layer_id, score_ptr, total_score);
+        if (use_paged_attention) {
+            Status paged_status = attention_decode_score_paged_f16_neon(
+                q_group_ptr,
+                score_ptr,
+                num_rep,
+                current_seq_len,
+                config.head_dim,
+                scale,
+                raw_k_pages,
+                paged_block_table,
+                paged_block_table_size,
+                paged_view.block_size,
+                layer_id,
+                kv_head,
+                paged_view.num_layers,
+                paged_view.num_kv_heads,
+                paged_view.num_physical_blocks);
+            if (paged_status == Status::SUCCESS) {
+                if (debug_numeric) {
+                    dump_f16_stats("score_scaled", layer_id, score_ptr, total_score);
+                }
+                paged_status = softmax_f16_neon(Score, Score);
+            }
+            if (paged_status == Status::SUCCESS) {
+                if (debug_numeric) {
+                    dump_f16_stats("score_softmax", layer_id, score_ptr, total_score);
+                }
+                paged_status = attention_decode_value_paged_f16_neon(
+                    score_ptr,
+                    out_group_ptr,
+                    num_rep,
+                    current_seq_len,
+                    config.head_dim,
+                    raw_v_pages,
+                    paged_block_table,
+                    paged_block_table_size,
+                    paged_view.block_size,
+                    layer_id,
+                    kv_head,
+                    paged_view.num_layers,
+                    paged_view.num_kv_heads,
+                    paged_view.num_physical_blocks);
+            }
+
+            if (paged_status == Status::SUCCESS) {
+                used_paged_group = true;
+                if (compare_paged_attention) {
+                    int group_elements = num_rep * config.head_dim;
+                    std::vector<fp16_t> paged_out((size_t)group_elements);
+                    std::vector<fp16_t> gather_out((size_t)group_elements);
+                    std::memcpy(
+                        paged_out.data(),
+                        out_group_ptr,
+                        (size_t)group_elements * sizeof(fp16_t));
+
+                    fp16_t* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
+                    fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
+                    attention_decode_score_f16_neon(
+                        q_group_ptr,
+                        k_cache_ptr,
+                        score_ptr,
+                        num_rep,
+                        current_seq_len,
+                        config.head_dim,
+                        scale);
+                    status = softmax_f16_neon(Score, Score);
+                    if (status != Status::SUCCESS) return status;
+                    attention_decode_value_f16_neon(
+                        score_ptr,
+                        v_cache_ptr,
+                        gather_out.data(),
+                        num_rep,
+                        current_seq_len,
+                        config.head_dim);
+                    compare_paged_attention_output(
+                        paged_out.data(),
+                        gather_out.data(),
+                        group_elements,
+                        layer_id,
+                        kv_head,
+                        current_seq_len,
+                        attention_env_float("LLM_PAGED_ATTENTION_COMPARE_TOL", 1e-2f));
+                    std::memcpy(
+                        out_group_ptr,
+                        paged_out.data(),
+                        (size_t)group_elements * sizeof(fp16_t));
+                }
+            } else {
+                if (debug_paged_attention) {
+                    std::cerr << "[PAGED_ATTN] fallback"
+                              << " layer=" << layer_id
+                              << " kv_head=" << kv_head
+                              << " reason=kernel_error"
+                              << " status=" << StatusToString(paged_status)
+                              << std::endl;
+                }
+                if (strict_paged_attention) {
+                    return paged_status;
+                }
+            }
         }
 
-        status = softmax_f16_neon(Score, Score);
-        if (status != Status::SUCCESS) return status;
-        if (debug_numeric) {
-            dump_f16_stats("score_softmax", layer_id, score_ptr, total_score);
-        }
+        if (!used_paged_group) {
+            fp16_t* k_cache_ptr = kv_cache.get_k_head_ptr(layer_id, kv_head);
+            fp16_t* v_cache_ptr = kv_cache.get_v_head_ptr(layer_id, kv_head);
+            attention_decode_score_f16_neon(
+                q_group_ptr,
+                k_cache_ptr,
+                score_ptr,
+                num_rep,
+                current_seq_len,
+                config.head_dim,
+                scale);
+            if (debug_numeric) {
+                dump_f16_stats("score_scaled", layer_id, score_ptr, total_score);
+            }
 
-        attention_decode_value_f16_neon(
-            score_ptr,
-            v_cache_ptr,
-            out_group_ptr,
-            num_rep,
-            current_seq_len,
-            config.head_dim);
+            status = softmax_f16_neon(Score, Score);
+            if (status != Status::SUCCESS) return status;
+            if (debug_numeric) {
+                dump_f16_stats("score_softmax", layer_id, score_ptr, total_score);
+            }
+
+            attention_decode_value_f16_neon(
+                score_ptr,
+                v_cache_ptr,
+                out_group_ptr,
+                num_rep,
+                current_seq_len,
+                config.head_dim);
+        }
         if (debug_numeric) {
             dump_f16_stats("attn_group_out", layer_id, out_group_ptr, num_rep * config.head_dim);
         }

@@ -191,6 +191,102 @@ void KVCache::clear_physical_block(int block_id) {
     std::fill(v_pages_.begin() + begin, v_pages_.begin() + end, (fp16_t)0);
 }
 
+bool KVCache::get_active_paged_view(PagedKVView* out) const {
+    if (!out || !is_paged()) {
+        return false;
+    }
+
+    const std::vector<int>* table = active_block_table_ ? active_block_table_ : &block_table_;
+    int max_written = active_max_written_pos_ ? *active_max_written_pos_ : max_written_pos_;
+    int seq_len = max_written + 1;
+    if (seq_len <= 0) {
+        return false;
+    }
+    if (seq_len > max_seq_len) {
+        seq_len = max_seq_len;
+    }
+
+    out->block_size = block_size_;
+    out->seq_len = seq_len;
+    out->num_layers = num_layers;
+    out->num_kv_heads = num_kv_heads;
+    out->head_dim = head_dim;
+    out->num_physical_blocks = num_physical_blocks_;
+    out->block_table = table;
+    return table != nullptr && !table->empty();
+}
+
+const fp16_t* KVCache::get_paged_k_token_ptr(
+    int physical_block, int layer_id, int kv_head_id, int offset_in_block) const {
+    if (!valid_physical_block(physical_block) ||
+        layer_id < 0 || layer_id >= num_layers ||
+        kv_head_id < 0 || kv_head_id >= num_kv_heads ||
+        offset_in_block < 0 || offset_in_block >= block_size_) {
+        return nullptr;
+    }
+    return paged_k_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block);
+}
+
+const fp16_t* KVCache::get_paged_v_token_ptr(
+    int physical_block, int layer_id, int kv_head_id, int offset_in_block) const {
+    if (!valid_physical_block(physical_block) ||
+        layer_id < 0 || layer_id >= num_layers ||
+        kv_head_id < 0 || kv_head_id >= num_kv_heads ||
+        offset_in_block < 0 || offset_in_block >= block_size_) {
+        return nullptr;
+    }
+    return paged_v_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block);
+}
+
+const fp16_t* KVCache::get_paged_k_token_ptr_by_pos(
+    int layer_id, int kv_head_id, int logical_pos) const {
+    PagedKVView view;
+    if (!get_active_paged_view(&view) ||
+        logical_pos < 0 || logical_pos >= view.seq_len ||
+        !view.block_table) {
+        return nullptr;
+    }
+    int logical_block = logical_pos / block_size_;
+    int offset_in_block = logical_pos % block_size_;
+    if (logical_block < 0 || logical_block >= static_cast<int>(view.block_table->size())) {
+        return nullptr;
+    }
+    int physical_block = (*view.block_table)[(size_t)logical_block];
+    return get_paged_k_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block);
+}
+
+const fp16_t* KVCache::get_paged_v_token_ptr_by_pos(
+    int layer_id, int kv_head_id, int logical_pos) const {
+    PagedKVView view;
+    if (!get_active_paged_view(&view) ||
+        logical_pos < 0 || logical_pos >= view.seq_len ||
+        !view.block_table) {
+        return nullptr;
+    }
+    int logical_block = logical_pos / block_size_;
+    int offset_in_block = logical_pos % block_size_;
+    if (logical_block < 0 || logical_block >= static_cast<int>(view.block_table->size())) {
+        return nullptr;
+    }
+    int physical_block = (*view.block_table)[(size_t)logical_block];
+    return get_paged_v_token_ptr(physical_block, layer_id, kv_head_id, offset_in_block);
+}
+
+const fp16_t* KVCache::raw_k_pages() const {
+    return is_paged() && !k_pages_.empty() ? k_pages_.data() : nullptr;
+}
+
+const fp16_t* KVCache::raw_v_pages() const {
+    return is_paged() && !v_pages_.empty() ? v_pages_.data() : nullptr;
+}
+
+size_t KVCache::paged_elements_per_block() const {
+    if (!is_paged()) {
+        return 0;
+    }
+    return (size_t)num_layers * num_kv_heads * block_size_ * head_dim;
+}
+
 void KVCache::set_active_sequence(std::vector<int>* block_table, int* max_written_pos) {
     active_block_table_ = block_table;
     active_max_written_pos_ = max_written_pos;
