@@ -369,6 +369,10 @@ bool LLMEngine::request_finished(RequestId id) const {
     return it == requests_.end() || is_terminal(it->second.status);
 }
 
+bool LLMEngine::scheduler_enabled() const {
+    return scheduler_enabled_;
+}
+
 void LLMEngine::clear_history() {
     if (debug_enabled()) {
         std::cerr << "[ENGINE] clear_history" << std::endl;

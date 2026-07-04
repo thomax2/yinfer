@@ -5,7 +5,12 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <mutex>
+#include <thread>
+#include <array>
+#include <atomic>
 #include "llm_engine/engine/llm_engine.h"
+#include "llm_engine/engine/engine_service.h"
 #include "tiktoken/encoding.h"
 
 using namespace llm_engine;
@@ -58,6 +63,114 @@ std::string real_decode(int token_id) {
     return tokenizer->decode(tokens);
 }
 
+static bool run_service_multi_submit_test(
+    EngineService& service,
+    int max_new_tokens,
+    bool debug_text,
+    int test_abort_after_tokens
+) {
+    std::array<std::string, 3> prompts = {
+        "鲁迅是谁",
+        "李大钊是谁",
+        "陈独秀是谁"
+    };
+    std::array<std::vector<int>, 3> encoded_prompts = {
+        real_encode(prompts[0]),
+        real_encode(prompts[1]),
+        real_encode(prompts[2])
+    };
+    std::array<RequestId, 3> request_ids = {0, 0, 0};
+    std::array<int, 3> token_counts = {0, 0, 0};
+    std::mutex output_mu;
+    std::atomic<bool> ok{true};
+
+    SamplingParams params;
+    params.max_new_tokens = max_new_tokens;
+    params.greedy = true;
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 3; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                SessionId session_id = static_cast<SessionId>(i + 1);
+                RequestId id = service.submit(session_id, encoded_prompts[(size_t)i], params, [&, i](int token_id) {
+                    std::string piece = real_decode(token_id);
+                    {
+                        std::lock_guard<std::mutex> lk(output_mu);
+                        if (debug_text) {
+                            std::cerr << "[SERVICE_MULTI_TOKEN]"
+                                      << " worker=" << i
+                                      << " id=" << token_id
+                                      << " piece=" << piece
+                                      << std::endl;
+                        }
+                        std::cout << piece << std::flush;
+                    }
+                    token_counts[(size_t)i]++;
+                    if (test_abort_after_tokens > 0 &&
+                        token_counts[(size_t)i] >= test_abort_after_tokens) {
+                        std::cerr << "[MAIN_TEST_ABORT]"
+                                  << " worker=" << i
+                                  << " after_tokens=" << test_abort_after_tokens
+                                  << std::endl;
+                        return false;
+                    }
+                    return true;
+                });
+                request_ids[(size_t)i] = id;
+                std::cerr << "[SERVICE_MULTI_SUBMIT]"
+                          << " worker=" << i
+                          << " session=" << session_id
+                          << " request=" << id
+                          << std::endl;
+            } catch (const std::exception& e) {
+                ok.store(false);
+                std::cerr << "[SERVICE_MULTI_ERROR]"
+                          << " worker=" << i
+                          << " error=" << e.what()
+                          << std::endl;
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    for (size_t i = 0; i < request_ids.size(); ++i) {
+        if (request_ids[i] == 0) {
+            ok.store(false);
+            continue;
+        }
+        service.wait_until_finished(request_ids[i]);
+        EngineRequestSnapshot snapshot;
+        if (service.request_snapshot(request_ids[i], &snapshot)) {
+            std::cerr << "[SERVICE_MULTI_RESULT]"
+                      << " worker=" << i
+                      << " request=" << request_ids[i]
+                      << " status=" << static_cast<int>(snapshot.status)
+                      << " generated=" << snapshot.num_generated_tokens
+                      << " error=" << snapshot.error_message
+                      << std::endl;
+            if (snapshot.status == RequestStatus::FAILED) {
+                ok.store(false);
+            }
+        } else {
+            ok.store(false);
+            std::cerr << "[SERVICE_MULTI_RESULT]"
+                      << " worker=" << i
+                      << " request=" << request_ids[i]
+                      << " status=missing"
+                      << std::endl;
+        }
+    }
+
+    std::cout << std::endl;
+    return ok.load();
+}
+
 int main(int argc, const char** argv) {
     // 0. 初始化真正的 Tokenizer
     try {
@@ -91,6 +204,18 @@ int main(int argc, const char** argv) {
     bool is_first_turn = true;
     engine.clear_history(); // 初始化时清空一次
 
+    bool use_service = main_env_flag("LLM_ENABLE_SERVICE");
+    std::unique_ptr<EngineService> service;
+    if (use_service) {
+        try {
+            service = std::make_unique<EngineService>(engine);
+            service->start();
+        } catch (const std::exception& e) {
+            std::cerr << "[SERVICE] start failed: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+    }
+
     std::cout << "=========================================" << std::endl;
     std::cout << "欢迎使用 Qwen2.5-1.5B FP16+GPTQ-Int8 CPU 推理引擎！" << std::endl;
     std::cout << "✅ 真实 Tokenizer (cpp-tiktoken) 已成功接入。" << std::endl;
@@ -102,6 +227,22 @@ int main(int argc, const char** argv) {
     bool stateless = main_env_flag("LLM_STATELESS");
     int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
     int test_abort_after_tokens = main_env_int("LLM_TEST_ABORT_AFTER_TOKENS", 0);
+    bool test_service_multi_submit = main_env_flag("LLM_TEST_SERVICE_MULTI_SUBMIT");
+
+    if (test_service_multi_submit) {
+        if (!service) {
+            std::cerr << "[SERVICE_MULTI_ERROR] LLM_TEST_SERVICE_MULTI_SUBMIT requires LLM_ENABLE_SERVICE=1"
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+        bool ok = run_service_multi_submit_test(
+            *service,
+            max_new_tokens,
+            debug_text,
+            test_abort_after_tokens);
+        service->stop();
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
 
     while (true) {
         std::cout << "\nUser: ";
@@ -116,7 +257,11 @@ int main(int argc, const char** argv) {
 
         // 【如果用户输入 clear，手动清空记忆】
         if (input == "clear") {
-            engine.clear_history();
+            if (service) {
+                service->clear_history();
+            } else {
+                engine.clear_history();
+            }
             is_first_turn = true;
             std::cout << "[System] History cleared." << std::endl;
             continue;
@@ -124,7 +269,11 @@ int main(int argc, const char** argv) {
 
         // LLM_STATELESS=1：每轮强制清空，单轮独立
         if (stateless) {
-            engine.clear_history();
+            if (service) {
+                service->clear_history();
+            } else {
+                engine.clear_history();
+            }
             is_first_turn = true;
             std::cerr << "[MAIN_STATELESS_CLEAR]" << std::endl;
         }
@@ -155,7 +304,7 @@ int main(int argc, const char** argv) {
         params.max_new_tokens = max_new_tokens;
         params.greedy = true;
 
-        RequestId req_id = engine.submit(input_tokens, params, [&](int token_id) {
+        auto callback = [&](int token_id) {
             // 【真实流式解码】：每当模型算出一个新 ID，立刻解码成中文打印到屏幕！
             std::string piece = real_decode(token_id);
             if (debug_text) {
@@ -173,14 +322,33 @@ int main(int argc, const char** argv) {
                 return false;
             }
             return true; // 返回 true 表示继续生成下一个字
-        });
+        };
 
-        const RequestState* request = engine.get_request(req_id);
-        if (request && request->status == RequestStatus::FAILED) {
-            std::cerr << "[ERROR] request failed"
-                      << " id=" << req_id
-                      << " error=" << request->error_message
-                      << std::endl;
+        RequestId req_id = 0;
+        if (service) {
+            req_id = service->submit(input_tokens, params, callback);
+            service->wait_until_finished(req_id);
+        } else {
+            req_id = engine.submit(input_tokens, params, callback);
+        }
+
+        if (service) {
+            EngineRequestSnapshot snapshot;
+            if (service->request_snapshot(req_id, &snapshot) &&
+                snapshot.status == RequestStatus::FAILED) {
+                std::cerr << "[ERROR] request failed"
+                          << " id=" << req_id
+                          << " error=" << snapshot.error_message
+                          << std::endl;
+            }
+        } else {
+            const RequestState* request = engine.get_request(req_id);
+            if (request && request->status == RequestStatus::FAILED) {
+                std::cerr << "[ERROR] request failed"
+                          << " id=" << req_id
+                          << " error=" << request->error_message
+                          << std::endl;
+            }
         }
 
         auto end = std::chrono::steady_clock::now();
@@ -192,5 +360,8 @@ int main(int argc, const char** argv) {
                   << " 个 token，速度 " << tokens_per_sec << " tok/s]" << std::endl;
     }
 
+    if (service) {
+        service->stop();
+    }
     return EXIT_SUCCESS;
 }

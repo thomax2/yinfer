@@ -83,6 +83,7 @@ public:
     void run_until_finished(RequestId id);
     bool has_pending_requests() const;
     bool request_finished(RequestId id) const;
+    bool scheduler_enabled() const;
 
     void abort(RequestId id);
     void clear_history();

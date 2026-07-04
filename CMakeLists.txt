@@ -67,6 +67,7 @@ add_executable(qwen_model_loader
     model/main.cpp
     model/model.cpp
     src/engine/llm_engine.cpp
+    src/engine/engine_service.cpp
     ${TIKTOKEN_SRCS}
 )
 
