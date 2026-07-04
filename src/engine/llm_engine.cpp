@@ -695,7 +695,20 @@ void LLMEngine::step_decode(RequestState& request) {
 }
 
 void LLMEngine::run_legacy_request(RequestState& request) {
+    if (debug_scheduler_enabled()) {
+        std::cerr << "[SCHED] legacy_prefill"
+                  << " id=" << request.id
+                  << " prompt_tokens=" << request.prompt_tokens.size()
+                  << std::endl;
+    }
     request.status = RequestStatus::RUNNING_DECODE;
+    if (debug_scheduler_enabled()) {
+        std::cerr << "[SCHED] transition"
+                  << " id=" << request.id
+                  << " status=" << request_status_name(request.status)
+                  << std::endl;
+    }
+
     bool callback_stopped = false;
     auto wrapped_callback = [this, &request, &callback_stopped](int token_id) {
         if (request.status == RequestStatus::ABORTED) {
@@ -715,17 +728,28 @@ void LLMEngine::run_legacy_request(RequestState& request) {
     try {
         model_.generate(request.prompt_tokens, request.sampling.max_new_tokens, wrapped_callback);
         request.callback_stopped = callback_stopped;
-        request.status = callback_stopped ? RequestStatus::ABORTED : RequestStatus::FINISHED;
+        if (callback_stopped) {
+            request.status = RequestStatus::ABORTED;
+            request.callback = TokenCallback{};
+            if (active_request_id_ == request.id) {
+                active_request_id_ = 0;
+            }
+            if (debug_scheduler_enabled()) {
+                std::cerr << "[SCHED] aborted"
+                          << " id=" << request.id
+                          << " generated=" << request.num_generated_tokens
+                          << std::endl;
+            }
+            return;
+        }
+        finish_request(request);
+        return;
     } catch (const std::exception& e) {
-        request.status = RequestStatus::FAILED;
-        request.error_message = e.what();
+        fail_request(request, e.what());
+        return;
     } catch (...) {
-        request.status = RequestStatus::FAILED;
-        request.error_message = "unknown legacy scheduler exception";
-    }
-    request.callback = TokenCallback{};
-    if (active_request_id_ == request.id) {
-        active_request_id_ = 0;
+        fail_request(request, "unknown legacy scheduler exception");
+        return;
     }
 }
 
