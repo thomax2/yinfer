@@ -41,6 +41,14 @@ private:
     int64_t real_batch_prefill_chunks_total_ = 0;
     int64_t paged_attention_calls_ = 0;
     int64_t paged_attention_fallbacks_ = 0;
+    bool continuous_batching_enabled_ = false;
+    int64_t decode_batch_steps_total_ = 0;
+    int64_t decode_batch_size_sum_ = 0;
+    int decode_batch_size_max_ = 0;
+    int64_t prefill_chunk_steps_total_ = 0;
+    int64_t scheduler_v2_decode_steps_total_ = 0;
+    int64_t scheduler_v2_prefill_steps_total_ = 0;
+    int active_decode_batch_size_ = 0;
     double tokens_per_second_sum_ = 0.0;
     double first_token_ms_sum_ = 0.0;
     int64_t latency_samples_ = 0;

@@ -24,6 +24,19 @@ bool env_flag(const char* name) {
     return s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON";
 }
 
+bool env_flag_default(const char* name, bool default_value) {
+    const char* v = std::getenv(name);
+    if (!v) return default_value;
+    std::string s(v);
+    if (s == "1" || s == "true" || s == "TRUE" || s == "on" || s == "ON") {
+        return true;
+    }
+    if (s == "0" || s == "false" || s == "FALSE" || s == "off" || s == "OFF") {
+        return false;
+    }
+    return default_value;
+}
+
 int env_int(const char* name, int default_value) {
     const char* v = std::getenv(name);
     if (!v || !*v) return default_value;
@@ -52,6 +65,16 @@ bool is_stop_token(int token_id) {
 
 LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     scheduler_enabled_ = env_flag("LLM_ENABLE_SCHEDULER");
+    continuous_batching_enabled_ = scheduler_enabled_ && env_flag("LLM_ENABLE_CONTINUOUS_BATCHING");
+    max_active_decode_requests_ = env_int("LLM_CONT_BATCH_MAX_ACTIVE_DECODE", 8);
+    cont_batch_decode_first_ = env_flag_default("LLM_CONT_BATCH_DECODE_FIRST", true);
+    cont_batch_prefill_when_decode_empty_ =
+        env_flag_default("LLM_CONT_BATCH_PREFILL_WHEN_DECODE_EMPTY", true);
+    cont_batch_prefill_after_decode_ = env_flag("LLM_CONT_BATCH_PREFILL_AFTER_DECODE");
+    cont_batch_max_prefill_chunks_per_step_ =
+        env_int("LLM_CONT_BATCH_MAX_PREFILL_CHUNKS_PER_STEP", 1);
+    cont_batch_conservative_executor_ =
+        env_flag_default("LLM_CONT_BATCH_CONSERVATIVE_EXECUTOR", true);
     prefill_step_tokens_ = env_int("LLM_PREFILL_STEP_TOKENS", 1);
     chunked_prefill_enabled_ = env_flag("LLM_ENABLE_CHUNKED_PREFILL");
     chunked_prefill_strict_ = env_flag("LLM_CHUNKED_PREFILL_STRICT");
@@ -64,6 +87,17 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
                   << " prefill_step_tokens=" << prefill_step_tokens_
                   << " chunked_prefill=" << (chunked_prefill_enabled_ ? 1 : 0)
                   << " prefill_chunk_size=" << prefill_chunk_size_
+                  << std::endl;
+    }
+    if (debug_cont_batch_enabled()) {
+        std::cerr << "[SCHED_V2] enabled=" << (continuous_batching_enabled_ ? 1 : 0)
+                  << " max_active_decode=" << max_active_decode_requests_
+                  << " decode_first=" << (cont_batch_decode_first_ ? 1 : 0)
+                  << " prefill_when_decode_empty="
+                  << (cont_batch_prefill_when_decode_empty_ ? 1 : 0)
+                  << " prefill_after_decode=" << (cont_batch_prefill_after_decode_ ? 1 : 0)
+                  << " max_prefill_chunks_per_step=" << cont_batch_max_prefill_chunks_per_step_
+                  << " conservative_executor=" << (cont_batch_conservative_executor_ ? 1 : 0)
                   << std::endl;
     }
 
@@ -136,6 +170,9 @@ RequestId LLMEngine::submit(
     request.metrics.session_id = session_id;
     request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
     request.metrics.max_new_tokens = sampling.max_new_tokens;
+    request.scheduler_v2 = continuous_batching_enabled_;
+    request.queued_waiting = continuous_batching_enabled_;
+    request.metrics.continuous_batching_enabled = continuous_batching_enabled_;
     init_request_sampling(request);
 
     auto inserted = requests_.emplace(id, std::move(request));
@@ -267,6 +304,9 @@ RequestId LLMEngine::submit_async(
     request.metrics.session_id = session_id;
     request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
     request.metrics.max_new_tokens = sampling.max_new_tokens;
+    request.scheduler_v2 = continuous_batching_enabled_;
+    request.queued_waiting = continuous_batching_enabled_;
+    request.metrics.continuous_batching_enabled = continuous_batching_enabled_;
     init_request_sampling(request);
 
     requests_.emplace(id, std::move(request));
@@ -291,6 +331,7 @@ void LLMEngine::abort(RequestId id) {
         it->second.status != RequestStatus::ABORTED &&
         it->second.status != RequestStatus::FAILED) {
         it->second.status = RequestStatus::ABORTED;
+        remove_request_from_all_v2_queues(id);
         emit_metrics_once(it->second);
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] abort"
@@ -302,6 +343,13 @@ void LLMEngine::abort(RequestId id) {
 }
 
 bool LLMEngine::step_once() {
+    if (continuous_batching_enabled_) {
+        return step_once_continuous();
+    }
+    return step_once_legacy();
+}
+
+bool LLMEngine::step_once_legacy() {
     if (active_request_id_ == 0) {
         schedule_next_request();
     }
@@ -386,6 +434,13 @@ void LLMEngine::run_until_finished(RequestId id) {
 }
 
 bool LLMEngine::has_pending_requests() const {
+    if (continuous_batching_enabled_) {
+        if (!active_decode_requests_.empty() ||
+            !prefill_queue_.empty() ||
+            !decode_ready_queue_.empty()) {
+            return true;
+        }
+    }
     if (active_request_id_ != 0) {
         return true;
     }
@@ -415,6 +470,26 @@ void LLMEngine::clear_history() {
 }
 
 void LLMEngine::clear_session(SessionId session_id) {
+    if (continuous_batching_enabled_) {
+        std::vector<RequestId> to_abort;
+        for (const auto& kv : requests_) {
+            const RequestState& request = kv.second;
+            if (request.session_id == session_id && !is_terminal(request.status)) {
+                to_abort.push_back(kv.first);
+            }
+        }
+        for (RequestId id : to_abort) {
+            auto req_it = requests_.find(id);
+            if (req_it != requests_.end() && !is_terminal(req_it->second.status)) {
+                req_it->second.status = RequestStatus::ABORTED;
+                req_it->second.error_message = "session cleared";
+                req_it->second.callback = TokenCallback{};
+                remove_request_from_all_v2_queues(id);
+                emit_metrics_once(req_it->second);
+            }
+        }
+    }
+
     if (!session_cache_enabled_) {
         model_.clear_history();
         return;
@@ -475,6 +550,14 @@ bool LLMEngine::debug_prefix_enabled() const {
 
 bool LLMEngine::debug_scheduler_enabled() const {
     return env_flag("LLM_DEBUG_SCHEDULER");
+}
+
+bool LLMEngine::debug_cont_batch_enabled() const {
+    return env_flag("LLM_CONT_BATCH_DEBUG");
+}
+
+bool LLMEngine::debug_cont_batch_verbose_enabled() const {
+    return env_flag("LLM_CONT_BATCH_DEBUG_VERBOSE");
 }
 
 bool LLMEngine::debug_chunked_prefill_enabled() const {
@@ -567,6 +650,315 @@ void LLMEngine::apply_prefix_cache(SequenceState& seq, const std::vector<int>& p
     }
 }
 
+bool LLMEngine::step_once_continuous() {
+    cleanup_terminal_requests_v2();
+    admit_waiting_requests_v2();
+    activate_decode_requests();
+
+    bool did_work = false;
+    if (cont_batch_decode_first_ && !active_decode_requests_.empty()) {
+        did_work = run_decode_batch_step() || did_work;
+        cleanup_terminal_requests_v2();
+        activate_decode_requests();
+        if (!cont_batch_prefill_after_decode_) {
+            return did_work;
+        }
+    }
+
+    int prefill_steps = 0;
+    const int max_prefill_steps = std::max(1, cont_batch_max_prefill_chunks_per_step_);
+    bool may_prefill = cont_batch_prefill_after_decode_ ||
+                       active_decode_requests_.empty() ||
+                       cont_batch_prefill_when_decode_empty_;
+    while (may_prefill &&
+           prefill_steps < max_prefill_steps &&
+           !prefill_queue_.empty()) {
+        if (!active_decode_requests_.empty() &&
+            cont_batch_decode_first_ &&
+            !cont_batch_prefill_after_decode_) {
+            for (RequestId id : prefill_queue_) {
+                auto it = requests_.find(id);
+                if (it != requests_.end() && !is_terminal(it->second.status)) {
+                    it->second.metrics.prefill_scheduler_yield_count++;
+                }
+            }
+            break;
+        }
+        if (!run_prefill_chunk_step()) {
+            break;
+        }
+        did_work = true;
+        prefill_steps++;
+        cleanup_terminal_requests_v2();
+        activate_decode_requests();
+        may_prefill = cont_batch_prefill_after_decode_ ||
+                      active_decode_requests_.empty() ||
+                      cont_batch_prefill_when_decode_empty_;
+    }
+
+    if (!cont_batch_decode_first_ && !active_decode_requests_.empty()) {
+        did_work = run_decode_batch_step() || did_work;
+        cleanup_terminal_requests_v2();
+    }
+
+    if (debug_cont_batch_verbose_enabled()) {
+        std::cerr << "[SCHED_V2] queues"
+                  << " waiting=" << waiting_queue_.size()
+                  << " prefill=" << prefill_queue_.size()
+                  << " decode_ready=" << decode_ready_queue_.size()
+                  << " active_decode=" << active_decode_requests_.size()
+                  << std::endl;
+    }
+    return did_work;
+}
+
+void LLMEngine::admit_waiting_requests_v2() {
+    while (!waiting_queue_.empty()) {
+        RequestId id = waiting_queue_.front();
+        waiting_queue_.pop_front();
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+
+        RequestState& request = it->second;
+        request.queued_waiting = false;
+        if (request.status != RequestStatus::WAITING) {
+            continue;
+        }
+        if (request.prompt_tokens.empty()) {
+            fail_request(request, "empty prompt is not supported");
+            continue;
+        }
+
+        if (session_cache_enabled_) {
+            SequenceState& seq = get_or_create_session(request.session_id);
+            apply_prefix_cache(seq, request.prompt_tokens);
+            request.prefix_applied = prefix_cache_enabled_;
+            request.cached_prefix_tokens = seq.cached_prefix_tokens;
+            request.cached_prefix_blocks = seq.cached_prefix_blocks;
+            request.prompt_cursor = seq.cached_prefix_tokens;
+            request.metrics.cached_prefix_tokens = seq.cached_prefix_tokens;
+            request.metrics.cached_prefix_blocks = seq.cached_prefix_blocks;
+        }
+
+        request.status = RequestStatus::RUNNING_PREFILL;
+        request.schedule_time_us = now_us();
+        request.metrics.queue_wait_ms = elapsed_ms(request.enqueue_time_us, request.schedule_time_us);
+        request.metrics.continuous_batching_enabled = true;
+        add_to_prefill_queue(request);
+        if (debug_cont_batch_enabled()) {
+            std::cerr << "[SCHED_V2] enqueue_prefill"
+                      << " id=" << request.id
+                      << " session=" << request.session_id
+                      << " prompt_cursor=" << request.prompt_cursor
+                      << " prompt_tokens=" << request.prompt_tokens.size()
+                      << " cached_prefix_tokens=" << request.cached_prefix_tokens
+                      << " cached_prefix_blocks=" << request.cached_prefix_blocks
+                      << " prefill_queue=" << prefill_queue_.size()
+                      << std::endl;
+        }
+    }
+}
+
+bool LLMEngine::run_decode_batch_step() {
+    activate_decode_requests();
+    if (active_decode_requests_.empty()) {
+        return false;
+    }
+
+    std::vector<RequestId> batch = active_decode_requests_;
+    int batch_size = static_cast<int>(batch.size());
+    if (debug_cont_batch_enabled()) {
+        std::cerr << "[SCHED_V2] decode_batch"
+                  << " size=" << batch_size
+                  << " active_decode=" << active_decode_requests_.size()
+                  << std::endl;
+    }
+
+    bool did_work = false;
+    for (RequestId id : batch) {
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            remove_from_active_decode(id);
+            continue;
+        }
+        RequestState& request = it->second;
+        if (is_terminal(request.status) || request.status != RequestStatus::RUNNING_DECODE) {
+            remove_from_active_decode(id);
+            continue;
+        }
+
+        request.metrics.continuous_batching_enabled = true;
+        request.metrics.scheduler_v2_steps++;
+        request.metrics.scheduler_v2_decode_steps++;
+        request.metrics.decode_batch_steps++;
+        request.metrics.decode_batch_size_sum += batch_size;
+        request.metrics.decode_batch_size_max =
+            std::max(request.metrics.decode_batch_size_max, batch_size);
+
+        try {
+            step_decode(request);
+        } catch (const std::exception& e) {
+            fail_request(request, e.what());
+        } catch (...) {
+            fail_request(request, "unknown scheduler v2 decode exception");
+        }
+        did_work = true;
+        if (is_terminal(request.status)) {
+            remove_from_active_decode(id);
+        }
+    }
+    return did_work;
+}
+
+bool LLMEngine::run_prefill_chunk_step() {
+    while (!prefill_queue_.empty()) {
+        RequestId id = prefill_queue_.front();
+        prefill_queue_.pop_front();
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+
+        RequestState& request = it->second;
+        request.queued_prefill = false;
+        if (is_terminal(request.status)) {
+            continue;
+        }
+        if (request.status != RequestStatus::RUNNING_PREFILL) {
+            if (request.status == RequestStatus::RUNNING_DECODE) {
+                add_to_decode_ready_queue(request);
+            }
+            continue;
+        }
+
+        request.metrics.continuous_batching_enabled = true;
+        request.metrics.scheduler_v2_steps++;
+        request.metrics.scheduler_v2_prefill_steps++;
+        request.metrics.prefill_chunk_steps++;
+        if (debug_cont_batch_enabled()) {
+            std::cerr << "[SCHED_V2] prefill_chunk"
+                      << " id=" << request.id
+                      << " cursor=" << request.prompt_cursor
+                      << " prompt_tokens=" << request.prompt_tokens.size()
+                      << std::endl;
+        }
+
+        try {
+            step_prefill(request);
+        } catch (const std::exception& e) {
+            fail_request(request, e.what());
+        } catch (...) {
+            fail_request(request, "unknown scheduler v2 prefill exception");
+        }
+
+        if (request.status == RequestStatus::RUNNING_PREFILL) {
+            add_to_prefill_queue(request);
+        } else if (request.status == RequestStatus::RUNNING_DECODE) {
+            add_to_decode_ready_queue(request);
+        } else if (is_terminal(request.status)) {
+            remove_request_from_all_v2_queues(request.id);
+        }
+        return true;
+    }
+    return false;
+}
+
+void LLMEngine::add_to_prefill_queue(RequestState& request) {
+    if (request.queued_prefill || is_terminal(request.status)) {
+        return;
+    }
+    request.queued_prefill = true;
+    prefill_queue_.push_back(request.id);
+}
+
+void LLMEngine::add_to_decode_ready_queue(RequestState& request) {
+    if (request.queued_decode_ready || request.active_decode || is_terminal(request.status)) {
+        return;
+    }
+    request.queued_decode_ready = true;
+    decode_ready_queue_.push_back(request.id);
+    if (debug_cont_batch_enabled()) {
+        std::cerr << "[SCHED_V2] enqueue_decode_ready"
+                  << " id=" << request.id
+                  << " decode_ready=" << decode_ready_queue_.size()
+                  << std::endl;
+    }
+}
+
+void LLMEngine::activate_decode_requests() {
+    while (!decode_ready_queue_.empty() &&
+           static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_) {
+        RequestId id = decode_ready_queue_.front();
+        decode_ready_queue_.pop_front();
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+        RequestState& request = it->second;
+        request.queued_decode_ready = false;
+        if (request.status != RequestStatus::RUNNING_DECODE || is_terminal(request.status)) {
+            continue;
+        }
+        if (request.active_decode) {
+            continue;
+        }
+        request.active_decode = true;
+        active_decode_requests_.push_back(id);
+        if (debug_cont_batch_enabled()) {
+            std::cerr << "[SCHED_V2] activate_decode"
+                      << " id=" << request.id
+                      << " active_decode=" << active_decode_requests_.size()
+                      << std::endl;
+        }
+    }
+}
+
+void LLMEngine::remove_from_active_decode(RequestId id) {
+    active_decode_requests_.erase(
+        std::remove(active_decode_requests_.begin(), active_decode_requests_.end(), id),
+        active_decode_requests_.end());
+    auto it = requests_.find(id);
+    if (it != requests_.end()) {
+        it->second.active_decode = false;
+    }
+}
+
+void LLMEngine::remove_request_from_all_v2_queues(RequestId id) {
+    waiting_queue_.erase(
+        std::remove(waiting_queue_.begin(), waiting_queue_.end(), id),
+        waiting_queue_.end());
+    prefill_queue_.erase(
+        std::remove(prefill_queue_.begin(), prefill_queue_.end(), id),
+        prefill_queue_.end());
+    decode_ready_queue_.erase(
+        std::remove(decode_ready_queue_.begin(), decode_ready_queue_.end(), id),
+        decode_ready_queue_.end());
+    active_decode_requests_.erase(
+        std::remove(active_decode_requests_.begin(), active_decode_requests_.end(), id),
+        active_decode_requests_.end());
+    auto it = requests_.find(id);
+    if (it != requests_.end()) {
+        it->second.queued_waiting = false;
+        it->second.queued_prefill = false;
+        it->second.queued_decode_ready = false;
+        it->second.active_decode = false;
+    }
+}
+
+void LLMEngine::cleanup_terminal_requests_v2() {
+    std::vector<RequestId> terminal_ids;
+    for (const auto& kv : requests_) {
+        if (kv.second.scheduler_v2 && is_terminal(kv.second.status)) {
+            terminal_ids.push_back(kv.first);
+        }
+    }
+    for (RequestId id : terminal_ids) {
+        remove_request_from_all_v2_queues(id);
+    }
+}
+
 void LLMEngine::schedule_next_request() {
     while (!waiting_queue_.empty()) {
         RequestId id = waiting_queue_.front();
@@ -620,7 +1012,9 @@ void LLMEngine::step_prefill(RequestState& request) {
     }
 
     SequenceState& seq = get_or_create_session(request.session_id);
-    int budget = std::max(1, prefill_step_tokens_);
+    int budget = (continuous_batching_enabled_ && request.scheduler_v2)
+        ? 1
+        : std::max(1, prefill_step_tokens_);
     while (budget-- > 0 &&
            request.prompt_cursor < static_cast<int>(request.prompt_tokens.size())) {
         int begin = request.prompt_cursor;
@@ -990,6 +1384,12 @@ void LLMEngine::fail_request(RequestState& request, const std::string& error) {
     if (active_request_id_ == request.id) {
         active_request_id_ = 0;
     }
+    if (request.scheduler_v2) {
+        request.metrics.active_decode_batch_size_at_finish =
+            std::max(request.metrics.active_decode_batch_size_at_finish,
+                     static_cast<int>(active_decode_requests_.size()));
+        remove_request_from_all_v2_queues(request.id);
+    }
     emit_metrics_once(request);
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] failed"
@@ -1008,6 +1408,12 @@ void LLMEngine::finish_request(RequestState& request) {
     request.callback = TokenCallback{};
     if (active_request_id_ == request.id) {
         active_request_id_ = 0;
+    }
+    if (request.scheduler_v2) {
+        request.metrics.active_decode_batch_size_at_finish =
+            std::max(request.metrics.active_decode_batch_size_at_finish,
+                     static_cast<int>(active_decode_requests_.size()));
+        remove_request_from_all_v2_queues(request.id);
     }
     emit_metrics_once(request);
     if (debug_scheduler_enabled()) {
@@ -1034,6 +1440,17 @@ void LLMEngine::emit_metrics_once(RequestState& request) {
     request.metrics.cached_prefix_blocks = request.cached_prefix_blocks;
     request.metrics.final_status = request_status_name(request.status);
     request.metrics.error_message = request.error_message;
+    request.metrics.continuous_batching_enabled =
+        request.metrics.continuous_batching_enabled || request.scheduler_v2;
+    if (request.metrics.decode_batch_steps > 0) {
+        request.metrics.decode_batch_size_avg =
+            static_cast<double>(request.metrics.decode_batch_size_sum) /
+            static_cast<double>(request.metrics.decode_batch_steps);
+    }
+    if (request.scheduler_v2 && request.metrics.active_decode_batch_size_at_finish <= 0) {
+        request.metrics.active_decode_batch_size_at_finish =
+            static_cast<int>(active_decode_requests_.size());
+    }
     request.metrics.total_ms = elapsed_ms(request.enqueue_time_us, request.finish_time_us);
     if (request.metrics.first_token_ms <= 0.0 && request.first_token_time_us > 0) {
         request.metrics.first_token_ms =

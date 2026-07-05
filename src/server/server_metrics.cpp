@@ -38,6 +38,18 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     real_batch_prefill_chunks_total_ += metrics.real_batch_prefill_chunks;
     paged_attention_calls_ += metrics.paged_attention_calls;
     paged_attention_fallbacks_ += metrics.paged_attention_fallbacks;
+    if (metrics.continuous_batching_enabled) {
+        continuous_batching_enabled_ = true;
+    }
+    decode_batch_steps_total_ += metrics.decode_batch_steps;
+    decode_batch_size_sum_ += metrics.decode_batch_size_sum;
+    if (metrics.decode_batch_size_max > decode_batch_size_max_) {
+        decode_batch_size_max_ = metrics.decode_batch_size_max;
+    }
+    prefill_chunk_steps_total_ += metrics.prefill_chunk_steps;
+    scheduler_v2_decode_steps_total_ += metrics.scheduler_v2_decode_steps;
+    scheduler_v2_prefill_steps_total_ += metrics.scheduler_v2_prefill_steps;
+    active_decode_batch_size_ = metrics.active_decode_batch_size_at_finish;
     if (metrics.tokens_per_second > 0.0) {
         tokens_per_second_sum_ += metrics.tokens_per_second;
     }
@@ -96,6 +108,10 @@ std::string ServerMetrics::to_json() const {
     double avg_first = latency_samples_ > 0
         ? first_token_ms_sum_ / static_cast<double>(latency_samples_)
         : 0.0;
+    double avg_decode_batch = decode_batch_steps_total_ > 0
+        ? static_cast<double>(decode_batch_size_sum_) /
+              static_cast<double>(decode_batch_steps_total_)
+        : 0.0;
     std::ostringstream os;
     os << '{'
        << "\"requests_total\":" << requests_total_
@@ -113,6 +129,15 @@ std::string ServerMetrics::to_json() const {
        << ",\"real_batch_prefill_chunks_total\":" << real_batch_prefill_chunks_total_
        << ",\"paged_attention_calls\":" << paged_attention_calls_
        << ",\"paged_attention_fallbacks\":" << paged_attention_fallbacks_
+       << ",\"continuous_batching_enabled\":" << (continuous_batching_enabled_ ? "true" : "false")
+       << ",\"decode_batch_steps_total\":" << decode_batch_steps_total_
+       << ",\"decode_batch_size_sum\":" << decode_batch_size_sum_
+       << ",\"decode_batch_size_max\":" << decode_batch_size_max_
+       << ",\"avg_decode_batch_size\":" << avg_decode_batch
+       << ",\"prefill_chunk_steps_total\":" << prefill_chunk_steps_total_
+       << ",\"active_decode_batch_size\":" << active_decode_batch_size_
+       << ",\"scheduler_v2_decode_steps\":" << scheduler_v2_decode_steps_total_
+       << ",\"scheduler_v2_prefill_steps\":" << scheduler_v2_prefill_steps_total_
        << ",\"avg_tokens_per_second\":" << avg_tps
        << ",\"avg_first_token_ms\":" << avg_first
        << '}';

@@ -128,6 +128,17 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"paged_attention_calls\":" << m.paged_attention_calls
        << ",\"paged_attention_fallbacks\":" << m.paged_attention_fallbacks
        << ",\"paged_attention_compare_warnings\":" << m.paged_attention_compare_warnings
+       << ",\"continuous_batching_enabled\":" << (m.continuous_batching_enabled ? "true" : "false")
+       << ",\"decode_batch_steps\":" << m.decode_batch_steps
+       << ",\"decode_batch_size_sum\":" << m.decode_batch_size_sum
+       << ",\"decode_batch_size_max\":" << m.decode_batch_size_max
+       << ",\"decode_batch_size_avg\":" << m.decode_batch_size_avg
+       << ",\"prefill_chunk_steps\":" << m.prefill_chunk_steps
+       << ",\"prefill_scheduler_yield_count\":" << m.prefill_scheduler_yield_count
+       << ",\"scheduler_v2_steps\":" << m.scheduler_v2_steps
+       << ",\"scheduler_v2_decode_steps\":" << m.scheduler_v2_decode_steps
+       << ",\"scheduler_v2_prefill_steps\":" << m.scheduler_v2_prefill_steps
+       << ",\"active_decode_batch_size_at_finish\":" << m.active_decode_batch_size_at_finish
        << ",\"queue_wait_ms\":" << m.queue_wait_ms
        << ",\"prefill_ms\":" << m.prefill_ms
        << ",\"batch_prefill_ms\":" << m.batch_prefill_ms

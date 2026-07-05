@@ -193,7 +193,7 @@ void EngineService::engine_loop() {
 
     while (true) {
         bool did_work = false;
-        std::unique_ptr<EngineCommand> command;
+        std::vector<std::unique_ptr<EngineCommand>> commands;
 
         {
             std::unique_lock<std::mutex> lk(mu_);
@@ -205,13 +205,13 @@ void EngineService::engine_loop() {
                 });
             }
 
-            if (!commands_.empty()) {
-                command = std::move(commands_.front());
+            while (!commands_.empty()) {
+                commands.push_back(std::move(commands_.front()));
                 commands_.pop_front();
             }
         }
 
-        if (command) {
+        for (auto& command : commands) {
             handle_command(*command);
             did_work = true;
         }
