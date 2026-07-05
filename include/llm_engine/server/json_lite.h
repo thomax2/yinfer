@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,16 +35,16 @@ public:
     bool as_bool() const { return bool_value_; }
     double as_number() const { return number_value_; }
     const std::string& as_string() const { return string_value_; }
-    const Array& as_array() const { return array_value_; }
-    const Object& as_object() const { return object_value_; }
+    const Array& as_array() const;
+    const Object& as_object() const;
 
 private:
     Type type_ = Type::Null;
     bool bool_value_ = false;
     double number_value_ = 0.0;
     std::string string_value_;
-    Array array_value_;
-    Object object_value_;
+    std::shared_ptr<Array> array_value_;
+    std::shared_ptr<Object> object_value_;
 };
 
 bool parse_json(const std::string& text, JsonValue* out, std::string* error);

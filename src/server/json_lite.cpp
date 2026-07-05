@@ -17,9 +17,19 @@ JsonValue::JsonValue(double value) : type_(Type::Number), number_value_(value) {
 JsonValue::JsonValue(std::string value)
     : type_(Type::String), string_value_(std::move(value)) {}
 JsonValue::JsonValue(Array value)
-    : type_(Type::Array), array_value_(std::move(value)) {}
+    : type_(Type::Array), array_value_(std::make_shared<Array>(std::move(value))) {}
 JsonValue::JsonValue(Object value)
-    : type_(Type::Object), object_value_(std::move(value)) {}
+    : type_(Type::Object), object_value_(std::make_shared<Object>(std::move(value))) {}
+
+const JsonValue::Array& JsonValue::as_array() const {
+    static const Array empty;
+    return array_value_ ? *array_value_ : empty;
+}
+
+const JsonValue::Object& JsonValue::as_object() const {
+    static const Object empty;
+    return object_value_ ? *object_value_ : empty;
+}
 
 namespace {
 
