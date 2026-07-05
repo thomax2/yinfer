@@ -2,12 +2,14 @@
 #include "backends/cpu/arm_neon/kernel_common.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <sstream>
 
@@ -23,6 +25,13 @@ bool is_stop_token(int token_id) {
     return token_id == QWEN_EOT_ID ||
            token_id == QWEN_IM_START_ID ||
            token_id == QWEN_IM_END_ID;
+}
+
+uint64_t model_now_us() {
+    using clock = std::chrono::steady_clock;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now().time_since_epoch()).count());
 }
 
 std::string join_path(const std::string& dir, const std::string& name) {
@@ -372,6 +381,8 @@ int QwenModel::prefill_prompt_batch(
         norm_out.data(),
         H,
         config.rms_norm_eps);
+    last_batch_norm_out_ = norm_out;
+    last_batch_norm_out_valid_ = true;
 
     arm_neon::ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
         norm_out.data(),
@@ -391,6 +402,7 @@ int QwenModel::prefill_prompt_batch(
 }
 
 int QwenModel::forward(int token_id, int pos, KVCache& cache) {
+    last_batch_norm_out_valid_ = false;
     if (!is_graph_built) {
         build_graph(cache);
     }
@@ -457,6 +469,185 @@ int QwenModel::forward(int token_id, int pos, KVCache& cache) {
         return -1;
     }
     return result.index;
+}
+
+int QwenModel::sample_next_token_from_last_logits(
+    const SamplingParams& sampling,
+    std::mt19937_64& rng,
+    SamplingRuntimeStats* stats
+) {
+    const fp16_t* norm = nullptr;
+    if (last_batch_norm_out_valid_ &&
+        static_cast<int>(last_batch_norm_out_.size()) == config.hidden_dim) {
+        norm = last_batch_norm_out_.data();
+    } else if (t_norm_out) {
+        norm = t_norm_out->ptr<fp16_t>();
+    }
+    if (!norm) {
+        return -1;
+    }
+
+    auto greedy_argmax = [&]() -> int {
+        arm_neon::ArgmaxResult result = arm_neon::linear_gptq_int8_decode_argmax_neon(
+            norm,
+            lm_head,
+            nullptr,
+            0);
+        if (stats) {
+            stats->greedy_tokens++;
+        }
+        forward_debug_last_result.token_id = result.index;
+        forward_debug_last_result.logit = result.value;
+        return result.index;
+    };
+
+    float temperature = sampling.temperature;
+    if (temperature < 0.0f) {
+        temperature = 0.0f;
+    }
+    if (sampling.greedy || temperature <= 0.0f) {
+        return greedy_argmax();
+    }
+
+    uint64_t begin_us = model_now_us();
+    std::vector<fp16_t> logits((size_t)config.vocab_size);
+    Status status = arm_neon::linear_gptq_int8_decode_neon(
+        norm,
+        lm_head,
+        logits.data(),
+        nullptr,
+        nullptr,
+        0);
+    if (status != Status::SUCCESS) {
+        std::cerr << "[SAMPLING] logits failed, fallback greedy status="
+                  << StatusToString(status)
+                  << std::endl;
+        if (stats) {
+            stats->sampling_ms += (double)(model_now_us() - begin_us) / 1000.0;
+        }
+        return greedy_argmax();
+    }
+
+    struct Candidate {
+        int id;
+        float logit;
+        double weight;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve((size_t)config.vocab_size);
+    int greedy_id = -1;
+    float greedy_logit = -std::numeric_limits<float>::infinity();
+    for (int id = 0; id < config.vocab_size; ++id) {
+        float logit = static_cast<float>(logits[(size_t)id]);
+        if (!std::isfinite(logit)) {
+            continue;
+        }
+        if (logit > greedy_logit) {
+            greedy_logit = logit;
+            greedy_id = id;
+        }
+        candidates.push_back(Candidate{id, logit, 0.0});
+    }
+    if (candidates.empty()) {
+        if (stats) {
+            stats->sampling_ms += (double)(model_now_us() - begin_us) / 1000.0;
+        }
+        return greedy_argmax();
+    }
+
+    int top_k = sampling.top_k < 0 ? 0 : sampling.top_k;
+    if (top_k > 0 && top_k < static_cast<int>(candidates.size())) {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + top_k,
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.logit > b.logit;
+            });
+        candidates.resize((size_t)top_k);
+    }
+
+    float top_p = sampling.top_p;
+    if (top_p <= 0.0f) {
+        top_p = 1.0f;
+    }
+    if (top_p > 1.0f) {
+        top_p = 1.0f;
+    }
+    if (top_p < 1.0f) {
+        std::sort(
+            candidates.begin(),
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.logit > b.logit;
+            });
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (const Candidate& c : candidates) {
+        max_logit = std::max(max_logit, c.logit);
+    }
+
+    double total_weight = 0.0;
+    const double inv_temp = 1.0 / std::max<double>(temperature, 1e-6);
+    for (Candidate& c : candidates) {
+        c.weight = std::exp(((double)c.logit - (double)max_logit) * inv_temp);
+        if (std::isfinite(c.weight) && c.weight > 0.0) {
+            total_weight += c.weight;
+        } else {
+            c.weight = 0.0;
+        }
+    }
+    if (total_weight <= 0.0) {
+        if (stats) {
+            stats->sampling_ms += (double)(model_now_us() - begin_us) / 1000.0;
+        }
+        return greedy_argmax();
+    }
+
+    if (top_p < 1.0f) {
+        double cumulative = 0.0;
+        size_t keep = 0;
+        for (; keep < candidates.size(); ++keep) {
+            cumulative += candidates[keep].weight / total_weight;
+            if (cumulative >= top_p) {
+                ++keep;
+                break;
+            }
+        }
+        keep = std::max<size_t>(1, std::min(keep, candidates.size()));
+        candidates.resize(keep);
+        total_weight = 0.0;
+        for (const Candidate& c : candidates) {
+            total_weight += c.weight;
+        }
+    }
+
+    std::uniform_real_distribution<double> dist(0.0, total_weight);
+    double pick = dist(rng);
+    double cumulative = 0.0;
+    int sampled_id = -1;
+    float sampled_logit = 0.0f;
+    for (const Candidate& c : candidates) {
+        cumulative += c.weight;
+        if (pick <= cumulative) {
+            sampled_id = c.id;
+            sampled_logit = c.logit;
+            break;
+        }
+    }
+    if (sampled_id < 0 || sampled_id >= config.vocab_size) {
+        sampled_id = greedy_id;
+        sampled_logit = greedy_logit;
+    }
+
+    if (stats) {
+        stats->sampled_tokens++;
+        stats->sampling_ms += (double)(model_now_us() - begin_us) / 1000.0;
+    }
+    forward_debug_last_result.token_id = sampled_id;
+    forward_debug_last_result.logit = sampled_logit;
+    return sampled_id;
 }
 
 void QwenModel::generate(
@@ -628,19 +819,171 @@ int QwenModel::prefill_chunk_for_sequence(
         return -1;
     }
 
-    int next_token = -1;
-    for (int index = prompt_begin; index < prompt_end; ++index) {
-        next_token = prefill_one_for_sequence(
-            seq,
-            prompt_tokens,
-            index,
-            kv_manager,
-            prefix_cache);
-        if (seq.status == SequenceStatus::FAILED || next_token < 0) {
-            return -1;
+    last_prefill_chunk_stats = PrefillChunkStats{};
+    const int chunk_len = prompt_end - prompt_begin;
+
+    auto register_completed_block = [&](int logical_block) {
+        if (!prefix_cache || !kv_cache || logical_block < 0) {
+            return;
         }
+        int block_size = kv_cache->block_size();
+        int block_begin = logical_block * block_size;
+        if (block_size <= 0 ||
+            block_begin < 0 ||
+            block_begin + block_size > static_cast<int>(seq.all_tokens.size()) ||
+            logical_block >= static_cast<int>(seq.block_table.size())) {
+            return;
+        }
+
+        int physical_block = seq.block_table[(size_t)logical_block];
+        if (physical_block < 0 || kv_manager.block_has_hash(physical_block)) {
+            return;
+        }
+
+        HashValue parent_hash;
+        if (logical_block > 0) {
+            int prev_block = seq.block_table[(size_t)(logical_block - 1)];
+            if (prev_block < 0 || !kv_manager.block_has_hash(prev_block)) {
+                return;
+            }
+            parent_hash = kv_manager.block_hash(prev_block);
+        }
+
+        HashValue current_hash = hash_token_block(
+            parent_hash,
+            seq.all_tokens,
+            block_begin,
+            block_size,
+            prefix_cache->config());
+        if (prefix_cache->insert(
+                current_hash,
+                parent_hash,
+                seq.all_tokens,
+                block_begin,
+                block_size,
+                physical_block)) {
+            kv_manager.attach_hash_to_block(
+                physical_block,
+                current_hash,
+                parent_hash,
+                block_size);
+            seq.last_prefix_hash = current_hash;
+        }
+    };
+
+    auto token_loop = [&]() -> int {
+        uint64_t begin_us = model_now_us();
+        last_prefill_chunk_stats.token_loop_used = true;
+        int next_token = -1;
+        for (int index = prompt_begin; index < prompt_end; ++index) {
+            next_token = prefill_one_for_sequence(
+                seq,
+                prompt_tokens,
+                index,
+                kv_manager,
+                prefix_cache);
+            if (seq.status == SequenceStatus::FAILED || next_token < 0) {
+                last_prefill_chunk_stats.token_loop_ms +=
+                    (double)(model_now_us() - begin_us) / 1000.0;
+                return -1;
+            }
+        }
+        last_prefill_chunk_stats.token_loop_ms +=
+            (double)(model_now_us() - begin_us) / 1000.0;
+        return next_token;
+    };
+
+    if (chunk_len == 1 || !env_flag("LLM_ENABLE_REAL_BATCH_PREFILL")) {
+        return token_loop();
     }
-    return next_token;
+    if (!kv_cache) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "missing kv cache";
+        return -1;
+    }
+
+    const int start_pos = seq.history_pos;
+    if (start_pos < 0 || start_pos + chunk_len > config.max_seq_len) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "sequence length exceeded";
+        return -1;
+    }
+    if (!kv_manager.ensure_blocks_for_range(seq, start_pos, start_pos + chunk_len)) {
+        seq.status = SequenceStatus::FAILED;
+        if (seq.error_message.empty()) {
+            seq.error_message = "KV block pool exhausted";
+        }
+        return -1;
+    }
+
+    std::vector<int> chunk_tokens(
+        prompt_tokens.begin() + prompt_begin,
+        prompt_tokens.begin() + prompt_end);
+
+    uint64_t batch_begin_us = model_now_us();
+    kv_cache->set_active_sequence(&seq.block_table, &seq.max_written_pos);
+    int next_token = prefill_prompt_batch(chunk_tokens, start_pos, *kv_cache);
+    kv_cache->clear_active_sequence();
+    last_prefill_chunk_stats.batch_ms +=
+        (double)(model_now_us() - batch_begin_us) / 1000.0;
+
+    if (next_token >= 0) {
+        last_prefill_chunk_stats.real_batch_used = true;
+        seq.all_tokens.insert(seq.all_tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
+        seq.history_pos += chunk_len;
+        seq.max_written_pos = std::max(seq.max_written_pos, seq.history_pos - 1);
+        seq.num_computed_tokens += chunk_len;
+
+        if (kv_cache->block_size() > 0) {
+            int block_size = kv_cache->block_size();
+            for (int pos = start_pos + 1; pos <= seq.history_pos; ++pos) {
+                if (pos % block_size == 0) {
+                    register_completed_block((pos / block_size) - 1);
+                }
+            }
+        }
+
+        if (env_flag("LLM_DEBUG_BATCH_PREFILL")) {
+            std::cerr << "[BATCH_PREFILL] real_batch"
+                      << " begin=" << prompt_begin
+                      << " end=" << prompt_end
+                      << " start_pos=" << start_pos
+                      << " chunk_len=" << chunk_len
+                      << " next_token=" << next_token
+                      << " batch_ms=" << last_prefill_chunk_stats.batch_ms
+                      << std::endl;
+        }
+        if (env_flag("LLM_BATCH_PREFILL_COMPARE")) {
+            std::cerr << "[BATCH_PREFILL_COMPARE]"
+                      << " begin=" << prompt_begin
+                      << " end=" << prompt_end
+                      << " batch_next=" << next_token
+                      << " ref_next=-1"
+                      << " match=skip"
+                      << " reason=reference_kv_clone_not_available"
+                      << std::endl;
+        }
+        return next_token;
+    }
+
+    last_prefill_chunk_stats.fallback = true;
+    if (env_flag("LLM_DEBUG_BATCH_PREFILL")) {
+        std::cerr << "[BATCH_PREFILL] fallback"
+                  << " begin=" << prompt_begin
+                  << " end=" << prompt_end
+                  << " start_pos=" << start_pos
+                  << " reason=batch_failed"
+                  << std::endl;
+    }
+    if (env_flag("LLM_REAL_BATCH_PREFILL_STRICT")) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "real batch prefill failed";
+        return -1;
+    }
+
+    seq.status = SequenceStatus::RUNNING;
+    seq.error_message.clear();
+    return token_loop();
 }
 
 int QwenModel::decode_one_for_sequence(
@@ -675,6 +1018,59 @@ int QwenModel::decode_one_for_sequence(
     seq.all_tokens.push_back(input_token);
     seq.history_pos++;
     return next_token;
+}
+
+int QwenModel::decode_one_for_sequence_sampled(
+    SequenceState& seq,
+    int input_token,
+    KVCacheManager& kv_manager,
+    PrefixCache* prefix_cache,
+    const SamplingParams& sampling,
+    std::mt19937_64& rng,
+    SamplingRuntimeStats* stats
+) {
+    if (!sampling_enabled(sampling)) {
+        int next = decode_one_for_sequence(seq, input_token, kv_manager, prefix_cache);
+        if (stats && next >= 0) {
+            stats->greedy_tokens++;
+        }
+        return next;
+    }
+
+    if (!kv_cache) return -1;
+    if (seq.history_pos >= config.max_seq_len) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "sequence length exceeded";
+        return -1;
+    }
+    if (!kv_manager.ensure_block_for_position(seq, seq.history_pos)) {
+        seq.status = SequenceStatus::FAILED;
+        if (seq.error_message.empty()) {
+            seq.error_message = "KV block pool exhausted";
+        }
+        return -1;
+    }
+
+    kv_cache->set_active_sequence(&seq.block_table, &seq.max_written_pos);
+    int greedy_next = forward(input_token, seq.history_pos, *kv_cache);
+    kv_cache->clear_active_sequence();
+    if (greedy_next < 0) {
+        seq.status = SequenceStatus::FAILED;
+        seq.error_message = "decode forward failed";
+        return -1;
+    }
+
+    int sampled_next = sample_next_token_from_last_logits(sampling, rng, stats);
+    if (sampled_next < 0) {
+        sampled_next = greedy_next;
+        if (stats) {
+            stats->greedy_tokens++;
+        }
+    }
+
+    seq.all_tokens.push_back(input_token);
+    seq.history_pos++;
+    return sampled_next;
 }
 
 void QwenModel::generate_for_sequence(

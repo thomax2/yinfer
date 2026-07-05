@@ -136,6 +136,7 @@ RequestId LLMEngine::submit(
     request.metrics.session_id = session_id;
     request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
     request.metrics.max_new_tokens = sampling.max_new_tokens;
+    init_request_sampling(request);
 
     auto inserted = requests_.emplace(id, std::move(request));
     RequestState& state = inserted.first->second;
@@ -179,6 +180,8 @@ RequestId LLMEngine::submit(
                           << std::endl;
             }
             apply_prefix_cache(seq, state.prompt_tokens);
+            state.cached_prefix_tokens = seq.cached_prefix_tokens;
+            state.cached_prefix_blocks = seq.cached_prefix_blocks;
             state.metrics.cached_prefix_tokens = seq.cached_prefix_tokens;
             state.metrics.cached_prefix_blocks = seq.cached_prefix_blocks;
             model_.generate_for_sequence(
@@ -264,6 +267,7 @@ RequestId LLMEngine::submit_async(
     request.metrics.session_id = session_id;
     request.metrics.prompt_tokens = static_cast<int>(prompt_tokens.size());
     request.metrics.max_new_tokens = sampling.max_new_tokens;
+    init_request_sampling(request);
 
     requests_.emplace(id, std::move(request));
     waiting_queue_.push_back(id);
@@ -638,26 +642,22 @@ void LLMEngine::step_prefill(RequestState& request) {
                     *kv_manager_,
                     prefix_cache_.get());
             }
-            used_chunk = next >= 0 && seq.status != SequenceStatus::FAILED;
-            if (!used_chunk && !chunked_prefill_strict_ && seq.history_pos == begin) {
-                if (debug_chunked_prefill_enabled()) {
-                    std::cerr << "[CHUNKED_PREFILL] fallback"
-                              << " id=" << request.id
-                              << " begin=" << begin
-                              << " end=" << end
-                              << std::endl;
-                }
-                seq.status = SequenceStatus::RUNNING;
-                seq.error_message.clear();
-                end = begin + 1;
-                ScopedTimer timer(&request.metrics.prefill_ms);
-                next = model_.prefill_one_for_sequence(
-                    seq,
-                    request.prompt_tokens,
-                    begin,
-                    *kv_manager_,
-                    prefix_cache_.get());
+            request.metrics.prefill_chunks++;
+            request.metrics.batch_prefill_ms += model_.last_prefill_chunk_stats.batch_ms;
+            request.metrics.token_loop_prefill_ms += model_.last_prefill_chunk_stats.token_loop_ms;
+            if (model_.last_prefill_chunk_stats.real_batch_used) {
+                request.metrics.real_batch_prefill_chunks++;
             }
+            if (model_.last_prefill_chunk_stats.token_loop_used) {
+                request.metrics.token_loop_prefill_chunks++;
+            }
+            if (model_.last_prefill_chunk_stats.fallback) {
+                request.metrics.batch_prefill_fallbacks++;
+            }
+            if (model_.last_prefill_chunk_stats.compare_mismatch) {
+                request.metrics.batch_prefill_compare_mismatches++;
+            }
+            used_chunk = next >= 0 && seq.status != SequenceStatus::FAILED;
         } else {
             ScopedTimer timer(&request.metrics.prefill_ms);
             next = model_.prefill_one_for_sequence(
@@ -666,6 +666,8 @@ void LLMEngine::step_prefill(RequestState& request) {
                 begin,
                 *kv_manager_,
                 prefix_cache_.get());
+            request.metrics.prefill_chunks++;
+            request.metrics.token_loop_prefill_chunks++;
         }
         if (seq.status == SequenceStatus::FAILED) {
             fail_request(request, seq.error_message.empty() ? "prefill failed" : seq.error_message);
@@ -697,6 +699,21 @@ void LLMEngine::step_prefill(RequestState& request) {
             fail_request(request, "prefill produced no next token");
             return;
         }
+        if (sampling_enabled(request.sampling)) {
+            SamplingRuntimeStats sampling_stats;
+            int sampled = model_.sample_next_token_from_last_logits(
+                request.sampling,
+                request.rng,
+                &sampling_stats);
+            if (sampled >= 0) {
+                request.next_token = sampled;
+            }
+            request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
+            request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
+            request.metrics.sampling_ms += sampling_stats.sampling_ms;
+        } else {
+            request.metrics.greedy_tokens++;
+        }
         request.status = RequestStatus::RUNNING_DECODE;
         if (debug_scheduler_enabled()) {
             std::cerr << "[SCHED] transition"
@@ -724,7 +741,7 @@ void LLMEngine::step_decode(RequestState& request) {
     SequenceState& seq = get_or_create_session(request.session_id);
     ScopedTimer decode_timer(&request.metrics.decode_ms);
     int token_id = request.next_token;
-    if (is_stop_token(token_id)) {
+    if (request_stop_token(request, token_id)) {
         model_.decode_one_for_sequence(seq, token_id, *kv_manager_, prefix_cache_.get());
         if (seq.status == SequenceStatus::FAILED) {
             fail_request(request, seq.error_message.empty() ? "stop token forward failed" : seq.error_message);
@@ -762,7 +779,24 @@ void LLMEngine::step_decode(RequestState& request) {
         return;
     }
 
-    int next = model_.decode_one_for_sequence(seq, token_id, *kv_manager_, prefix_cache_.get());
+    int next = -1;
+    if (sampling_enabled(request.sampling)) {
+        SamplingRuntimeStats sampling_stats;
+        next = model_.decode_one_for_sequence_sampled(
+            seq,
+            token_id,
+            *kv_manager_,
+            prefix_cache_.get(),
+            request.sampling,
+            request.rng,
+            &sampling_stats);
+        request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
+        request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
+        request.metrics.sampling_ms += sampling_stats.sampling_ms;
+    } else {
+        next = model_.decode_one_for_sequence(seq, token_id, *kv_manager_, prefix_cache_.get());
+        request.metrics.greedy_tokens++;
+    }
     if (seq.status == SequenceStatus::FAILED) {
         fail_request(request, seq.error_message.empty() ? "decode failed" : seq.error_message);
         return;
@@ -819,6 +853,107 @@ void LLMEngine::run_legacy_request(RequestState& request) {
     };
 
     try {
+        if (sampling_enabled(request.sampling)) {
+            ScopedTimer timer(&request.metrics.decode_ms);
+            if (!model_.kv_cache) {
+                fail_request(request, "missing kv cache");
+                return;
+            }
+
+            int next_token = -1;
+            for (int tok : request.prompt_tokens) {
+                if (model_.history_pos >= model_.config.max_seq_len) {
+                    fail_request(request, "sequence length exceeded");
+                    return;
+                }
+                next_token = model_.forward(tok, model_.history_pos, *model_.kv_cache);
+                model_.history_pos++;
+                if (next_token < 0) {
+                    fail_request(request, "prompt forward failed");
+                    return;
+                }
+            }
+
+            SamplingRuntimeStats sampling_stats;
+            int sampled = model_.sample_next_token_from_last_logits(
+                request.sampling,
+                request.rng,
+                &sampling_stats);
+            if (sampled >= 0) {
+                next_token = sampled;
+            }
+            request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
+            request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
+            request.metrics.sampling_ms += sampling_stats.sampling_ms;
+
+            int current_token = next_token;
+            for (int i = 0;
+                 i < request.sampling.max_new_tokens && current_token >= 0;
+                 ++i) {
+                if (request_stop_token(request, current_token)) {
+                    if (model_.history_pos < model_.config.max_seq_len) {
+                        int ignored = model_.forward(
+                            current_token,
+                            model_.history_pos,
+                            *model_.kv_cache);
+                        model_.history_pos++;
+                        if (ignored < 0) {
+                            fail_request(request, "stop token forward failed");
+                            return;
+                        }
+                    }
+                    break;
+                }
+
+                if (!wrapped_callback(current_token)) {
+                    callback_stopped = true;
+                    break;
+                }
+                if (model_.history_pos >= model_.config.max_seq_len) {
+                    break;
+                }
+
+                int greedy_next = model_.forward(
+                    current_token,
+                    model_.history_pos,
+                    *model_.kv_cache);
+                model_.history_pos++;
+                if (greedy_next < 0) {
+                    fail_request(request, "decode forward failed");
+                    return;
+                }
+
+                SamplingRuntimeStats step_stats;
+                int sampled_next = model_.sample_next_token_from_last_logits(
+                    request.sampling,
+                    request.rng,
+                    &step_stats);
+                request.metrics.sampled_tokens += step_stats.sampled_tokens;
+                request.metrics.greedy_tokens += step_stats.greedy_tokens;
+                request.metrics.sampling_ms += step_stats.sampling_ms;
+                current_token = sampled_next >= 0 ? sampled_next : greedy_next;
+            }
+
+            request.callback_stopped = callback_stopped;
+            if (callback_stopped) {
+                request.status = RequestStatus::ABORTED;
+                request.callback = TokenCallback{};
+                if (active_request_id_ == request.id) {
+                    active_request_id_ = 0;
+                }
+                emit_metrics_once(request);
+                if (debug_scheduler_enabled()) {
+                    std::cerr << "[SCHED] aborted"
+                              << " id=" << request.id
+                              << " generated=" << request.num_generated_tokens
+                              << std::endl;
+                }
+                return;
+            }
+            finish_request(request);
+            return;
+        }
+
         ScopedTimer timer(&request.metrics.decode_ms);
         model_.generate(request.prompt_tokens, request.sampling.max_new_tokens, wrapped_callback);
         request.callback_stopped = callback_stopped;
@@ -937,6 +1072,46 @@ void LLMEngine::mark_first_token(RequestState& request) {
     request.first_token_time_us = now_us();
     request.metrics.first_token_ms =
         elapsed_ms(request.enqueue_time_us, request.first_token_time_us);
+}
+
+void LLMEngine::init_request_sampling(RequestState& request) {
+    if (request.sampling.temperature < 0.0f) {
+        request.sampling.temperature = 0.0f;
+    }
+    if (request.sampling.top_k < 0) {
+        request.sampling.top_k = 0;
+    }
+    if (request.sampling.top_p <= 0.0f || request.sampling.top_p > 1.0f) {
+        request.sampling.top_p = 1.0f;
+    }
+    if (request.sampling.temperature > 0.0f) {
+        request.sampling.greedy = false;
+    }
+
+    uint64_t seed = request.sampling.has_seed
+        ? request.sampling.seed
+        : (now_us() ^ (request.id * 0x9e3779b97f4a7c15ULL));
+    request.sampling.seed = seed;
+    request.sampling.has_seed = true;
+    request.rng.seed(seed);
+
+    request.metrics.sampling_enabled = sampling_enabled(request.sampling);
+    request.metrics.temperature = request.sampling.temperature;
+    request.metrics.top_k = request.sampling.top_k;
+    request.metrics.top_p = request.sampling.top_p;
+    request.metrics.seed = seed;
+}
+
+bool LLMEngine::request_stop_token(const RequestState& request, int token_id) const {
+    if (is_stop_token(token_id)) {
+        return true;
+    }
+    for (int stop_id : request.sampling.stop_token_ids) {
+        if (token_id == stop_id) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool LLMEngine::is_terminal(RequestStatus status) const {

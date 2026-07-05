@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -17,6 +20,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -127,6 +131,57 @@ bool extract_int_field(const std::string& json, const char* key, int64_t* out) {
     return true;
 }
 
+bool extract_u64_field(const std::string& json, const char* key, uint64_t* out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    if (!skip_ws(json, &pos)) return false;
+
+    char* end = nullptr;
+    unsigned long long value = std::strtoull(json.c_str() + pos, &end, 10);
+    if (end == json.c_str() + pos) return false;
+    *out = static_cast<uint64_t>(value);
+    return true;
+}
+
+bool extract_float_field(const std::string& json, const char* key, float* out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    if (!skip_ws(json, &pos)) return false;
+
+    char* end = nullptr;
+    float value = std::strtof(json.c_str() + pos, &end);
+    if (end == json.c_str() + pos) return false;
+    *out = value;
+    return true;
+}
+
+bool extract_bool_field(const std::string& json, const char* key, bool* out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    if (!skip_ws(json, &pos)) return false;
+    if (json.compare(pos, 4, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (json.compare(pos, 5, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 const char* status_name(RequestStatus status) {
     switch (status) {
         case RequestStatus::WAITING: return "WAITING";
@@ -149,6 +204,27 @@ void close_fd(int fd) {
 
 } // namespace
 
+struct TcpJsonlServer::ServerResponse {
+    enum class Type { RAW, TOKEN, FINISH, ERROR };
+    Type type = Type::RAW;
+    std::string raw_json;
+    RequestId request_id = 0;
+    int token_id = -1;
+    std::string error;
+    RequestStatus status = RequestStatus::FAILED;
+    int generated_tokens = 0;
+};
+
+struct TcpJsonlServer::ClientConnection {
+    int fd = -1;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ServerResponse> responses;
+    std::atomic<bool> closed{false};
+    std::atomic<RequestId> active_request_id{0};
+    std::thread writer_thread;
+};
+
 TcpJsonlServer::TcpJsonlServer(
     EngineService& service,
     EncodeFn encode,
@@ -157,7 +233,9 @@ TcpJsonlServer::TcpJsonlServer(
 ) : service_(service),
     encode_(std::move(encode)),
     decode_(std::move(decode)),
-    default_max_new_tokens_(default_max_new_tokens) {}
+    default_max_new_tokens_(default_max_new_tokens) {
+    response_queue_limit_ = std::max(1, env_int("LLM_SERVER_RESPONSE_QUEUE_LIMIT", 1024));
+}
 
 bool TcpJsonlServer::run_forever(const std::string& host, int port) {
 #ifdef _WIN32
@@ -240,20 +318,33 @@ void TcpJsonlServer::handle_client(int fd) {
 #ifdef _WIN32
     (void)fd;
 #else
+    auto client = std::make_shared<ClientConnection>();
+    client->fd = fd;
+
+    int timeout_ms = std::max(1, env_int("LLM_SERVER_WRITE_TIMEOUT_MS", 5000));
+    timeval tv{};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    client->writer_thread = std::thread(&TcpJsonlServer::writer_loop, this, client);
     if (debug_enabled()) {
         std::cerr << "[SERVER] client connected fd=" << fd << std::endl;
     }
 
     std::string buffer;
     char chunk[4096];
-    while (!stop_requested_.load()) {
+    while (!stop_requested_.load() && !client->closed.load()) {
         ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
         if (n <= 0) {
             break;
         }
         buffer.append(chunk, chunk + n);
         if (buffer.size() > kMaxLineBytes) {
-            write_json_line(fd, "{\"error\":\"line too large\"}");
+            enqueue_response(
+                client,
+                ServerResponse{ServerResponse::Type::ERROR, "", 0, -1, "line too large"},
+                false);
             break;
         }
 
@@ -264,13 +355,23 @@ void TcpJsonlServer::handle_client(int fd) {
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
-            if (!line.empty() && !handle_line(fd, line)) {
-                close_fd(fd);
-                return;
+            if (!line.empty() && !handle_line(client, line)) {
+                client->closed.store(true);
+                break;
             }
         }
     }
 
+    client->closed.store(true);
+    RequestId active = client->active_request_id.exchange(0);
+    if (active != 0) {
+        service_.abort(active);
+    }
+    shutdown(fd, SHUT_RDWR);
+    client->cv.notify_all();
+    if (client->writer_thread.joinable()) {
+        client->writer_thread.join();
+    }
     if (debug_enabled()) {
         std::cerr << "[SERVER] client disconnected fd=" << fd << std::endl;
     }
@@ -278,7 +379,10 @@ void TcpJsonlServer::handle_client(int fd) {
 #endif
 }
 
-bool TcpJsonlServer::handle_line(int fd, const std::string& line) {
+bool TcpJsonlServer::handle_line(
+    const std::shared_ptr<ClientConnection>& client,
+    const std::string& line
+) {
     std::string command;
     extract_string_field(line, "command", &command);
 
@@ -291,22 +395,43 @@ bool TcpJsonlServer::handle_line(int fd, const std::string& line) {
             service_.clear_session(session_id);
             std::ostringstream os;
             os << "{\"ok\":true,\"session_id\":" << session_id << ",\"command\":\"clear\"}";
-            return write_json_line(fd, os.str());
+            return enqueue_response(
+                client,
+                ServerResponse{ServerResponse::Type::RAW, os.str()},
+                true);
         }
         if (command == "abort") {
             int64_t id = 0;
             if (!extract_int_field(line, "request_id", &id) || id <= 0) {
-                return write_json_line(fd, "{\"error\":\"missing request_id\"}");
+                return enqueue_response(
+                    client,
+                    ServerResponse{ServerResponse::Type::ERROR, "", 0, -1, "missing request_id"},
+                    true);
             }
             service_.abort(static_cast<RequestId>(id));
             std::ostringstream os;
             os << "{\"ok\":true,\"request_id\":" << id << ",\"command\":\"abort\"}";
-            return write_json_line(fd, os.str());
+            return enqueue_response(
+                client,
+                ServerResponse{ServerResponse::Type::RAW, os.str()},
+                true);
+        }
+
+        bool stream = true;
+        extract_bool_field(line, "stream", &stream);
+        if (!stream) {
+            return enqueue_response(
+                client,
+                ServerResponse{ServerResponse::Type::ERROR, "", 0, -1, "stream=false is not implemented"},
+                true);
         }
 
         std::string prompt;
         if (!extract_string_field(line, "prompt", &prompt)) {
-            return write_json_line(fd, "{\"error\":\"missing prompt\"}");
+            return enqueue_response(
+                client,
+                ServerResponse{ServerResponse::Type::ERROR, "", 0, -1, "missing prompt"},
+                true);
         }
         int64_t max_new_tokens_value = default_max_new_tokens_;
         extract_int_field(line, "max_new_tokens", &max_new_tokens_value);
@@ -316,35 +441,45 @@ bool TcpJsonlServer::handle_line(int fd, const std::string& line) {
         SamplingParams sampling;
         sampling.max_new_tokens = max_new_tokens;
         sampling.greedy = true;
+        extract_float_field(line, "temperature", &sampling.temperature);
+        int64_t top_k = 0;
+        if (extract_int_field(line, "top_k", &top_k)) {
+            sampling.top_k = static_cast<int>(top_k);
+        }
+        extract_float_field(line, "top_p", &sampling.top_p);
+        bool greedy = sampling.greedy;
+        if (extract_bool_field(line, "greedy", &greedy)) {
+            sampling.greedy = greedy;
+        }
+        uint64_t seed = 0;
+        if (extract_u64_field(line, "seed", &seed)) {
+            sampling.seed = seed;
+            sampling.has_seed = true;
+        }
+        if (sampling.temperature > 0.0f) {
+            sampling.greedy = false;
+        }
 
         std::vector<int> prompt_tokens = encode_(prompt);
-        auto request_id_holder = std::make_shared<std::atomic<RequestId>>(0);
-        auto write_failed = std::make_shared<std::atomic<bool>>(false);
         RequestId request_id = service_.submit(
             session_id,
             prompt_tokens,
             sampling,
-            [this, fd, request_id_holder, write_failed](int token_id) {
-                if (write_failed->load()) {
+            [this, client](int token_id) {
+                if (client->closed.load()) {
                     return false;
                 }
-                std::string token;
-                try {
-                    token = decode_(token_id);
-                } catch (const std::exception& e) {
-                    token = std::string("<decode_error:") + e.what() + ">";
-                }
-                std::ostringstream os;
-                os << "{\"request_id\":" << request_id_holder->load()
-                   << ",\"token_id\":" << token_id
-                   << ",\"token\":\"" << json_escape(token) << "\"}";
-                if (!write_json_line(fd, os.str())) {
-                    write_failed->store(true);
+                ServerResponse response;
+                response.type = ServerResponse::Type::TOKEN;
+                response.request_id = client->active_request_id.load();
+                response.token_id = token_id;
+                if (!enqueue_response(client, std::move(response), true)) {
+                    std::cerr << "[SERVER] response queue overflow" << std::endl;
                     return false;
                 }
                 return true;
             });
-        request_id_holder->store(request_id);
+        client->active_request_id.store(request_id);
 
         if (debug_enabled()) {
             std::cerr << "[SERVER] submit"
@@ -357,18 +492,109 @@ bool TcpJsonlServer::handle_line(int fd, const std::string& line) {
         service_.wait_until_finished(request_id);
         EngineRequestSnapshot snapshot;
         service_.request_snapshot(request_id, &snapshot);
-        std::ostringstream os;
-        os << "{\"request_id\":" << request_id
-           << ",\"finished\":true"
-           << ",\"status\":\"" << status_name(snapshot.status) << "\""
-           << ",\"generated_tokens\":" << snapshot.num_generated_tokens
-           << ",\"error_message\":\"" << json_escape(snapshot.error_message) << "\"}";
-        return write_failed->load() ? false : write_json_line(fd, os.str());
+        ServerResponse finish;
+        finish.type = ServerResponse::Type::FINISH;
+        finish.request_id = request_id;
+        finish.status = snapshot.status;
+        finish.generated_tokens = snapshot.num_generated_tokens;
+        finish.error = snapshot.error_message;
+        enqueue_response(client, std::move(finish), true);
+        client->active_request_id.store(0);
+        return !client->closed.load();
     } catch (const std::exception& e) {
-        std::ostringstream os;
-        os << "{\"error\":\"" << json_escape(e.what()) << "\"}";
-        return write_json_line(fd, os.str());
+        return enqueue_response(
+            client,
+            ServerResponse{ServerResponse::Type::ERROR, "", 0, -1, e.what()},
+            true);
     }
+}
+
+void TcpJsonlServer::writer_loop(std::shared_ptr<ClientConnection> client) {
+    if (debug_queue_enabled()) {
+        std::cerr << "[SERVER_QUEUE] writer start fd=" << client->fd << std::endl;
+    }
+    while (true) {
+        ServerResponse response;
+        {
+            std::unique_lock<std::mutex> lk(client->mu);
+            client->cv.wait(lk, [&] {
+                return client->closed.load() || !client->responses.empty();
+            });
+            if (client->responses.empty()) {
+                if (client->closed.load()) {
+                    break;
+                }
+                continue;
+            }
+            response = std::move(client->responses.front());
+            client->responses.pop_front();
+        }
+
+        std::ostringstream os;
+        if (response.type == ServerResponse::Type::RAW) {
+            os << response.raw_json;
+        } else if (response.type == ServerResponse::Type::TOKEN) {
+            std::string token;
+            try {
+                std::lock_guard<std::mutex> lk(decode_mu_);
+                token = decode_(response.token_id);
+            } catch (const std::exception& e) {
+                token = std::string("<decode_error:") + e.what() + ">";
+            }
+            os << "{\"request_id\":" << response.request_id
+               << ",\"token_id\":" << response.token_id
+               << ",\"token\":\"" << json_escape(token) << "\"}";
+        } else if (response.type == ServerResponse::Type::FINISH) {
+            os << "{\"request_id\":" << response.request_id
+               << ",\"finished\":true"
+               << ",\"status\":\"" << status_name(response.status) << "\""
+               << ",\"generated_tokens\":" << response.generated_tokens
+               << ",\"error_message\":\"" << json_escape(response.error) << "\"}";
+        } else {
+            os << "{\"error\":\"" << json_escape(response.error) << "\"}";
+        }
+
+        if (!write_json_line(client->fd, os.str())) {
+            client->closed.store(true);
+            RequestId active = client->active_request_id.exchange(0);
+            if (active != 0) {
+                service_.abort(active);
+            }
+            break;
+        }
+    }
+    if (debug_queue_enabled()) {
+        std::cerr << "[SERVER_QUEUE] writer exit fd=" << client->fd << std::endl;
+    }
+}
+
+bool TcpJsonlServer::enqueue_response(
+    const std::shared_ptr<ClientConnection>& client,
+    ServerResponse response,
+    bool count_limit
+) {
+    if (!client || client->closed.load()) {
+        return false;
+    }
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lk(client->mu);
+        if (count_limit &&
+            client->responses.size() >= static_cast<size_t>(response_queue_limit_)) {
+            client->closed.store(true);
+            return false;
+        }
+        client->responses.push_back(std::move(response));
+        size = client->responses.size();
+    }
+    client->cv.notify_one();
+    if (debug_queue_enabled()) {
+        std::cerr << "[SERVER_QUEUE] push"
+                  << " fd=" << client->fd
+                  << " size=" << size
+                  << std::endl;
+    }
+    return true;
 }
 
 bool TcpJsonlServer::write_json_line(int fd, const std::string& json) {
@@ -395,6 +621,10 @@ bool TcpJsonlServer::write_json_line(int fd, const std::string& json) {
 
 bool TcpJsonlServer::debug_enabled() const {
     return env_flag("LLM_DEBUG_SERVER");
+}
+
+bool TcpJsonlServer::debug_queue_enabled() const {
+    return env_flag("LLM_DEBUG_SERVER_QUEUE");
 }
 
 } // namespace llm_engine

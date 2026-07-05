@@ -115,6 +115,11 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"cached_prefix_tokens\":" << m.cached_prefix_tokens
        << ",\"cached_prefix_blocks\":" << m.cached_prefix_blocks
        << ",\"computed_prefill_tokens\":" << m.computed_prefill_tokens
+       << ",\"prefill_chunks\":" << m.prefill_chunks
+       << ",\"real_batch_prefill_chunks\":" << m.real_batch_prefill_chunks
+       << ",\"token_loop_prefill_chunks\":" << m.token_loop_prefill_chunks
+       << ",\"batch_prefill_fallbacks\":" << m.batch_prefill_fallbacks
+       << ",\"batch_prefill_compare_mismatches\":" << m.batch_prefill_compare_mismatches
        << ",\"kv_total_blocks\":" << m.kv_total_blocks
        << ",\"kv_free_blocks\":" << m.kv_free_blocks
        << ",\"kv_active_blocks\":" << m.kv_active_blocks
@@ -125,10 +130,20 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"paged_attention_compare_warnings\":" << m.paged_attention_compare_warnings
        << ",\"queue_wait_ms\":" << m.queue_wait_ms
        << ",\"prefill_ms\":" << m.prefill_ms
+       << ",\"batch_prefill_ms\":" << m.batch_prefill_ms
+       << ",\"token_loop_prefill_ms\":" << m.token_loop_prefill_ms
        << ",\"decode_ms\":" << m.decode_ms
+       << ",\"sampling_ms\":" << m.sampling_ms
        << ",\"total_ms\":" << m.total_ms
        << ",\"first_token_ms\":" << m.first_token_ms
        << ",\"tokens_per_second\":" << m.tokens_per_second
+       << ",\"sampling_enabled\":" << (m.sampling_enabled ? "true" : "false")
+       << ",\"temperature\":" << m.temperature
+       << ",\"top_k\":" << m.top_k
+       << ",\"top_p\":" << m.top_p
+       << ",\"seed\":" << m.seed
+       << ",\"sampled_tokens\":" << m.sampled_tokens
+       << ",\"greedy_tokens\":" << m.greedy_tokens
        << ",\"final_status\":\"" << json_escape(m.final_status) << "\""
        << ",\"error_message\":\"" << json_escape(m.error_message) << "\""
        << '}';

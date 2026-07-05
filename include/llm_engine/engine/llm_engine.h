@@ -4,11 +4,13 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "llm_engine/cache/prefix_cache.h"
+#include "llm_engine/engine/sampling.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/memory/kv_cache_manager.h"
 #include "llm_engine/metrics/metrics.h"
@@ -19,14 +21,6 @@ class QwenModel;
 
 using RequestId = uint64_t;
 using TokenCallback = std::function<bool(int token_id)>;
-
-struct SamplingParams {
-    int max_new_tokens = 512;
-    float temperature = 0.0f;
-    int top_k = 0;
-    float top_p = 1.0f;
-    bool greedy = true;
-};
 
 enum class RequestStatus {
     WAITING,
@@ -62,6 +56,7 @@ struct RequestState {
     uint64_t finish_time_us = 0;
     bool first_token_emitted = false;
     bool metrics_emitted = false;
+    std::mt19937_64 rng;
 };
 
 class LLMEngine {
@@ -116,6 +111,8 @@ private:
     void finish_request(RequestState& request);
     void emit_metrics_once(RequestState& request);
     void mark_first_token(RequestState& request);
+    void init_request_sampling(RequestState& request);
+    bool request_stop_token(const RequestState& request, int token_id) const;
     bool is_terminal(RequestStatus status) const;
     const char* request_status_name(RequestStatus status) const;
     void debug_log_submit(const RequestState& request) const;

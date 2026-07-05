@@ -24,6 +24,11 @@ struct RequestMetrics {
     int cached_prefix_tokens = 0;
     int cached_prefix_blocks = 0;
     int computed_prefill_tokens = 0;
+    int prefill_chunks = 0;
+    int real_batch_prefill_chunks = 0;
+    int token_loop_prefill_chunks = 0;
+    int batch_prefill_fallbacks = 0;
+    int batch_prefill_compare_mismatches = 0;
 
     int kv_total_blocks = 0;
     int kv_free_blocks = 0;
@@ -37,10 +42,21 @@ struct RequestMetrics {
 
     double queue_wait_ms = 0.0;
     double prefill_ms = 0.0;
+    double batch_prefill_ms = 0.0;
+    double token_loop_prefill_ms = 0.0;
     double decode_ms = 0.0;
+    double sampling_ms = 0.0;
     double total_ms = 0.0;
     double first_token_ms = 0.0;
     double tokens_per_second = 0.0;
+
+    bool sampling_enabled = false;
+    float temperature = 0.0f;
+    int top_k = 0;
+    float top_p = 1.0f;
+    uint64_t seed = 0;
+    int sampled_tokens = 0;
+    int greedy_tokens = 0;
 
     std::string final_status;
     std::string error_message;

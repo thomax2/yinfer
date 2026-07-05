@@ -7,10 +7,12 @@
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
+#include "llm_engine/engine/sampling.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/runtime/thread_pool.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include <memory>
+#include <random>
 #include <vector>
 #include <string>
 #include <functional>
@@ -86,6 +88,17 @@ public:
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 
+
+    struct PrefillChunkStats {
+        bool real_batch_used = false;
+        bool token_loop_used = false;
+        bool fallback = false;
+        bool compare_mismatch = false;
+        double batch_ms = 0.0;
+        double token_loop_ms = 0.0;
+    };
+
+    PrefillChunkStats last_prefill_chunk_stats;
     
     // 【新增】：提供一个手动清空记忆的接口
     void clear_history() {
@@ -146,6 +159,22 @@ public:
         PrefixCache* prefix_cache
     );
 
+    int decode_one_for_sequence_sampled(
+        SequenceState& seq,
+        int input_token,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache,
+        const SamplingParams& sampling,
+        std::mt19937_64& rng,
+        SamplingRuntimeStats* stats
+    );
+
+    int sample_next_token_from_last_logits(
+        const SamplingParams& sampling,
+        std::mt19937_64& rng,
+        SamplingRuntimeStats* stats
+    );
+
 private:
     // 内部辅助函数：分配固定内存并绑定给 Tensor
     void allocate_tensor(Tensor& t, const std::vector<int>& shape, DataType dtype);
@@ -174,6 +203,8 @@ private:
     };
 
     ForwardDebugResult forward_debug_last_result;
+    std::vector<fp16_t> last_batch_norm_out_;
+    bool last_batch_norm_out_valid_ = false;
 };
 
 } // namespace llm_engine
