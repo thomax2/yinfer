@@ -356,6 +356,7 @@ void EngineService::refresh_request_status(RequestId id) {
         snapshot.error_message = request->error_message;
         snapshot.token_count = request->token_count;
         snapshot.num_generated_tokens = request->num_generated_tokens;
+        snapshot.metrics = request->metrics;
     }
 
     {

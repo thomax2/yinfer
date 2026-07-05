@@ -9,8 +9,10 @@
 #include <thread>
 #include <array>
 #include <atomic>
+#include <unordered_set>
 #include "llm_engine/engine/llm_engine.h"
 #include "llm_engine/engine/engine_service.h"
+#include "llm_engine/server/http_sse_server.h"
 #include "llm_engine/server/tcp_jsonl_server.h"
 #include "tiktoken/encoding.h"
 
@@ -64,6 +66,14 @@ std::vector<int> real_encode(const std::string& text) {
 }
 
 // 真实的 Decode：将模型输出的单个 Token ID 解码为人类语言
+std::vector<int> encode_chatml_prompt(const std::string& prompt) {
+    std::unordered_set<std::string> allowed_special_tokens;
+    allowed_special_tokens.insert("<|im_start|>");
+    allowed_special_tokens.insert("<|im_end|>");
+    std::unordered_set<std::string> disallowed_special_tokens;
+    return tokenizer->encode(prompt, allowed_special_tokens, disallowed_special_tokens);
+}
+
 std::string real_decode(int token_id) {
     // decode 接口通常接收一个 vector
     std::vector<int> tokens = {token_id};
@@ -213,13 +223,29 @@ int main(int argc, const char** argv) {
 
     bool use_service = main_env_flag("LLM_ENABLE_SERVICE");
     bool use_tcp_server = main_env_flag("LLM_ENABLE_TCP_SERVER");
+    bool use_http_server = main_env_flag("LLM_ENABLE_HTTP_SERVER");
+    if (use_tcp_server && use_http_server) {
+        std::cerr << "[SERVER] cannot enable both LLM_ENABLE_TCP_SERVER=1 and LLM_ENABLE_HTTP_SERVER=1"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
     if (use_tcp_server && !use_service) {
         std::cerr << "[SERVER] LLM_ENABLE_TCP_SERVER=1 requires LLM_ENABLE_SERVICE=1"
                   << std::endl;
         return EXIT_FAILURE;
     }
+    if (use_http_server && !use_service) {
+        std::cerr << "[HTTP] LLM_ENABLE_HTTP_SERVER=1 requires LLM_ENABLE_SERVICE=1"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
     if (use_tcp_server && !engine.scheduler_enabled()) {
         std::cerr << "[SERVER] LLM_ENABLE_TCP_SERVER=1 requires LLM_ENABLE_SCHEDULER=1"
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (use_http_server && !engine.scheduler_enabled()) {
+        std::cerr << "[HTTP] LLM_ENABLE_HTTP_SERVER=1 requires LLM_ENABLE_SCHEDULER=1"
                   << std::endl;
         return EXIT_FAILURE;
     }
@@ -235,6 +261,19 @@ int main(int argc, const char** argv) {
     }
 
     int max_new_tokens = main_env_int("LLM_MAX_NEW_TOKENS", 512);
+    if (use_http_server) {
+        std::string host = main_env_string("LLM_HTTP_HOST", "0.0.0.0");
+        int port = main_env_int("LLM_HTTP_PORT", 8000);
+        HttpSseServer server(
+            *service,
+            [](const std::string& text) { return real_encode(text); },
+            [](const std::string& prompt) { return encode_chatml_prompt(prompt); },
+            [](int token_id) { return real_decode(token_id); },
+            max_new_tokens);
+        bool ok = server.run_forever(host, port);
+        service->stop();
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (use_tcp_server) {
         std::string host = main_env_string("LLM_SERVER_HOST", "0.0.0.0");
         int port = main_env_int("LLM_SERVER_PORT", 8080);

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "llm_engine/engine/llm_engine.h"
+#include "llm_engine/metrics/metrics.h"
 
 namespace llm_engine {
 
@@ -23,6 +24,7 @@ struct EngineRequestSnapshot {
     std::string error_message;
     int token_count = 0;
     int num_generated_tokens = 0;
+    RequestMetrics metrics;
 };
 
 class EngineService {
