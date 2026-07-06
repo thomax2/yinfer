@@ -660,22 +660,33 @@ bool LLMEngine::step_once_continuous() {
         did_work = run_decode_batch_step() || did_work;
         cleanup_terminal_requests_v2();
         activate_decode_requests();
-        if (!cont_batch_prefill_after_decode_) {
+        bool can_prefill_to_fill_decode_batch =
+            !prefill_queue_.empty() &&
+            static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
+        if (!cont_batch_prefill_after_decode_ && !can_prefill_to_fill_decode_batch) {
             return did_work;
         }
     }
 
     int prefill_steps = 0;
     const int max_prefill_steps = std::max(1, cont_batch_max_prefill_chunks_per_step_);
+    bool can_prefill_to_fill_decode_batch =
+        !active_decode_requests_.empty() &&
+        static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
     bool may_prefill = cont_batch_prefill_after_decode_ ||
                        active_decode_requests_.empty() ||
-                       cont_batch_prefill_when_decode_empty_;
+                       cont_batch_prefill_when_decode_empty_ ||
+                       can_prefill_to_fill_decode_batch;
     while (may_prefill &&
            prefill_steps < max_prefill_steps &&
            !prefill_queue_.empty()) {
+        can_prefill_to_fill_decode_batch =
+            !active_decode_requests_.empty() &&
+            static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
         if (!active_decode_requests_.empty() &&
             cont_batch_decode_first_ &&
-            !cont_batch_prefill_after_decode_) {
+            !cont_batch_prefill_after_decode_ &&
+            !can_prefill_to_fill_decode_batch) {
             for (RequestId id : prefill_queue_) {
                 auto it = requests_.find(id);
                 if (it != requests_.end() && !is_terminal(it->second.status)) {
@@ -691,9 +702,13 @@ bool LLMEngine::step_once_continuous() {
         prefill_steps++;
         cleanup_terminal_requests_v2();
         activate_decode_requests();
+        can_prefill_to_fill_decode_batch =
+            !active_decode_requests_.empty() &&
+            static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
         may_prefill = cont_batch_prefill_after_decode_ ||
                       active_decode_requests_.empty() ||
-                      cont_batch_prefill_when_decode_empty_;
+                      cont_batch_prefill_when_decode_empty_ ||
+                      can_prefill_to_fill_decode_batch;
     }
 
     if (!cont_batch_decode_first_ && !active_decode_requests_.empty()) {
