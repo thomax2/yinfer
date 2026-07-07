@@ -46,6 +46,14 @@ int env_int(const char* name, int default_value) {
     return static_cast<int>(x);
 }
 
+std::string env_string(const char* name, const std::string& default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+        return default_value;
+    }
+    return std::string(v);
+}
+
 uint64_t env_u64(const char* name, uint64_t default_value) {
     const char* v = std::getenv(name);
     if (!v || !*v) return default_value;
@@ -75,12 +83,46 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
         env_int("LLM_CONT_BATCH_MAX_PREFILL_CHUNKS_PER_STEP", 1);
     cont_batch_conservative_executor_ =
         env_flag_default("LLM_CONT_BATCH_CONSERVATIVE_EXECUTOR", true);
+    bool requested_prefill_batching = env_flag("LLM_ENABLE_PREFILL_BATCHING");
+    prefill_batching_enabled_ = continuous_batching_enabled_ && requested_prefill_batching;
+    prefill_microbatch_max_requests_ =
+        env_int("LLM_PREFILL_MICROBATCH_MAX_REQUESTS", 4);
+    prefill_microbatch_chunk_size_ =
+        env_int("LLM_PREFILL_MICROBATCH_CHUNK_SIZE", env_int("LLM_PREFILL_CHUNK_SIZE", 8));
+    prefill_microbatch_min_requests_ =
+        env_int("LLM_PREFILL_MICROBATCH_MIN_REQUESTS", 2);
+    prefill_microbatch_allow_tail_ =
+        env_flag_default("LLM_PREFILL_MICROBATCH_ALLOW_TAIL", true);
+    prefill_microbatch_tail_max_wait_steps_ =
+        env_int("LLM_PREFILL_MICROBATCH_TAIL_MAX_WAIT_STEPS", 2);
+    prefill_microbatch_scan_limit_ =
+        env_int("LLM_PREFILL_MICROBATCH_SCAN_LIMIT", 32);
+    prefill_microbatch_after_decode_ =
+        env_flag("LLM_PREFILL_MICROBATCH_AFTER_DECODE");
+    prefill_microbatch_when_decode_empty_ =
+        env_flag_default("LLM_PREFILL_MICROBATCH_WHEN_DECODE_EMPTY", true);
+    prefill_microbatch_executor_ =
+        env_string("LLM_PREFILL_MICROBATCH_EXECUTOR", "conservative");
+    prefill_microbatch_strict_ =
+        env_flag("LLM_PREFILL_MICROBATCH_STRICT");
     prefill_step_tokens_ = env_int("LLM_PREFILL_STEP_TOKENS", 1);
     chunked_prefill_enabled_ = env_flag("LLM_ENABLE_CHUNKED_PREFILL");
     chunked_prefill_strict_ = env_flag("LLM_CHUNKED_PREFILL_STRICT");
     prefill_chunk_size_ = env_int("LLM_PREFILL_CHUNK_SIZE", prefill_step_tokens_);
     if (prefill_chunk_size_ <= 0) {
         prefill_chunk_size_ = 1;
+    }
+    if (prefill_microbatch_chunk_size_ <= 0) {
+        prefill_microbatch_chunk_size_ = 1;
+    }
+    if (prefill_microbatch_max_requests_ <= 0) {
+        prefill_microbatch_max_requests_ = 1;
+    }
+    if (prefill_microbatch_min_requests_ <= 0) {
+        prefill_microbatch_min_requests_ = 1;
+    }
+    if (prefill_microbatch_scan_limit_ <= 0) {
+        prefill_microbatch_scan_limit_ = 1;
     }
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] enabled=" << (scheduler_enabled_ ? 1 : 0)
@@ -98,6 +140,24 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
                   << " prefill_after_decode=" << (cont_batch_prefill_after_decode_ ? 1 : 0)
                   << " max_prefill_chunks_per_step=" << cont_batch_max_prefill_chunks_per_step_
                   << " conservative_executor=" << (cont_batch_conservative_executor_ ? 1 : 0)
+                  << std::endl;
+    }
+    if (requested_prefill_batching && !prefill_batching_enabled_ && debug_prefill_batch_enabled()) {
+        std::cerr << "[PREFILL_BATCH] ignored because continuous batching is disabled"
+                  << std::endl;
+    }
+    if (debug_prefill_batch_enabled()) {
+        std::cerr << "[PREFILL_BATCH] enabled=" << (prefill_batching_enabled_ ? 1 : 0)
+                  << " max_requests=" << prefill_microbatch_max_requests_
+                  << " chunk_size=" << prefill_microbatch_chunk_size_
+                  << " min_requests=" << prefill_microbatch_min_requests_
+                  << " allow_tail=" << (prefill_microbatch_allow_tail_ ? 1 : 0)
+                  << " tail_max_wait_steps=" << prefill_microbatch_tail_max_wait_steps_
+                  << " scan_limit=" << prefill_microbatch_scan_limit_
+                  << " after_decode=" << (prefill_microbatch_after_decode_ ? 1 : 0)
+                  << " when_decode_empty=" << (prefill_microbatch_when_decode_empty_ ? 1 : 0)
+                  << " executor=" << prefill_microbatch_executor_
+                  << " strict=" << (prefill_microbatch_strict_ ? 1 : 0)
                   << std::endl;
     }
 
@@ -173,6 +233,9 @@ RequestId LLMEngine::submit(
     request.scheduler_v2 = continuous_batching_enabled_;
     request.queued_waiting = continuous_batching_enabled_;
     request.metrics.continuous_batching_enabled = continuous_batching_enabled_;
+    request.metrics.prefill_batching_enabled = prefill_batching_enabled_;
+    request.metrics.prefill_microbatch_executor =
+        prefill_batching_enabled_ ? prefill_microbatch_executor_ : "none";
     init_request_sampling(request);
 
     auto inserted = requests_.emplace(id, std::move(request));
@@ -307,6 +370,9 @@ RequestId LLMEngine::submit_async(
     request.scheduler_v2 = continuous_batching_enabled_;
     request.queued_waiting = continuous_batching_enabled_;
     request.metrics.continuous_batching_enabled = continuous_batching_enabled_;
+    request.metrics.prefill_batching_enabled = prefill_batching_enabled_;
+    request.metrics.prefill_microbatch_executor =
+        prefill_batching_enabled_ ? prefill_microbatch_executor_ : "none";
     init_request_sampling(request);
 
     requests_.emplace(id, std::move(request));
@@ -560,6 +626,14 @@ bool LLMEngine::debug_cont_batch_verbose_enabled() const {
     return env_flag("LLM_CONT_BATCH_DEBUG_VERBOSE");
 }
 
+bool LLMEngine::debug_prefill_batch_enabled() const {
+    return env_flag("LLM_PREFILL_BATCH_DEBUG");
+}
+
+bool LLMEngine::debug_prefill_batch_verbose_enabled() const {
+    return env_flag("LLM_PREFILL_BATCH_DEBUG_VERBOSE");
+}
+
 bool LLMEngine::debug_chunked_prefill_enabled() const {
     return env_flag("LLM_DEBUG_CHUNKED_PREFILL");
 }
@@ -663,19 +737,25 @@ bool LLMEngine::step_once_continuous() {
         bool can_prefill_to_fill_decode_batch =
             !prefill_queue_.empty() &&
             static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
-        if (!cont_batch_prefill_after_decode_ && !can_prefill_to_fill_decode_batch) {
+        bool allow_prefill_after_decode = cont_batch_prefill_after_decode_ ||
+            (prefill_batching_enabled_ && prefill_microbatch_after_decode_);
+        if (!allow_prefill_after_decode && !can_prefill_to_fill_decode_batch) {
             return did_work;
         }
     }
 
     int prefill_steps = 0;
     const int max_prefill_steps = std::max(1, cont_batch_max_prefill_chunks_per_step_);
+    bool allow_prefill_after_decode = cont_batch_prefill_after_decode_ ||
+        (prefill_batching_enabled_ && prefill_microbatch_after_decode_);
+    bool allow_prefill_when_decode_empty = prefill_batching_enabled_
+        ? prefill_microbatch_when_decode_empty_
+        : cont_batch_prefill_when_decode_empty_;
     bool can_prefill_to_fill_decode_batch =
         !active_decode_requests_.empty() &&
         static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
-    bool may_prefill = cont_batch_prefill_after_decode_ ||
-                       active_decode_requests_.empty() ||
-                       cont_batch_prefill_when_decode_empty_ ||
+    bool may_prefill = allow_prefill_after_decode ||
+                       (active_decode_requests_.empty() && allow_prefill_when_decode_empty) ||
                        can_prefill_to_fill_decode_batch;
     while (may_prefill &&
            prefill_steps < max_prefill_steps &&
@@ -685,7 +765,7 @@ bool LLMEngine::step_once_continuous() {
             static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
         if (!active_decode_requests_.empty() &&
             cont_batch_decode_first_ &&
-            !cont_batch_prefill_after_decode_ &&
+            !allow_prefill_after_decode &&
             !can_prefill_to_fill_decode_batch) {
             for (RequestId id : prefill_queue_) {
                 auto it = requests_.find(id);
@@ -695,7 +775,10 @@ bool LLMEngine::step_once_continuous() {
             }
             break;
         }
-        if (!run_prefill_chunk_step()) {
+        bool prefill_work = prefill_batching_enabled_
+            ? run_prefill_microbatch_step()
+            : run_prefill_chunk_step();
+        if (!prefill_work) {
             break;
         }
         did_work = true;
@@ -705,9 +788,8 @@ bool LLMEngine::step_once_continuous() {
         can_prefill_to_fill_decode_batch =
             !active_decode_requests_.empty() &&
             static_cast<int>(active_decode_requests_.size()) < max_active_decode_requests_;
-        may_prefill = cont_batch_prefill_after_decode_ ||
-                      active_decode_requests_.empty() ||
-                      cont_batch_prefill_when_decode_empty_ ||
+        may_prefill = allow_prefill_after_decode ||
+                      (active_decode_requests_.empty() && allow_prefill_when_decode_empty) ||
                       can_prefill_to_fill_decode_batch;
     }
 
@@ -880,6 +962,378 @@ bool LLMEngine::run_prefill_chunk_step() {
     return false;
 }
 
+bool LLMEngine::run_prefill_microbatch_step() {
+    PrefillMicroBatch batch = build_prefill_microbatch();
+    if (batch.items.empty()) {
+        return false;
+    }
+
+    if (prefill_microbatch_executor_ == "true_batch") {
+        return execute_prefill_microbatch_true_batch(batch);
+    }
+    return execute_prefill_microbatch_conservative(batch);
+}
+
+PrefillMicroBatch LLMEngine::build_prefill_microbatch() {
+    PrefillMicroBatch batch;
+    batch.target_chunk_size = prefill_microbatch_chunk_size_;
+    if (prefill_queue_.empty()) {
+        return batch;
+    }
+
+    const size_t queue_before = prefill_queue_.size();
+    std::vector<PrefillChunkItem> full_items;
+    std::vector<PrefillChunkItem> tail_items;
+    std::deque<RequestId> deferred;
+    int scanned = 0;
+
+    while (!prefill_queue_.empty() &&
+           scanned < prefill_microbatch_scan_limit_) {
+        RequestId id = prefill_queue_.front();
+        prefill_queue_.pop_front();
+        scanned++;
+
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+        RequestState& request = it->second;
+        request.queued_prefill = false;
+        request.prefill_blocked_for_batch = false;
+
+        if (is_terminal(request.status)) {
+            continue;
+        }
+        if (request.status != RequestStatus::RUNNING_PREFILL) {
+            if (request.status == RequestStatus::RUNNING_DECODE) {
+                add_to_decode_ready_queue(request);
+            }
+            continue;
+        }
+
+        PrefillChunkItem item;
+        if (!make_prefill_chunk_item(request, &item)) {
+            if (!request_has_prefill_remaining(request) && request.next_token >= 0) {
+                transition_prefill_complete(request);
+                if (request.status == RequestStatus::RUNNING_DECODE) {
+                    add_to_decode_ready_queue(request);
+                }
+            }
+            continue;
+        }
+
+        if (debug_prefill_batch_verbose_enabled()) {
+            std::cerr << "[PREFILL_BATCH] scan"
+                      << " request=" << request.id
+                      << " status=" << request_status_name(request.status)
+                      << " cursor=" << request.prompt_cursor
+                      << " remaining="
+                      << (static_cast<int>(request.prompt_tokens.size()) - request.prompt_cursor)
+                      << " selected=1"
+                      << " tail=" << (item.is_tail ? 1 : 0)
+                      << std::endl;
+        }
+
+        if (item.is_tail) {
+            if (!prefill_microbatch_allow_tail_) {
+                request.prefill_tail_wait_steps++;
+                request.metrics.prefill_tail_wait_steps++;
+                request.prefill_blocked_for_batch = true;
+                deferred.push_back(id);
+                if (debug_prefill_batch_enabled()) {
+                    std::cerr << "[PREFILL_BATCH] tail_wait"
+                              << " request=" << id
+                              << " wait_steps=" << request.prefill_tail_wait_steps
+                              << std::endl;
+                }
+                continue;
+            }
+            tail_items.push_back(item);
+        } else {
+            full_items.push_back(item);
+        }
+    }
+
+    auto selected_contains = [](const std::vector<PrefillChunkItem>& items, RequestId id) {
+        for (const PrefillChunkItem& item : items) {
+            if (item.request_id == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const PrefillChunkItem& item : full_items) {
+        if (static_cast<int>(batch.items.size()) >= prefill_microbatch_max_requests_) {
+            break;
+        }
+        batch.items.push_back(item);
+    }
+    if (static_cast<int>(batch.items.size()) < prefill_microbatch_min_requests_ ||
+        batch.items.empty()) {
+        for (const PrefillChunkItem& item : tail_items) {
+            if (static_cast<int>(batch.items.size()) >= prefill_microbatch_max_requests_) {
+                break;
+            }
+            batch.items.push_back(item);
+        }
+    }
+
+    std::vector<PrefillChunkItem> selected = batch.items;
+    for (const PrefillChunkItem& item : full_items) {
+        if (!selected_contains(selected, item.request_id)) {
+            deferred.push_back(item.request_id);
+        }
+    }
+    for (const PrefillChunkItem& item : tail_items) {
+        if (!selected_contains(selected, item.request_id)) {
+            auto it = requests_.find(item.request_id);
+            if (it != requests_.end()) {
+                it->second.prefill_tail_wait_steps++;
+                it->second.metrics.prefill_tail_wait_steps++;
+            }
+            deferred.push_back(item.request_id);
+        }
+    }
+    while (!deferred.empty()) {
+        RequestId id = deferred.front();
+        deferred.pop_front();
+        auto it = requests_.find(id);
+        if (it != requests_.end() &&
+            it->second.status == RequestStatus::RUNNING_PREFILL &&
+            !is_terminal(it->second.status)) {
+            it->second.prefill_requeue_count++;
+            it->second.metrics.prefill_requeue_count++;
+            add_to_prefill_queue(it->second);
+        }
+    }
+
+    for (const PrefillChunkItem& item : batch.items) {
+        if (item.is_tail) {
+            batch.tail_chunks++;
+            batch.contains_tail = true;
+        } else {
+            batch.full_chunks++;
+        }
+    }
+
+    if (debug_prefill_batch_enabled()) {
+        std::cerr << "[PREFILL_BATCH] build"
+                  << " size=" << batch.items.size()
+                  << " full=" << batch.full_chunks
+                  << " tail=" << batch.tail_chunks
+                  << " queue_before=" << queue_before
+                  << " queue_after=" << prefill_queue_.size()
+                  << std::endl;
+    }
+    return batch;
+}
+
+bool LLMEngine::execute_prefill_microbatch_true_batch(const PrefillMicroBatch& batch) {
+    if (prefill_microbatch_strict_) {
+        for (const PrefillChunkItem& item : batch.items) {
+            auto it = requests_.find(item.request_id);
+            if (it != requests_.end() && !is_terminal(it->second.status)) {
+                fail_request(it->second, "true prefill microbatch executor is not implemented");
+            }
+        }
+        return !batch.items.empty();
+    }
+    if (debug_prefill_batch_enabled()) {
+        std::cerr << "[PREFILL_BATCH] true_batch not implemented, fallback=conservative"
+                  << std::endl;
+    }
+    return execute_prefill_microbatch_conservative(batch);
+}
+
+bool LLMEngine::execute_prefill_microbatch_conservative(const PrefillMicroBatch& batch) {
+    bool did_work = false;
+    for (const PrefillChunkItem& item : batch.items) {
+        auto it = requests_.find(item.request_id);
+        if (it == requests_.end()) {
+            continue;
+        }
+        RequestState& request = it->second;
+        request.queued_prefill = false;
+        if (is_terminal(request.status) || request.status != RequestStatus::RUNNING_PREFILL) {
+            continue;
+        }
+        if (request.prompt_cursor != item.prompt_begin) {
+            fail_request(request, "prefill microbatch cursor changed before execution");
+            continue;
+        }
+
+        SequenceState& seq = get_or_create_session(request.session_id);
+        if (seq.history_pos != item.seq_history_pos_begin) {
+            fail_request(request, "prefill microbatch sequence position mismatch");
+            continue;
+        }
+
+        if (debug_prefill_batch_enabled()) {
+            std::cerr << "[PREFILL_BATCH] item"
+                      << " request=" << item.request_id
+                      << " session=" << item.session_id
+                      << " begin=" << item.prompt_begin
+                      << " end=" << item.prompt_end
+                      << " tokens=" << item.token_count
+                      << " tail=" << (item.is_tail ? 1 : 0)
+                      << std::endl;
+        }
+
+        int next = -1;
+        {
+            ScopedTimer timer(&request.metrics.prefill_ms);
+            next = model_.prefill_chunk_for_sequence(
+                seq,
+                request.prompt_tokens,
+                item.prompt_begin,
+                item.prompt_end,
+                *kv_manager_,
+                prefix_cache_.get());
+        }
+        request.metrics.prefill_chunks++;
+        request.metrics.batch_prefill_ms += model_.last_prefill_chunk_stats.batch_ms;
+        request.metrics.token_loop_prefill_ms += model_.last_prefill_chunk_stats.token_loop_ms;
+        if (model_.last_prefill_chunk_stats.real_batch_used) {
+            request.metrics.real_batch_prefill_chunks++;
+        }
+        if (model_.last_prefill_chunk_stats.token_loop_used) {
+            request.metrics.token_loop_prefill_chunks++;
+        }
+        if (model_.last_prefill_chunk_stats.fallback) {
+            request.metrics.batch_prefill_fallbacks++;
+        }
+        if (model_.last_prefill_chunk_stats.compare_mismatch) {
+            request.metrics.batch_prefill_compare_mismatches++;
+        }
+
+        if (seq.status == SequenceStatus::FAILED) {
+            fail_request(request, seq.error_message.empty() ? "prefill failed" : seq.error_message);
+            continue;
+        }
+        if (next < 0) {
+            fail_request(request, "prefill forward failed");
+            continue;
+        }
+
+        request.next_token = next;
+        request.prompt_cursor = item.prompt_end;
+        request.metrics.computed_prefill_tokens += item.token_count;
+        request.metrics.continuous_batching_enabled = true;
+        request.metrics.scheduler_v2_steps++;
+        request.metrics.scheduler_v2_prefill_steps++;
+        request.metrics.prefill_chunk_steps++;
+        update_prefill_microbatch_metrics(request, batch, item);
+        did_work = true;
+
+        if (request.prompt_cursor >= static_cast<int>(request.prompt_tokens.size())) {
+            transition_prefill_complete(request);
+        }
+
+        if (request.status == RequestStatus::RUNNING_PREFILL) {
+            requeue_prefill_request(request.id);
+        } else if (request.status == RequestStatus::RUNNING_DECODE) {
+            add_to_decode_ready_queue(request);
+        } else if (is_terminal(request.status)) {
+            remove_request_from_all_v2_queues(request.id);
+        }
+
+        if (debug_prefill_batch_enabled()) {
+            std::cerr << "[PREFILL_BATCH] done"
+                      << " request=" << item.request_id
+                      << " cursor=" << request.prompt_cursor
+                      << " total=" << request.prompt_tokens.size()
+                      << " next="
+                      << (request.status == RequestStatus::RUNNING_DECODE ? "decode_ready" :
+                          request.status == RequestStatus::RUNNING_PREFILL ? "prefill" :
+                          request_status_name(request.status))
+                      << std::endl;
+        }
+    }
+    return did_work;
+}
+
+bool LLMEngine::make_prefill_chunk_item(RequestState& request, PrefillChunkItem* out) {
+    if (!out || request.status != RequestStatus::RUNNING_PREFILL) {
+        return false;
+    }
+    if (!request_has_prefill_remaining(request)) {
+        return false;
+    }
+    SequenceState& seq = get_or_create_session(request.session_id);
+    int begin = request.prompt_cursor;
+    int total = static_cast<int>(request.prompt_tokens.size());
+    int remaining = total - begin;
+    int token_count = std::min(prefill_microbatch_chunk_size_, remaining);
+    if (token_count <= 0) {
+        return false;
+    }
+    if (seq.history_pos + token_count > model_.config.max_seq_len) {
+        fail_request(request, "sequence length exceeded");
+        return false;
+    }
+
+    out->request_id = request.id;
+    out->session_id = request.session_id;
+    out->prompt_begin = begin;
+    out->prompt_end = begin + token_count;
+    out->token_count = token_count;
+    out->seq_history_pos_begin = seq.history_pos;
+    out->seq_history_pos_end = seq.history_pos + token_count;
+    out->is_tail = token_count < prefill_microbatch_chunk_size_;
+    return true;
+}
+
+void LLMEngine::update_prefill_microbatch_metrics(
+    RequestState& request,
+    const PrefillMicroBatch& batch,
+    const PrefillChunkItem& item
+) {
+    int batch_size = static_cast<int>(batch.items.size());
+    request.prefill_microbatch_steps++;
+    request.prefill_microbatch_size_sum += batch_size;
+    request.prefill_microbatch_size_max =
+        std::max(request.prefill_microbatch_size_max, batch_size);
+
+    request.metrics.prefill_batching_enabled = prefill_batching_enabled_;
+    request.metrics.prefill_microbatch_steps++;
+    request.metrics.prefill_microbatch_size_sum += batch_size;
+    request.metrics.prefill_microbatch_size_max =
+        std::max(request.metrics.prefill_microbatch_size_max, batch_size);
+    if (request.metrics.prefill_microbatch_steps > 0) {
+        request.metrics.prefill_microbatch_size_avg =
+            static_cast<double>(request.metrics.prefill_microbatch_size_sum) /
+            static_cast<double>(request.metrics.prefill_microbatch_steps);
+    }
+    request.metrics.prefill_microbatch_items_total += batch_size;
+    request.metrics.prefill_microbatch_tokens_total += item.token_count;
+    request.metrics.prefill_microbatch_executor = prefill_microbatch_executor_;
+
+    if (item.is_tail) {
+        request.prefill_tail_chunk_steps++;
+        request.metrics.prefill_tail_chunk_steps++;
+    } else {
+        request.prefill_full_chunk_steps++;
+        request.metrics.prefill_full_chunk_steps++;
+    }
+}
+
+void LLMEngine::requeue_prefill_request(RequestId id) {
+    auto it = requests_.find(id);
+    if (it == requests_.end()) {
+        return;
+    }
+    RequestState& request = it->second;
+    if (request.status == RequestStatus::RUNNING_PREFILL && !is_terminal(request.status)) {
+        add_to_prefill_queue(request);
+    }
+}
+
+bool LLMEngine::request_has_prefill_remaining(const RequestState& request) const {
+    return request.status == RequestStatus::RUNNING_PREFILL &&
+           request.prompt_cursor < static_cast<int>(request.prompt_tokens.size());
+}
+
 void LLMEngine::add_to_prefill_queue(RequestState& request) {
     if (request.queued_prefill || is_terminal(request.status)) {
         return;
@@ -1020,6 +1474,38 @@ void LLMEngine::schedule_next_request() {
     }
 }
 
+void LLMEngine::transition_prefill_complete(RequestState& request) {
+    if (request.prompt_cursor < static_cast<int>(request.prompt_tokens.size())) {
+        return;
+    }
+    if (request.next_token < 0) {
+        fail_request(request, "prefill produced no next token");
+        return;
+    }
+    if (sampling_enabled(request.sampling)) {
+        SamplingRuntimeStats sampling_stats;
+        int sampled = model_.sample_next_token_from_last_logits(
+            request.sampling,
+            request.rng,
+            &sampling_stats);
+        if (sampled >= 0) {
+            request.next_token = sampled;
+        }
+        request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
+        request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
+        request.metrics.sampling_ms += sampling_stats.sampling_ms;
+    } else {
+        request.metrics.greedy_tokens++;
+    }
+    request.status = RequestStatus::RUNNING_DECODE;
+    if (debug_scheduler_enabled()) {
+        std::cerr << "[SCHED] transition"
+                  << " id=" << request.id
+                  << " status=" << request_status_name(request.status)
+                  << std::endl;
+    }
+}
+
 void LLMEngine::step_prefill(RequestState& request) {
     if (!session_cache_enabled_) {
         run_legacy_request(request);
@@ -1104,32 +1590,7 @@ void LLMEngine::step_prefill(RequestState& request) {
     }
 
     if (request.prompt_cursor >= static_cast<int>(request.prompt_tokens.size())) {
-        if (request.next_token < 0) {
-            fail_request(request, "prefill produced no next token");
-            return;
-        }
-        if (sampling_enabled(request.sampling)) {
-            SamplingRuntimeStats sampling_stats;
-            int sampled = model_.sample_next_token_from_last_logits(
-                request.sampling,
-                request.rng,
-                &sampling_stats);
-            if (sampled >= 0) {
-                request.next_token = sampled;
-            }
-            request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
-            request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
-            request.metrics.sampling_ms += sampling_stats.sampling_ms;
-        } else {
-            request.metrics.greedy_tokens++;
-        }
-        request.status = RequestStatus::RUNNING_DECODE;
-        if (debug_scheduler_enabled()) {
-            std::cerr << "[SCHED] transition"
-                      << " id=" << request.id
-                      << " status=" << request_status_name(request.status)
-                      << std::endl;
-        }
+        transition_prefill_complete(request);
     }
 }
 
@@ -1461,6 +1922,17 @@ void LLMEngine::emit_metrics_once(RequestState& request) {
         request.metrics.decode_batch_size_avg =
             static_cast<double>(request.metrics.decode_batch_size_sum) /
             static_cast<double>(request.metrics.decode_batch_steps);
+    }
+    request.metrics.prefill_batching_enabled =
+        request.metrics.prefill_batching_enabled || prefill_batching_enabled_;
+    if (request.metrics.prefill_microbatch_steps > 0) {
+        request.metrics.prefill_microbatch_size_avg =
+            static_cast<double>(request.metrics.prefill_microbatch_size_sum) /
+            static_cast<double>(request.metrics.prefill_microbatch_steps);
+    }
+    if (request.metrics.prefill_batching_enabled &&
+        request.metrics.prefill_microbatch_executor == "none") {
+        request.metrics.prefill_microbatch_executor = prefill_microbatch_executor_;
     }
     if (request.scheduler_v2 && request.metrics.active_decode_batch_size_at_finish <= 0) {
         request.metrics.active_decode_batch_size_at_finish =

@@ -31,6 +31,25 @@ enum class RequestStatus {
     FAILED
 };
 
+struct PrefillChunkItem {
+    RequestId request_id = 0;
+    SessionId session_id = 0;
+    int prompt_begin = 0;
+    int prompt_end = 0;
+    int token_count = 0;
+    int seq_history_pos_begin = 0;
+    int seq_history_pos_end = 0;
+    bool is_tail = false;
+};
+
+struct PrefillMicroBatch {
+    std::vector<PrefillChunkItem> items;
+    int target_chunk_size = 0;
+    int full_chunks = 0;
+    int tail_chunks = 0;
+    bool contains_tail = false;
+};
+
 struct RequestState {
     RequestId id = 0;
     SessionId session_id = 0;
@@ -61,6 +80,14 @@ struct RequestState {
     bool queued_prefill = false;
     bool queued_decode_ready = false;
     bool active_decode = false;
+    int prefill_microbatch_steps = 0;
+    int prefill_microbatch_size_sum = 0;
+    int prefill_microbatch_size_max = 0;
+    int prefill_full_chunk_steps = 0;
+    int prefill_tail_chunk_steps = 0;
+    int prefill_tail_wait_steps = 0;
+    int prefill_requeue_count = 0;
+    bool prefill_blocked_for_batch = false;
     std::mt19937_64 rng;
 };
 
@@ -108,6 +135,8 @@ private:
     bool debug_scheduler_enabled() const;
     bool debug_cont_batch_enabled() const;
     bool debug_cont_batch_verbose_enabled() const;
+    bool debug_prefill_batch_enabled() const;
+    bool debug_prefill_batch_verbose_enabled() const;
     bool debug_chunked_prefill_enabled() const;
     void apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens);
     bool step_once_legacy();
@@ -116,6 +145,18 @@ private:
     void admit_waiting_requests_v2();
     bool run_decode_batch_step();
     bool run_prefill_chunk_step();
+    bool run_prefill_microbatch_step();
+    PrefillMicroBatch build_prefill_microbatch();
+    bool execute_prefill_microbatch_conservative(const PrefillMicroBatch& batch);
+    bool execute_prefill_microbatch_true_batch(const PrefillMicroBatch& batch);
+    bool make_prefill_chunk_item(RequestState& request, PrefillChunkItem* out);
+    void update_prefill_microbatch_metrics(
+        RequestState& request,
+        const PrefillMicroBatch& batch,
+        const PrefillChunkItem& item);
+    void requeue_prefill_request(RequestId id);
+    bool request_has_prefill_remaining(const RequestState& request) const;
+    void transition_prefill_complete(RequestState& request);
     void add_to_prefill_queue(RequestState& request);
     void add_to_decode_ready_queue(RequestState& request);
     void activate_decode_requests();
@@ -151,6 +192,17 @@ private:
     bool cont_batch_prefill_when_decode_empty_ = true;
     bool cont_batch_prefill_after_decode_ = false;
     bool cont_batch_conservative_executor_ = true;
+    bool prefill_batching_enabled_ = false;
+    int prefill_microbatch_max_requests_ = 4;
+    int prefill_microbatch_chunk_size_ = 8;
+    int prefill_microbatch_min_requests_ = 2;
+    bool prefill_microbatch_allow_tail_ = true;
+    int prefill_microbatch_tail_max_wait_steps_ = 2;
+    int prefill_microbatch_scan_limit_ = 32;
+    bool prefill_microbatch_after_decode_ = false;
+    bool prefill_microbatch_when_decode_empty_ = true;
+    std::string prefill_microbatch_executor_ = "conservative";
+    bool prefill_microbatch_strict_ = false;
     int max_active_decode_requests_ = 8;
     int cont_batch_max_prefill_chunks_per_step_ = 1;
     int prefill_step_tokens_ = 1;

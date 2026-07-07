@@ -50,6 +50,17 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     scheduler_v2_decode_steps_total_ += metrics.scheduler_v2_decode_steps;
     scheduler_v2_prefill_steps_total_ += metrics.scheduler_v2_prefill_steps;
     active_decode_batch_size_ = metrics.active_decode_batch_size_at_finish;
+    if (metrics.prefill_batching_enabled) {
+        prefill_batching_enabled_ = true;
+    }
+    prefill_microbatch_steps_total_ += metrics.prefill_microbatch_steps;
+    prefill_microbatch_size_sum_ += metrics.prefill_microbatch_size_sum;
+    if (metrics.prefill_microbatch_size_max > prefill_microbatch_size_max_) {
+        prefill_microbatch_size_max_ = metrics.prefill_microbatch_size_max;
+    }
+    prefill_full_chunk_steps_total_ += metrics.prefill_full_chunk_steps;
+    prefill_tail_chunk_steps_total_ += metrics.prefill_tail_chunk_steps;
+    prefill_microbatch_tokens_total_ += metrics.prefill_microbatch_tokens_total;
     if (metrics.tokens_per_second > 0.0) {
         tokens_per_second_sum_ += metrics.tokens_per_second;
     }
@@ -112,6 +123,10 @@ std::string ServerMetrics::to_json() const {
         ? static_cast<double>(decode_batch_size_sum_) /
               static_cast<double>(decode_batch_steps_total_)
         : 0.0;
+    double avg_prefill_microbatch = prefill_microbatch_steps_total_ > 0
+        ? static_cast<double>(prefill_microbatch_size_sum_) /
+              static_cast<double>(prefill_microbatch_steps_total_)
+        : 0.0;
     std::ostringstream os;
     os << '{'
        << "\"requests_total\":" << requests_total_
@@ -138,6 +153,14 @@ std::string ServerMetrics::to_json() const {
        << ",\"active_decode_batch_size\":" << active_decode_batch_size_
        << ",\"scheduler_v2_decode_steps\":" << scheduler_v2_decode_steps_total_
        << ",\"scheduler_v2_prefill_steps\":" << scheduler_v2_prefill_steps_total_
+       << ",\"prefill_batching_enabled\":" << (prefill_batching_enabled_ ? "true" : "false")
+       << ",\"prefill_microbatch_steps_total\":" << prefill_microbatch_steps_total_
+       << ",\"prefill_microbatch_size_sum\":" << prefill_microbatch_size_sum_
+       << ",\"prefill_microbatch_size_max\":" << prefill_microbatch_size_max_
+       << ",\"avg_prefill_microbatch_size\":" << avg_prefill_microbatch
+       << ",\"prefill_full_chunk_steps_total\":" << prefill_full_chunk_steps_total_
+       << ",\"prefill_tail_chunk_steps_total\":" << prefill_tail_chunk_steps_total_
+       << ",\"prefill_microbatch_tokens_total\":" << prefill_microbatch_tokens_total_
        << ",\"avg_tokens_per_second\":" << avg_tps
        << ",\"avg_first_token_ms\":" << avg_first
        << '}';

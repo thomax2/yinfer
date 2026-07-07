@@ -139,6 +139,18 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"scheduler_v2_decode_steps\":" << m.scheduler_v2_decode_steps
        << ",\"scheduler_v2_prefill_steps\":" << m.scheduler_v2_prefill_steps
        << ",\"active_decode_batch_size_at_finish\":" << m.active_decode_batch_size_at_finish
+       << ",\"prefill_batching_enabled\":" << (m.prefill_batching_enabled ? "true" : "false")
+       << ",\"prefill_microbatch_steps\":" << m.prefill_microbatch_steps
+       << ",\"prefill_microbatch_size_sum\":" << m.prefill_microbatch_size_sum
+       << ",\"prefill_microbatch_size_max\":" << m.prefill_microbatch_size_max
+       << ",\"prefill_microbatch_size_avg\":" << m.prefill_microbatch_size_avg
+       << ",\"prefill_full_chunk_steps\":" << m.prefill_full_chunk_steps
+       << ",\"prefill_tail_chunk_steps\":" << m.prefill_tail_chunk_steps
+       << ",\"prefill_tail_wait_steps\":" << m.prefill_tail_wait_steps
+       << ",\"prefill_requeue_count\":" << m.prefill_requeue_count
+       << ",\"prefill_microbatch_items_total\":" << m.prefill_microbatch_items_total
+       << ",\"prefill_microbatch_tokens_total\":" << m.prefill_microbatch_tokens_total
+       << ",\"prefill_microbatch_executor\":\"" << json_escape(m.prefill_microbatch_executor) << "\""
        << ",\"queue_wait_ms\":" << m.queue_wait_ms
        << ",\"prefill_ms\":" << m.prefill_ms
        << ",\"batch_prefill_ms\":" << m.batch_prefill_ms

@@ -52,6 +52,19 @@ struct RequestMetrics {
     int scheduler_v2_prefill_steps = 0;
     int active_decode_batch_size_at_finish = 0;
 
+    bool prefill_batching_enabled = false;
+    int prefill_microbatch_steps = 0;
+    int prefill_microbatch_size_sum = 0;
+    int prefill_microbatch_size_max = 0;
+    double prefill_microbatch_size_avg = 0.0;
+    int prefill_full_chunk_steps = 0;
+    int prefill_tail_chunk_steps = 0;
+    int prefill_tail_wait_steps = 0;
+    int prefill_requeue_count = 0;
+    int prefill_microbatch_items_total = 0;
+    int prefill_microbatch_tokens_total = 0;
+    std::string prefill_microbatch_executor = "none";
+
     double queue_wait_ms = 0.0;
     double prefill_ms = 0.0;
     double batch_prefill_ms = 0.0;

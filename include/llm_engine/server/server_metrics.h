@@ -49,6 +49,13 @@ private:
     int64_t scheduler_v2_decode_steps_total_ = 0;
     int64_t scheduler_v2_prefill_steps_total_ = 0;
     int active_decode_batch_size_ = 0;
+    bool prefill_batching_enabled_ = false;
+    int64_t prefill_microbatch_steps_total_ = 0;
+    int64_t prefill_microbatch_size_sum_ = 0;
+    int prefill_microbatch_size_max_ = 0;
+    int64_t prefill_full_chunk_steps_total_ = 0;
+    int64_t prefill_tail_chunk_steps_total_ = 0;
+    int64_t prefill_microbatch_tokens_total_ = 0;
     double tokens_per_second_sum_ = 0.0;
     double first_token_ms_sum_ = 0.0;
     int64_t latency_samples_ = 0;
