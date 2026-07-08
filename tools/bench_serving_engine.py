@@ -412,6 +412,11 @@ class BenchmarkRunner:
             print("[BENCH]", *parts)
 
     def common_env(self, port, metrics_path):
+        server_timeout_s = (
+            self.args.server_request_timeout
+            if self.args.server_request_timeout is not None
+            else self.args.request_timeout
+        )
         return {
             "LLM_ENABLE_SERVICE": "1",
             "LLM_ENABLE_SCHEDULER": "1",
@@ -424,6 +429,7 @@ class BenchmarkRunner:
             "LLM_MAX_NEW_TOKENS": str(self.args.max_new_tokens),
             "LLM_HTTP_PREFIX_CACHE_FRIENDLY": "1",
             "LLM_OPENAI_STATELESS": "1",
+            "LLM_SERVER_REQUEST_TIMEOUT_MS": str(max(1, int(server_timeout_s * 1000))),
         }
 
     def mode_env(self, mode, port, metrics_path):
@@ -1000,6 +1006,12 @@ def build_arg_parser():
     p.add_argument("--warmup", type=int, default=0)
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--request-timeout", type=int, default=180)
+    p.add_argument(
+        "--server-request-timeout",
+        type=int,
+        default=None,
+        help="server-side request timeout seconds; defaults to --request-timeout",
+    )
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--prompt-repeat", type=int, default=20)
     p.add_argument("--stream-prefix-cache", action="store_true")
