@@ -50,7 +50,8 @@ REQUEST_FIELDS = [
     "jsonl_decode_batch_size_avg", "jsonl_decode_batch_size_max",
     "jsonl_prefill_microbatch_size_avg",
     "jsonl_prefill_microbatch_size_max",
-    "jsonl_prefill_microbatch_executor", "match_method",
+    "jsonl_prefill_microbatch_executor", "jsonl_final_status",
+    "jsonl_error_message", "match_method",
 ]
 
 SUMMARY_FIELDS = [
@@ -345,6 +346,14 @@ class HttpClient:
                             chunk = json.loads(data)
                         except json.JSONDecodeError:
                             continue
+                        if "error" in chunk:
+                            err = chunk.get("error") or {}
+                            if isinstance(err, dict):
+                                rec["error"] = err.get("message", "server error")
+                            else:
+                                rec["error"] = str(err)
+                            rec["success"] = False
+                            break
                         if first_perf is None:
                             first_perf = now_ms()
                             rec["client_ttft_ms"] = first_perf - start_perf
@@ -356,7 +365,7 @@ class HttpClient:
                             text = delta.get("content") or ""
                             rec["client_chars"] += len(text)
                             rec["client_chunks"] += 1
-                    if not rec["success"]:
+                    if not rec["success"] and not rec["error"]:
                         rec["success"] = rec["http_status"] == 200 and rec["client_chunks"] > 0
                     if rec["client_ttft_ms"] is None:
                         rec["client_ttft_ms"] = now_ms() - start_perf
@@ -676,7 +685,18 @@ class BenchmarkRunner:
                 "jsonl_prefill_microbatch_size_avg": item.get("prefill_microbatch_size_avg", ""),
                 "jsonl_prefill_microbatch_size_max": item.get("prefill_microbatch_size_max", ""),
                 "jsonl_prefill_microbatch_executor": item.get("prefill_microbatch_executor", ""),
+                "jsonl_final_status": item.get("final_status", ""),
+                "jsonl_error_message": item.get("error_message", ""),
             })
+            final_status = item.get("final_status", "")
+            generated = int(item.get("generated_tokens") or 0)
+            if final_status and final_status != "FINISHED":
+                rec["success"] = False
+                rec["error"] = item.get("error_message") or final_status
+            elif generated <= 0:
+                rec["success"] = False
+                if not rec.get("error"):
+                    rec["error"] = "no generated tokens"
 
     def summarize_scenario(
         self,
