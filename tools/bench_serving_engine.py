@@ -60,12 +60,16 @@ REQUEST_FIELDS = [
     "jsonl_selective_decode_model_ms",
     "jsonl_selective_decode_mode",
     "jsonl_error_message", "match_method",
+    "valid_effective_run", "validity_warnings",
 ]
 
 SUMMARY_FIELDS = [
     "run_id", "suite", "scenario", "mode", "repeat", "concurrency",
     "num_requests", "success_count", "fail_count", "abort_count",
     "total_wall_ms", "aggregate_output_tokens", "aggregate_output_tok_s",
+    "generated_tokens_per_request_avg", "decode_ms_per_token_avg",
+    "selective_model_ms_per_token_avg", "total_ms_per_output_token",
+    "selective_batch_utilization",
     "p50_client_ttft_ms", "p95_client_ttft_ms", "p50_client_total_ms",
     "p95_client_total_ms", "avg_server_tps", "avg_prefill_ms",
     "avg_decode_ms", "avg_first_token_ms", "prefix_hit_requests",
@@ -81,6 +85,7 @@ SUMMARY_FIELDS = [
     "selective_decode_lm_head_rows_total",
     "selective_decode_fallbacks_total",
     "selective_decode_model_ms_total",
+    "valid_effective_run", "validity_warnings",
     "server_requests_total", "server_requests_finished",
     "server_requests_failed", "server_requests_aborted",
     "server_tokens_generated_total", "raw_log_path", "metrics_jsonl_path",
@@ -118,6 +123,34 @@ def fmt(value, digits=2):
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def to_float(value, default=None):
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value, default=0):
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 def compact_error(exc):
@@ -188,6 +221,26 @@ def make_long_prompt(topic, repeat=20):
     return (
         make_shared_system_prompt(repeat)
         + f"\n请围绕{topic}展开，给出清晰、可核对、分层的说明。"
+    )
+
+
+def make_decode_heavy_prompt(topic, target_items=200, prompt_kind="numbered-list"):
+    if prompt_kind == "short-lines":
+        return (
+            f"请连续写 {target_items} 行短句，每行以编号开头，主题是：{topic}。\n"
+            "不要提前结束，不要总结，不要反问。"
+        )
+    return (
+        f"请严格按照编号列表连续输出 1 到 {target_items} 条内容。\n"
+        f"主题是：{topic}。\n"
+        "每一条只写一句简短说明。\n"
+        "不要总结。\n"
+        "不要提前结束。\n"
+        "不要输出结束语。\n"
+        "格式如下：\n"
+        "1. ...\n"
+        "2. ...\n"
+        "3. ..."
     )
 
 
@@ -464,6 +517,8 @@ class BenchmarkRunner:
             "prefix_cache",
             "continuous_batching",
             "prefill_batching",
+            "selective_decode_off",
+            "selective_decode_on",
             "selective_decode",
             "full_stack",
         ):
@@ -473,6 +528,8 @@ class BenchmarkRunner:
             "prefix_cache",
             "continuous_batching",
             "prefill_batching",
+            "selective_decode_off",
+            "selective_decode_on",
             "selective_decode",
             "full_stack",
         ):
@@ -483,7 +540,14 @@ class BenchmarkRunner:
                 "LLM_OPENAI_STATELESS": "1",
                 "LLM_HTTP_PREFIX_CACHE_FRIENDLY": "1",
             })
-        if mode in ("continuous_batching", "prefill_batching", "selective_decode", "full_stack"):
+        if mode in (
+            "continuous_batching",
+            "prefill_batching",
+            "selective_decode_off",
+            "selective_decode_on",
+            "selective_decode",
+            "full_stack",
+        ):
             env.update({
                 "LLM_ENABLE_CONTINUOUS_BATCHING": "1",
                 "LLM_CONT_BATCH_MAX_ACTIVE_DECODE": "8",
@@ -491,7 +555,9 @@ class BenchmarkRunner:
                 "LLM_CONT_BATCH_PREFILL_WHEN_DECODE_EMPTY": "1",
                 "LLM_CONT_BATCH_PREFILL_AFTER_DECODE": "0",
             })
-        if mode in ("selective_decode", "full_stack"):
+        if mode == "selective_decode_off":
+            env["LLM_ENABLE_SELECTIVE_BATCH_DECODE"] = "0"
+        if mode in ("selective_decode_on", "selective_decode", "full_stack"):
             env.update({
                 "LLM_ENABLE_SELECTIVE_BATCH_DECODE": "1",
                 "LLM_SELECTIVE_DECODE_MAX_BATCH": str(max(1, self.args.selective_decode_max_batch)),
@@ -509,7 +575,7 @@ class BenchmarkRunner:
                 "LLM_PREFILL_MICROBATCH_EXECUTOR": "conservative",
                 "LLM_PREFILL_MICROBATCH_AFTER_DECODE": "0",
             })
-        if self.args.verbose:
+        if self.args.engine_debug:
             env.update({
                 "LLM_CONT_BATCH_DEBUG": "1",
                 "LLM_PREFILL_BATCH_DEBUG": "1",
@@ -576,7 +642,6 @@ class BenchmarkRunner:
         wall_ms = now_ms() - wall_start
         jsonl_items = read_jsonl(metrics_path)
         self.attach_jsonl_metrics(scenario_records, jsonl_items)
-        self.records.extend(scenario_records)
         summary = self.summarize_scenario(
             suite,
             scenario,
@@ -590,6 +655,12 @@ class BenchmarkRunner:
             metrics_path,
             server_metrics_path,
         )
+        validation = self.validate_selective_decode_summary(summary, scenario_records)
+        summary.update(validation)
+        for rec in scenario_records:
+            rec["valid_effective_run"] = validation["valid_effective_run"]
+            rec["validity_warnings"] = validation["validity_warnings"]
+        self.records.extend(scenario_records)
         self.summaries.append(summary)
         metrics_row = dict(server_metrics) if isinstance(server_metrics, dict) else {}
         metrics_row.update({
@@ -684,6 +755,8 @@ class BenchmarkRunner:
             "client_total_ms": None,
             "client_chunks": 0,
             "client_chars": 0,
+            "valid_effective_run": "",
+            "validity_warnings": "",
         }
 
     def attach_jsonl_metrics(self, records, jsonl_items):
@@ -765,6 +838,26 @@ class BenchmarkRunner:
         fail_count = len(records) - success_count
         server_metrics = server_metrics if isinstance(server_metrics, dict) else {}
         out_tokens = sum(generated)
+        generated_avg = (out_tokens / len(records)) if records else None
+        decode_ms_per_token_values = []
+        for r in records:
+            decode_ms = to_float(r.get("jsonl_decode_ms"))
+            gen = to_int(r.get("jsonl_generated_tokens"), 0)
+            if decode_ms is not None and gen > 0:
+                decode_ms_per_token_values.append(decode_ms / gen)
+        selective_model_ms = to_float(
+            server_metrics.get("selective_decode_model_ms_total"),
+            0.0,
+        )
+        avg_selective_decode_size = to_float(
+            server_metrics.get("avg_selective_decode_size"),
+            0.0,
+        )
+        selective_util = (
+            avg_selective_decode_size / max(1, self.args.selective_decode_max_batch)
+            if avg_selective_decode_size is not None
+            else None
+        )
         return {
             "run_id": self.run_id,
             "suite": suite,
@@ -779,6 +872,12 @@ class BenchmarkRunner:
             "total_wall_ms": wall_ms,
             "aggregate_output_tokens": out_tokens,
             "aggregate_output_tok_s": (out_tokens * 1000.0 / wall_ms) if wall_ms > 0 else None,
+            "generated_tokens_per_request_avg": generated_avg,
+            "decode_ms_per_token_avg": safe_mean(decode_ms_per_token_values),
+            "selective_model_ms_per_token_avg":
+                (selective_model_ms / out_tokens) if out_tokens > 0 else None,
+            "total_ms_per_output_token": (wall_ms / out_tokens) if out_tokens > 0 else None,
+            "selective_batch_utilization": selective_util,
             "p50_client_ttft_ms": percentile(ttfts, 50),
             "p95_client_ttft_ms": percentile(ttfts, 95),
             "p50_client_total_ms": percentile(totals, 50),
@@ -822,10 +921,101 @@ class BenchmarkRunner:
             "server_metrics_path": str(server_metrics_path),
         }
 
+    def validate_selective_decode_summary(self, summary, records):
+        if summary.get("suite") != "selective-decode" or not self.args.validate_effective:
+            return {"valid_effective_run": "", "validity_warnings": ""}
+
+        warnings = []
+        valid = True
+        concurrency = to_int(summary.get("concurrency"), 1)
+        max_new_tokens = max(1, int(self.args.max_new_tokens))
+        generated_total = to_int(summary.get("server_tokens_generated_total"), 0)
+        expected_min_tokens = int(0.8 * concurrency * max_new_tokens)
+
+        failed = to_int(summary.get("server_requests_failed"), 0)
+        aborted = to_int(summary.get("server_requests_aborted"), 0)
+        client_fail_count = to_int(summary.get("fail_count"), 0)
+        if client_fail_count != 0:
+            valid = False
+            warnings.append(f"client_fail_count={client_fail_count}")
+        if failed != 0:
+            valid = False
+            warnings.append(f"requests_failed={failed}")
+        if aborted != 0:
+            valid = False
+            warnings.append(f"requests_aborted={aborted}")
+        if generated_total < expected_min_tokens:
+            valid = False
+            warnings.append(
+                f"generated_tokens_low={generated_total}<expected_min={expected_min_tokens}"
+            )
+
+        selective_enabled = to_bool(summary.get("selective_decode_enabled"))
+        selective_size_max = to_float(summary.get("selective_decode_size_max"), 0.0)
+        avg_selective_size = to_float(summary.get("avg_selective_decode_size"), 0.0)
+        decode_batch_size_max = to_float(summary.get("decode_batch_size_max"), 0.0)
+        paged_fallbacks = to_int(summary.get("paged_attention_fallbacks"), 0)
+        selective_fallbacks = to_int(summary.get("selective_decode_fallbacks_total"), 0)
+        selective_steps = to_int(summary.get("selective_decode_steps_total"), 0)
+
+        if summary.get("scenario") == "selective_decode_on":
+            if not selective_enabled:
+                valid = False
+                warnings.append("selective_decode_enabled=false")
+            if concurrency >= 2 and selective_size_max < 2:
+                valid = False
+                warnings.append(f"selective_decode_size_max={selective_size_max}<2")
+            if concurrency >= 2 and avg_selective_size <= 1.0:
+                valid = False
+                warnings.append(f"avg_selective_decode_size={avg_selective_size}<=1")
+            if to_int(summary.get("selective_decode_linear_batch_rows_total"), 0) <= 0:
+                valid = False
+                warnings.append("selective_decode_linear_batch_rows_total=0")
+            if to_int(summary.get("selective_decode_attention_per_sequence_calls_total"), 0) <= 0:
+                valid = False
+                warnings.append("selective_decode_attention_per_sequence_calls_total=0")
+            if to_int(summary.get("selective_decode_lm_head_rows_total"), 0) <= 0:
+                valid = False
+                warnings.append("selective_decode_lm_head_rows_total=0")
+            if paged_fallbacks != 0:
+                valid = False
+                warnings.append(f"paged_attention_fallbacks={paged_fallbacks}")
+            if selective_steps > 0 and selective_fallbacks > max(2, int(0.25 * selective_steps)):
+                warnings.append(
+                    f"selective_decode_fallbacks_high={selective_fallbacks}/{selective_steps}"
+                )
+        elif summary.get("scenario") == "selective_decode_off":
+            if selective_enabled:
+                valid = False
+                warnings.append("selective_decode_enabled=true_in_off_mode")
+            if selective_size_max not in (0, 0.0):
+                valid = False
+                warnings.append(f"selective_decode_size_max={selective_size_max}_in_off_mode")
+            if concurrency >= 2 and decode_batch_size_max < 2:
+                valid = False
+                warnings.append(f"decode_batch_size_max={decode_batch_size_max}<2")
+
+        if records and all(r.get("match_method") == "none" for r in records):
+            warnings.append("jsonl_metrics_not_matched")
+
+        return {
+            "valid_effective_run": bool(valid),
+            "validity_warnings": "; ".join(warnings),
+        }
+
     def request_for_topic(self, topic, prompt_kind="medium", max_tokens=None, shared=False):
         if prompt_kind == "short":
             user = make_short_prompt(topic)
             messages = make_chat_messages(user_text=user)
+        elif prompt_kind == "decode-heavy":
+            target_items = 200 if self.args.force_long_output else 80
+            messages = make_chat_messages(
+                user_text=make_decode_heavy_prompt(
+                    topic,
+                    target_items=target_items,
+                    prompt_kind=self.args.decode_heavy_prompt,
+                )
+            )
         elif prompt_kind == "long":
             messages = make_chat_messages(user_text=make_long_prompt(topic, self.args.prompt_repeat))
         elif shared:
@@ -902,16 +1092,20 @@ class BenchmarkRunner:
         for rep in range(self.args.repeats):
             for conc in self.args.concurrency_values:
                 reqs = [
-                    self.request_for_topic(TOPICS[i % len(TOPICS)], "short", 96)
+                    self.request_for_topic(
+                        TOPICS[i % len(TOPICS)],
+                        "decode-heavy",
+                        self.args.max_new_tokens,
+                    )
                     for i in range(conc)
                 ]
                 self.run_server_scenario(
                     "selective-decode", "selective_decode_off",
-                    "continuous_batching", rep, conc, reqs, True
+                    "selective_decode_off", rep, conc, reqs, True
                 )
                 self.run_server_scenario(
                     "selective-decode", "selective_decode_on",
-                    "selective_decode", rep, conc, reqs, True
+                    "selective_decode_on", rep, conc, reqs, True
                 )
 
     def run_paged_attention(self):
@@ -992,6 +1186,10 @@ class BenchmarkRunner:
         write_json(self.json_dir / "scenario_summary.json", self.summaries)
         self.write_report()
         print(f"[BENCH] wrote output_dir={self.out_root}")
+        print("")
+        print("Recommended selective-decode commands:")
+        for line in self.recommended_commands():
+            print(line)
 
     def write_report(self):
         lines = []
@@ -1019,6 +1217,10 @@ class BenchmarkRunner:
         lines.append("")
         lines.append("## Findings")
         lines.extend(self.report_findings())
+        selective_lines = self.selective_decode_report_lines()
+        if selective_lines:
+            lines.append("")
+            lines.extend(selective_lines)
         lines.append("")
         lines.append("## Output Files")
         lines.append(f"- requests: `{self.csv_dir / 'requests.csv'}`")
@@ -1032,6 +1234,9 @@ class BenchmarkRunner:
         lines.append("- stream=false has no real client-side TTFT; the script leaves TTFT empty for it.")
         lines.append("- Prefill batching currently validates scheduler-level conservative executor behavior, not operator-level batch prefill speedup.")
         lines.append("- Client records and JSONL request metrics are matched by completion order as a best effort.")
+        lines.append("")
+        lines.append("## Recommended Commands")
+        lines.extend(self.recommended_commands(markdown=True))
         (self.out_root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def report_findings(self):
@@ -1074,6 +1279,163 @@ class BenchmarkRunner:
             lines.append(f"- Paged attention: calls={calls}, fallbacks={fallbacks}.")
         if not lines:
             lines.append("- No feature-specific scenarios were run.")
+        return lines
+
+    def selective_decode_report_lines(self):
+        rows = [s for s in self.summaries if s.get("suite") == "selective-decode"]
+        if not rows:
+            return []
+
+        lines = []
+        lines.append("## Selective Batch Decode Summary")
+        lines.append("")
+        lines.append("### Experiment Settings")
+        lines.append(f"- threads: `{self.args.threads}`")
+        lines.append(f"- taskset: `{self.args.taskset or ''}`")
+        lines.append(f"- max_new_tokens: `{self.args.max_new_tokens}`")
+        lines.append(f"- concurrency: `{','.join(str(x) for x in self.args.concurrency_values)}`")
+        lines.append(f"- selective_decode_max_batch: `{self.args.selective_decode_max_batch}`")
+        lines.append(f"- selective_decode_min_batch: `{self.args.selective_decode_min_batch}`")
+        lines.append(f"- prompt type: `{self.args.decode_heavy_prompt}`")
+        lines.append("")
+
+        valid = [s for s in rows if s.get("valid_effective_run") is True]
+        invalid = [s for s in rows if s.get("valid_effective_run") is False]
+        lines.append("### Validity")
+        lines.append(f"- valid scenarios: `{len(valid)}`")
+        lines.append(f"- invalid scenarios: `{len(invalid)}`")
+        for row in invalid:
+            lines.append(
+                "- invalid: "
+                f"scenario=`{row.get('scenario')}` "
+                f"repeat=`{row.get('repeat')}` "
+                f"concurrency=`{row.get('concurrency')}` "
+                f"warnings=`{row.get('validity_warnings')}`"
+            )
+        lines.append("")
+
+        lines.append("### On/Off Comparison")
+        cols = [
+            "concurrency", "off_tok_s", "on_tok_s", "speedup_pct",
+            "off_p95_total_ms", "on_p95_total_ms",
+            "selective_decode_size_max", "avg_selective_decode_size",
+            "paged_attention_fallbacks",
+        ]
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+
+        by_key = {}
+        for row in rows:
+            key = (row.get("repeat"), row.get("concurrency"))
+            by_key.setdefault(key, {})[row.get("scenario")] = row
+        for (_rep, conc), pair in sorted(by_key.items(), key=lambda x: (to_int(x[0][0]), to_int(x[0][1]))):
+            off = pair.get("selective_decode_off")
+            on = pair.get("selective_decode_on")
+            if not off or not on:
+                continue
+            off_tps = to_float(off.get("aggregate_output_tok_s"))
+            on_tps = to_float(on.get("aggregate_output_tok_s"))
+            speedup = None
+            if off_tps and off_tps > 0 and on_tps is not None:
+                speedup = (on_tps / off_tps - 1.0) * 100.0
+            vals = [
+                conc,
+                fmt(off_tps),
+                fmt(on_tps),
+                fmt(speedup),
+                fmt(off.get("p95_client_total_ms")),
+                fmt(on.get("p95_client_total_ms")),
+                fmt(on.get("selective_decode_size_max")),
+                fmt(on.get("avg_selective_decode_size")),
+                fmt(on.get("paged_attention_fallbacks")),
+            ]
+            lines.append("| " + " | ".join(str(v) for v in vals) + " |")
+        lines.append("")
+
+        lines.append("### Interpretation")
+        best_speedup = None
+        best_pair = None
+        for key, pair in by_key.items():
+            off = pair.get("selective_decode_off")
+            on = pair.get("selective_decode_on")
+            if not off or not on:
+                continue
+            off_tps = to_float(off.get("aggregate_output_tok_s"))
+            on_tps = to_float(on.get("aggregate_output_tok_s"))
+            if off_tps and off_tps > 0 and on_tps is not None:
+                speedup = (on_tps / off_tps - 1.0) * 100.0
+                if best_speedup is None or speedup > best_speedup:
+                    best_speedup = speedup
+                    best_pair = (key, speedup)
+        lines.append("- concurrency=1 usually has little or no selective batching benefit.")
+        lines.append("- concurrency>=2 with avg_selective_decode_size>1 is the effective selective batching case.")
+        if best_pair:
+            (_rep, conc), speedup = best_pair
+            if speedup >= 0:
+                lines.append(f"- Best observed selective decode speedup: {fmt(speedup)}% at concurrency={conc}.")
+            else:
+                lines.append(
+                    "- Selective decode was slower in this run. Likely causes include cache pressure, "
+                    "too few generated tokens, too many fallbacks, per-sequence attention, thread contention, "
+                    "or limited LM Head batch benefit."
+                )
+        lines.append(
+            "- Selective Batch Decode is not batch attention. It batches token-independent operators "
+            "such as QKV/O/FFN/LM Head, while attention remains per-sequence page-aware to avoid "
+            "padding and mask waste from different KV lengths."
+        )
+        return lines
+
+    def recommended_commands(self, markdown=False):
+        exe = "python3 ../tools/bench_serving_engine.py"
+        commands = [
+            (
+                "A. Functional validation",
+                f"{exe} --binary ./qwen_model_loader --suite selective-decode "
+                "--threads 4 --taskset 4-7 --concurrency 2,4 --repeats 1 "
+                "--prompt-repeat 1 --max-new-tokens 32 --request-timeout 600 "
+                "--server-request-timeout 600 --selective-decode-max-batch 4 "
+                "--selective-decode-min-batch 2 --validate-effective --verbose"
+            ),
+            (
+                "B. Decode-heavy main experiment",
+                f"{exe} --binary ./qwen_model_loader --suite selective-decode "
+                "--threads 4 --taskset 4-7 --concurrency 1,2,4,8 --repeats 3 "
+                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--server-request-timeout 1200 --selective-decode-max-batch 8 "
+                "--selective-decode-min-batch 2 --validate-effective"
+            ),
+            (
+                "C. Max batch sweep",
+                "for b in 2 4 8; do "
+                f"{exe} --binary ./qwen_model_loader --suite selective-decode "
+                "--threads 4 --taskset 4-7 --concurrency 8 --repeats 3 "
+                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--server-request-timeout 1200 --selective-decode-max-batch $b "
+                "--selective-decode-min-batch 2 --validate-effective; done"
+            ),
+            (
+                "D. Thread sweep",
+                "for t in 1 2 3 4; do "
+                f"{exe} --binary ./qwen_model_loader --suite selective-decode "
+                "--threads $t --taskset 4-7 --concurrency 4 --repeats 3 "
+                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--server-request-timeout 1200 --selective-decode-max-batch 4 "
+                "--selective-decode-min-batch 2 --validate-effective; done"
+            ),
+        ]
+        if not markdown:
+            lines = []
+            for title, cmd in commands:
+                lines.append(f"{title}:")
+                lines.append(cmd)
+            return lines
+        lines = []
+        for title, cmd in commands:
+            lines.append(f"### {title}")
+            lines.append("```bash")
+            lines.append(cmd)
+            lines.append("```")
         return lines
 
 
@@ -1121,6 +1483,12 @@ def build_arg_parser():
     p.add_argument("--stream-prefix-cache", action="store_true")
     p.add_argument("--selective-decode-max-batch", type=int, default=8)
     p.add_argument("--selective-decode-min-batch", type=int, default=2)
+    p.add_argument("--decode-heavy-prompt", default="numbered-list")
+    p.add_argument("--force-long-output", action="store_true", default=True)
+    p.add_argument("--no-force-long-output", dest="force_long_output", action="store_false")
+    p.add_argument("--validate-effective", action="store_true", default=True)
+    p.add_argument("--no-validate-effective", dest="validate_effective", action="store_false")
+    p.add_argument("--engine-debug", action="store_true", default=False)
     p.add_argument("--keep-logs", action="store_true", default=True)
     p.add_argument("--no-kill", action="store_true")
     p.add_argument("--verbose", action="store_true")
