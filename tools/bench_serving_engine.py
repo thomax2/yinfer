@@ -483,10 +483,15 @@ class BenchmarkRunner:
         self.summaries = []
         self.server_metrics_rows = []
         self.next_port = int(args.base_port)
+        self.expected_scenarios = 0
+        self.completed_scenarios = 0
 
     def log(self, *parts):
         if self.args.verbose:
             print("[BENCH]", *parts)
+
+    def progress(self, *parts):
+        print("[BENCH]", *parts, flush=True)
 
     def common_env(self, port, metrics_path):
         server_timeout_s = (
@@ -612,6 +617,16 @@ class BenchmarkRunner:
         )
         wall_start = now_ms()
         server_metrics = {}
+        next_index = self.completed_scenarios + 1
+        total = self.expected_scenarios or "?"
+        self.progress(
+            f"scenario {next_index}/{total} start",
+            f"suite={suite}",
+            f"scenario={scenario}",
+            f"mode={mode}",
+            f"repeat={repeat}",
+            f"concurrency={concurrency}",
+        )
         try:
             self.log(f"starting scenario={scenario} mode={mode} port={port}")
             runner.start()
@@ -673,6 +688,20 @@ class BenchmarkRunner:
             "path": str(server_metrics_path),
         })
         self.server_metrics_rows.append(metrics_row)
+        self.completed_scenarios += 1
+        self.progress(
+            f"scenario {self.completed_scenarios}/{total} done",
+            f"suite={suite}",
+            f"scenario={scenario}",
+            f"repeat={repeat}",
+            f"concurrency={concurrency}",
+            f"success={summary.get('success_count')}",
+            f"fail={summary.get('fail_count')}",
+        )
+        try:
+            self.write_outputs(final=False)
+        except Exception as exc:  # noqa: BLE001
+            self.progress(f"incremental output failed: {compact_error(exc)}")
 
     def send_requests(self, client, suite, scenario, mode, repeat, concurrency, requests, stream):
         if concurrency <= 1:
@@ -683,24 +712,62 @@ class BenchmarkRunner:
                 )
             return rows
         barrier = threading.Barrier(concurrency)
+        scenario_timeout = max(1.0, float(self.args.timeout))
 
         def worker(i):
             req = requests[i % len(requests)]
-            barrier.wait()
+            barrier.wait(timeout=30.0)
             return self.send_one(
                 client, suite, scenario, mode, repeat, i, concurrency, req, stream
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futs = [pool.submit(worker, i) for i in range(concurrency)]
-            rows = []
-            for fut in concurrent.futures.as_completed(futs):
+        self.log(
+            f"dispatch scenario={scenario} mode={mode} repeat={repeat} "
+            f"concurrency={concurrency} timeout_s={scenario_timeout}"
+        )
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        fut_to_index = {pool.submit(worker, i): i for i in range(concurrency)}
+        rows = []
+        try:
+            done, pending = concurrent.futures.wait(
+                fut_to_index.keys(),
+                timeout=scenario_timeout,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+            for fut in done:
+                idx = fut_to_index[fut]
                 try:
                     rows.append(fut.result())
                 except Exception as exc:  # noqa: BLE001
                     rows.append(self.failure_record(
-                        suite, scenario, mode, repeat, concurrency, compact_error(exc)
+                        suite, scenario, mode, repeat, concurrency, compact_error(exc), idx
                     ))
+            for fut in pending:
+                idx = fut_to_index[fut]
+                fut.cancel()
+                rows.append(self.failure_record(
+                    suite,
+                    scenario,
+                    mode,
+                    repeat,
+                    concurrency,
+                    f"scenario request timeout after {scenario_timeout:.1f}s",
+                    idx,
+                ))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        seen = {int(r.get("request_index", 0)) for r in rows}
+        for i in range(concurrency):
+            if i not in seen:
+                rows.append(self.failure_record(
+                    suite,
+                    scenario,
+                    mode,
+                    repeat,
+                    concurrency,
+                    "missing request result",
+                    i,
+                ))
         rows.sort(key=lambda r: int(r.get("request_index", 0)))
         return rows
 
@@ -731,14 +798,14 @@ class BenchmarkRunner:
         })
         return rec
 
-    def failure_record(self, suite, scenario, mode, repeat, concurrency, error):
+    def failure_record(self, suite, scenario, mode, repeat, concurrency, error, request_index=0):
         return {
             "run_id": self.run_id,
             "suite": suite,
             "scenario": scenario,
             "mode": mode,
             "repeat": repeat,
-            "request_index": 0,
+            "request_index": request_index,
             "concurrency": concurrency,
             "stream": "",
             "max_tokens": "",
@@ -1089,7 +1156,19 @@ class BenchmarkRunner:
                 )
 
     def run_selective_decode(self):
+        self.expected_scenarios = (
+            len(self.args.concurrency_values) *
+            max(0, int(self.args.repeats)) *
+            2
+        )
+        self.progress(
+            "selective-decode plan",
+            f"repeats={self.args.repeats}",
+            f"concurrency={','.join(str(x) for x in self.args.concurrency_values)}",
+            f"expected_scenarios={self.expected_scenarios}",
+        )
         for rep in range(self.args.repeats):
+            self.progress(f"selective-decode repeat {rep + 1}/{self.args.repeats} start")
             for conc in self.args.concurrency_values:
                 reqs = [
                     self.request_for_topic(
@@ -1107,6 +1186,7 @@ class BenchmarkRunner:
                     "selective-decode", "selective_decode_on",
                     "selective_decode_on", rep, conc, reqs, True
                 )
+            self.progress(f"selective-decode repeat {rep + 1}/{self.args.repeats} done")
 
     def run_paged_attention(self):
         for rep in range(self.args.repeats):
@@ -1174,9 +1254,9 @@ class BenchmarkRunner:
                 self.run_full()
             else:
                 raise ValueError(f"unknown suite: {suite}")
-        self.write_outputs()
+        self.write_outputs(final=True)
 
-    def write_outputs(self):
+    def write_outputs(self, final=True):
         write_csv(self.csv_dir / "requests.csv", self.records, REQUEST_FIELDS)
         write_csv(self.csv_dir / "scenario_summary.csv", self.summaries, SUMMARY_FIELDS)
         if self.server_metrics_rows:
@@ -1184,12 +1264,18 @@ class BenchmarkRunner:
             write_csv(self.csv_dir / "server_metrics.csv", self.server_metrics_rows, server_fields)
         write_json(self.json_dir / "request_records.json", self.records)
         write_json(self.json_dir / "scenario_summary.json", self.summaries)
-        self.write_report()
-        print(f"[BENCH] wrote output_dir={self.out_root}")
-        print("")
-        print("Recommended selective-decode commands:")
-        for line in self.recommended_commands():
-            print(line)
+        try:
+            self.write_report()
+        except Exception as exc:  # noqa: BLE001
+            error_path = self.out_root / "report_error.txt"
+            error_path.write_text(compact_error(exc) + "\n", encoding="utf-8")
+            self.progress(f"report generation failed: {compact_error(exc)}")
+        if final:
+            print(f"[BENCH] wrote output_dir={self.out_root}")
+            print("")
+            print("Recommended selective-decode commands:")
+            for line in self.recommended_commands():
+                print(line)
 
     def write_report(self):
         lines = []
@@ -1200,6 +1286,8 @@ class BenchmarkRunner:
         lines.append(f"- suite: `{self.args.suite}`")
         lines.append(f"- threads: `{self.args.threads}`")
         lines.append(f"- taskset: `{self.args.taskset or ''}`")
+        lines.append(f"- completed_scenarios: `{self.completed_scenarios}`")
+        lines.append(f"- expected_scenarios: `{self.expected_scenarios or ''}`")
         lines.append("")
         lines.append("## Scenario Summary")
         lines.append("")
@@ -1393,7 +1481,7 @@ class BenchmarkRunner:
                 "A. Functional validation",
                 f"{exe} --binary ./qwen_model_loader --suite selective-decode "
                 "--threads 4 --taskset 4-7 --concurrency 2,4 --repeats 1 "
-                "--prompt-repeat 1 --max-new-tokens 32 --request-timeout 600 "
+                "--prompt-repeat 1 --max-new-tokens 32 --timeout 600 --request-timeout 600 "
                 "--server-request-timeout 600 --selective-decode-max-batch 4 "
                 "--selective-decode-min-batch 2 --validate-effective --verbose"
             ),
@@ -1401,7 +1489,7 @@ class BenchmarkRunner:
                 "B. Decode-heavy main experiment",
                 f"{exe} --binary ./qwen_model_loader --suite selective-decode "
                 "--threads 4 --taskset 4-7 --concurrency 1,2,4,8 --repeats 3 "
-                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--prompt-repeat 1 --max-new-tokens 128 --timeout 1200 --request-timeout 1200 "
                 "--server-request-timeout 1200 --selective-decode-max-batch 8 "
                 "--selective-decode-min-batch 2 --validate-effective"
             ),
@@ -1410,7 +1498,7 @@ class BenchmarkRunner:
                 "for b in 2 4 8; do "
                 f"{exe} --binary ./qwen_model_loader --suite selective-decode "
                 "--threads 4 --taskset 4-7 --concurrency 8 --repeats 3 "
-                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--prompt-repeat 1 --max-new-tokens 128 --timeout 1200 --request-timeout 1200 "
                 "--server-request-timeout 1200 --selective-decode-max-batch $b "
                 "--selective-decode-min-batch 2 --validate-effective; done"
             ),
@@ -1419,7 +1507,7 @@ class BenchmarkRunner:
                 "for t in 1 2 3 4; do "
                 f"{exe} --binary ./qwen_model_loader --suite selective-decode "
                 "--threads $t --taskset 4-7 --concurrency 4 --repeats 3 "
-                "--prompt-repeat 1 --max-new-tokens 128 --request-timeout 1200 "
+                "--prompt-repeat 1 --max-new-tokens 128 --timeout 1200 --request-timeout 1200 "
                 "--server-request-timeout 1200 --selective-decode-max-batch 4 "
                 "--selective-decode-min-batch 2 --validate-effective; done"
             ),
