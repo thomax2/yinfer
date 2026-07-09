@@ -1183,7 +1183,7 @@ bool QwenModel::decode_selective_batch_for_sequences(
                 Tensor Score({num_rep, current_seq_len}, score.data(), DataType::FP16);
                 bool used_paged_group = false;
                 if (use_paged_attention) {
-                    Status paged_status = arm_neon::attention_decode_score_paged_f16_neon(
+                    Status paged_status = arm_neon::attention_decode_score_paged_f16_neon_public(
                         q_group_ptr, score.data(), num_rep, current_seq_len,
                         config.head_dim, scale, raw_k_pages, paged_block_table,
                         paged_block_table_size, paged_view.block_size, layer_id,
@@ -1193,7 +1193,7 @@ bool QwenModel::decode_selective_batch_for_sequences(
                         paged_status = arm_neon::softmax_f16_neon(Score, Score);
                     }
                     if (paged_status == Status::SUCCESS) {
-                        paged_status = arm_neon::attention_decode_value_paged_f16_neon(
+                        paged_status = arm_neon::attention_decode_value_paged_f16_neon_public(
                             score.data(), out_group_ptr, num_rep, current_seq_len,
                             config.head_dim, raw_v_pages, paged_block_table,
                             paged_block_table_size, paged_view.block_size, layer_id,
@@ -1214,7 +1214,7 @@ bool QwenModel::decode_selective_batch_for_sequences(
                 if (!used_paged_group) {
                     fp16_t* k_cache_ptr = kv_cache->get_k_head_ptr(layer_id, kv_head);
                     fp16_t* v_cache_ptr = kv_cache->get_v_head_ptr(layer_id, kv_head);
-                    arm_neon::attention_decode_score_f16_neon(
+                    arm_neon::attention_decode_score_f16_neon_public(
                         q_group_ptr, k_cache_ptr, score.data(), num_rep,
                         current_seq_len, config.head_dim, scale);
                     status = arm_neon::softmax_f16_neon(Score, Score);
@@ -1222,7 +1222,7 @@ bool QwenModel::decode_selective_batch_for_sequences(
                         kv_cache->clear_active_sequence();
                         return false;
                     }
-                    arm_neon::attention_decode_value_f16_neon(
+                    arm_neon::attention_decode_value_f16_neon_public(
                         score.data(), v_cache_ptr, out_group_ptr, num_rep,
                         current_seq_len, config.head_dim);
                 }

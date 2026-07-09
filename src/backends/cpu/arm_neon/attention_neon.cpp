@@ -626,6 +626,99 @@ void compare_paged_attention_output(
 }
 } // namespace
 
+void attention_decode_score_f16_neon_public(
+    const fp16_t* q,
+    const fp16_t* k_cache,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale
+) {
+    attention_decode_score_f16_neon(
+        q, k_cache, score, num_rep, seq_len, head_dim, scale);
+}
+
+void attention_decode_value_f16_neon_public(
+    const fp16_t* score,
+    const fp16_t* v_cache,
+    fp16_t* out,
+    int num_rep,
+    int seq_len,
+    int head_dim
+) {
+    attention_decode_value_f16_neon(
+        score, v_cache, out, num_rep, seq_len, head_dim);
+}
+
+Status attention_decode_score_paged_f16_neon_public(
+    const fp16_t* q,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale,
+    const fp16_t* raw_k_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+) {
+    return attention_decode_score_paged_f16_neon(
+        q,
+        score,
+        num_rep,
+        seq_len,
+        head_dim,
+        scale,
+        raw_k_pages,
+        block_table,
+        block_table_size,
+        block_size,
+        layer_id,
+        kv_head,
+        num_layers,
+        num_kv_heads,
+        num_physical_blocks);
+}
+
+Status attention_decode_value_paged_f16_neon_public(
+    const fp16_t* score,
+    fp16_t* out,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    const fp16_t* raw_v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+) {
+    return attention_decode_value_paged_f16_neon(
+        score,
+        out,
+        num_rep,
+        seq_len,
+        head_dim,
+        raw_v_pages,
+        block_table,
+        block_table_size,
+        block_size,
+        layer_id,
+        kv_head,
+        num_layers,
+        num_kv_heads,
+        num_physical_blocks);
+}
+
 Status attention_neon(
     const Tensor& hidden_states, // [1, hidden_dim]
     Tensor& attn_output,         // [1, hidden_dim]
