@@ -139,6 +139,18 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"scheduler_v2_decode_steps\":" << m.scheduler_v2_decode_steps
        << ",\"scheduler_v2_prefill_steps\":" << m.scheduler_v2_prefill_steps
        << ",\"active_decode_batch_size_at_finish\":" << m.active_decode_batch_size_at_finish
+       << ",\"selective_decode_enabled\":" << (m.selective_decode_enabled ? "true" : "false")
+       << ",\"selective_decode_steps\":" << m.selective_decode_steps
+       << ",\"selective_decode_size_sum\":" << m.selective_decode_size_sum
+       << ",\"selective_decode_size_max\":" << m.selective_decode_size_max
+       << ",\"selective_decode_size_avg\":" << m.selective_decode_size_avg
+       << ",\"selective_decode_linear_batch_rows\":" << m.selective_decode_linear_batch_rows
+       << ",\"selective_decode_attention_per_sequence_calls\":"
+       << m.selective_decode_attention_per_sequence_calls
+       << ",\"selective_decode_lm_head_rows\":" << m.selective_decode_lm_head_rows
+       << ",\"selective_decode_fallbacks\":" << m.selective_decode_fallbacks
+       << ",\"selective_decode_model_ms\":" << m.selective_decode_model_ms
+       << ",\"selective_decode_mode\":\"" << json_escape(m.selective_decode_mode) << "\""
        << ",\"prefill_batching_enabled\":" << (m.prefill_batching_enabled ? "true" : "false")
        << ",\"prefill_microbatch_steps\":" << m.prefill_microbatch_steps
        << ",\"prefill_microbatch_size_sum\":" << m.prefill_microbatch_size_sum

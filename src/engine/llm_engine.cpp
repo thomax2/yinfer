@@ -105,6 +105,24 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
         env_string("LLM_PREFILL_MICROBATCH_EXECUTOR", "conservative");
     prefill_microbatch_strict_ =
         env_flag("LLM_PREFILL_MICROBATCH_STRICT");
+    selective_decode_enabled_ =
+        continuous_batching_enabled_ && env_flag("LLM_ENABLE_SELECTIVE_BATCH_DECODE");
+    selective_decode_max_batch_ =
+        env_int("LLM_SELECTIVE_DECODE_MAX_BATCH", 8);
+    selective_decode_min_batch_ =
+        env_int("LLM_SELECTIVE_DECODE_MIN_BATCH", 2);
+    selective_decode_greedy_only_ =
+        env_flag_default("LLM_SELECTIVE_DECODE_GREEDY_ONLY", true);
+    selective_decode_allow_sampling_ =
+        env_flag("LLM_SELECTIVE_DECODE_ALLOW_SAMPLING");
+    selective_decode_fallback_ =
+        env_flag_default("LLM_SELECTIVE_DECODE_FALLBACK", true);
+    selective_decode_compare_ =
+        env_flag("LLM_SELECTIVE_DECODE_COMPARE");
+    selective_decode_debug_ =
+        env_flag("LLM_SELECTIVE_DECODE_DEBUG");
+    selective_decode_debug_verbose_ =
+        env_flag("LLM_SELECTIVE_DECODE_DEBUG_VERBOSE");
     prefill_step_tokens_ = env_int("LLM_PREFILL_STEP_TOKENS", 1);
     chunked_prefill_enabled_ = env_flag("LLM_ENABLE_CHUNKED_PREFILL");
     chunked_prefill_strict_ = env_flag("LLM_CHUNKED_PREFILL_STRICT");
@@ -123,6 +141,12 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     }
     if (prefill_microbatch_scan_limit_ <= 0) {
         prefill_microbatch_scan_limit_ = 1;
+    }
+    if (selective_decode_max_batch_ <= 0) {
+        selective_decode_max_batch_ = 1;
+    }
+    if (selective_decode_min_batch_ <= 0) {
+        selective_decode_min_batch_ = 1;
     }
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] enabled=" << (scheduler_enabled_ ? 1 : 0)
@@ -158,6 +182,16 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
                   << " when_decode_empty=" << (prefill_microbatch_when_decode_empty_ ? 1 : 0)
                   << " executor=" << prefill_microbatch_executor_
                   << " strict=" << (prefill_microbatch_strict_ ? 1 : 0)
+                  << std::endl;
+    }
+    if (selective_decode_debug_) {
+        std::cerr << "[SELECTIVE_DECODE] enabled=" << (selective_decode_enabled_ ? 1 : 0)
+                  << " max_batch=" << selective_decode_max_batch_
+                  << " min_batch=" << selective_decode_min_batch_
+                  << " greedy_only=" << (selective_decode_greedy_only_ ? 1 : 0)
+                  << " allow_sampling=" << (selective_decode_allow_sampling_ ? 1 : 0)
+                  << " fallback=" << (selective_decode_fallback_ ? 1 : 0)
+                  << " compare=" << (selective_decode_compare_ ? 1 : 0)
                   << std::endl;
     }
 
@@ -859,6 +893,13 @@ void LLMEngine::admit_waiting_requests_v2() {
 }
 
 bool LLMEngine::run_decode_batch_step() {
+    if (selective_decode_enabled_ && run_selective_decode_batch_step()) {
+        return true;
+    }
+    return run_decode_batch_step_conservative();
+}
+
+bool LLMEngine::run_decode_batch_step_conservative() {
     activate_decode_requests();
     if (active_decode_requests_.empty()) {
         return false;
@@ -907,6 +948,261 @@ bool LLMEngine::run_decode_batch_step() {
         }
     }
     return did_work;
+}
+
+bool LLMEngine::build_selective_decode_batch(std::vector<RequestId>* selected) {
+    if (!selected) {
+        return false;
+    }
+    selected->clear();
+    activate_decode_requests();
+    for (RequestId id : active_decode_requests_) {
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+        RequestState& request = it->second;
+        if (is_terminal(request.status) ||
+            request.status != RequestStatus::RUNNING_DECODE ||
+            request.next_token < 0 ||
+            request.num_generated_tokens >= request.sampling.max_new_tokens) {
+            continue;
+        }
+        if (request_stop_token(request, request.next_token)) {
+            continue;
+        }
+        bool is_sampling = sampling_enabled(request.sampling);
+        if (is_sampling && (selective_decode_greedy_only_ || !selective_decode_allow_sampling_)) {
+            request.metrics.selective_decode_fallbacks++;
+            request.metrics.selective_decode_mode = "fallback_sampling";
+            continue;
+        }
+        selected->push_back(id);
+        if (static_cast<int>(selected->size()) >= selective_decode_max_batch_) {
+            break;
+        }
+    }
+    if (static_cast<int>(selected->size()) < selective_decode_min_batch_) {
+        if (selective_decode_debug_) {
+            std::cerr << "[SELECTIVE_DECODE] fallback reason=batch_too_small"
+                      << " active=" << active_decode_requests_.size()
+                      << " selected=" << selected->size()
+                      << std::endl;
+        }
+        for (RequestId id : *selected) {
+            auto it = requests_.find(id);
+            if (it != requests_.end()) {
+                it->second.metrics.selective_decode_fallbacks++;
+                it->second.metrics.selective_decode_mode = "fallback_batch_too_small";
+            }
+        }
+        selected->clear();
+        return false;
+    }
+    return true;
+}
+
+bool LLMEngine::run_decode_post_emit_conservative(
+    RequestState& request,
+    SequenceState& seq,
+    int token_id
+) {
+    int next = -1;
+    if (sampling_enabled(request.sampling)) {
+        SamplingRuntimeStats sampling_stats;
+        next = model_.decode_one_for_sequence_sampled(
+            seq,
+            token_id,
+            *kv_manager_,
+            prefix_cache_.get(),
+            request.sampling,
+            request.rng,
+            &sampling_stats);
+        request.metrics.sampled_tokens += sampling_stats.sampled_tokens;
+        request.metrics.greedy_tokens += sampling_stats.greedy_tokens;
+        request.metrics.sampling_ms += sampling_stats.sampling_ms;
+    } else {
+        next = model_.decode_one_for_sequence(seq, token_id, *kv_manager_, prefix_cache_.get());
+        request.metrics.greedy_tokens++;
+    }
+    if (seq.status == SequenceStatus::FAILED) {
+        fail_request(request, seq.error_message.empty() ? "decode failed" : seq.error_message);
+        return false;
+    }
+    if (next < 0) {
+        fail_request(request, "decode forward failed");
+        return false;
+    }
+    request.next_token = next;
+    if (request.num_generated_tokens >= request.sampling.max_new_tokens) {
+        finish_request(request);
+    }
+    return true;
+}
+
+bool LLMEngine::run_selective_decode_batch_step() {
+    std::vector<RequestId> selected;
+    if (!build_selective_decode_batch(&selected)) {
+        return false;
+    }
+
+    std::vector<RequestId> model_ids;
+    std::vector<QwenModel::SelectiveDecodeItem> items;
+    model_ids.reserve(selected.size());
+    items.reserve(selected.size());
+
+    for (RequestId id : selected) {
+        auto it = requests_.find(id);
+        if (it == requests_.end()) {
+            continue;
+        }
+        RequestState& request = it->second;
+        if (is_terminal(request.status) || request.status != RequestStatus::RUNNING_DECODE) {
+            continue;
+        }
+        SequenceState& seq = get_or_create_session(request.session_id);
+        int token_id = request.next_token;
+
+        request.generated_tokens.push_back(token_id);
+        request.token_count++;
+        request.num_generated_tokens++;
+        seq.generated_tokens.push_back(token_id);
+        mark_first_token(request);
+
+        bool keep_going = true;
+        if (request.callback) {
+            keep_going = request.callback(token_id);
+        }
+        if (!keep_going) {
+            request.callback_stopped = true;
+            request.status = RequestStatus::ABORTED;
+            seq.status = SequenceStatus::ABORTED;
+            request.callback = TokenCallback{};
+            emit_metrics_once(request);
+            remove_from_active_decode(id);
+            continue;
+        }
+
+        model_ids.push_back(id);
+        items.push_back(QwenModel::SelectiveDecodeItem{&seq, token_id});
+    }
+
+    if (items.empty()) {
+        return true;
+    }
+
+    if (static_cast<int>(items.size()) < selective_decode_min_batch_) {
+        for (RequestId id : model_ids) {
+            auto it = requests_.find(id);
+            if (it == requests_.end() || is_terminal(it->second.status)) {
+                continue;
+            }
+            RequestState& request = it->second;
+            SequenceState& seq = get_or_create_session(request.session_id);
+            request.metrics.selective_decode_fallbacks++;
+            request.metrics.selective_decode_mode = "fallback_after_callback";
+            run_decode_post_emit_conservative(request, seq, request.generated_tokens.back());
+        }
+        return true;
+    }
+
+    if (selective_decode_debug_) {
+        std::cerr << "[SELECTIVE_DECODE] build size=" << items.size()
+                  << " active_decode=" << active_decode_requests_.size()
+                  << std::endl;
+    }
+
+    std::vector<QwenModel::SelectiveDecodeOutput> outputs;
+    QwenModel::SelectiveDecodeStats stats;
+    bool ok = model_.decode_selective_batch_for_sequences(
+        items,
+        *kv_manager_,
+        prefix_cache_.get(),
+        &outputs,
+        &stats);
+
+    if (!ok || outputs.size() != items.size()) {
+        if (selective_decode_debug_) {
+            std::cerr << "[SELECTIVE_DECODE] fallback reason=model_failed"
+                      << " size=" << items.size()
+                      << std::endl;
+        }
+        for (RequestId id : model_ids) {
+            auto it = requests_.find(id);
+            if (it == requests_.end() || is_terminal(it->second.status)) {
+                continue;
+            }
+            RequestState& request = it->second;
+            request.metrics.selective_decode_fallbacks++;
+            request.metrics.selective_decode_mode = "fallback_model_failed";
+            if (!selective_decode_fallback_) {
+                fail_request(request, "selective decode failed");
+                continue;
+            }
+            SequenceState& seq = get_or_create_session(request.session_id);
+            run_decode_post_emit_conservative(request, seq, request.generated_tokens.back());
+        }
+        return true;
+    }
+
+    int batch_size = static_cast<int>(items.size());
+    double per_request_model_ms =
+        batch_size > 0 ? stats.model_ms / static_cast<double>(batch_size) : 0.0;
+    int per_request_linear_rows =
+        batch_size > 0 ? stats.linear_batch_rows / batch_size : stats.linear_batch_rows;
+    int per_request_attention_calls =
+        batch_size > 0
+            ? stats.attention_per_sequence_calls / batch_size
+            : stats.attention_per_sequence_calls;
+    int per_request_lm_head_rows =
+        batch_size > 0 ? stats.lm_head_rows / batch_size : stats.lm_head_rows;
+    for (size_t i = 0; i < model_ids.size(); ++i) {
+        RequestId id = model_ids[i];
+        auto it = requests_.find(id);
+        if (it == requests_.end() || is_terminal(it->second.status)) {
+            continue;
+        }
+        RequestState& request = it->second;
+        SequenceState& seq = get_or_create_session(request.session_id);
+        request.metrics.continuous_batching_enabled = true;
+        request.metrics.scheduler_v2_steps++;
+        request.metrics.scheduler_v2_decode_steps++;
+        request.metrics.decode_batch_steps++;
+        request.metrics.decode_batch_size_sum += batch_size;
+        request.metrics.decode_batch_size_max =
+            std::max(request.metrics.decode_batch_size_max, batch_size);
+        request.metrics.selective_decode_enabled = true;
+        request.metrics.selective_decode_steps++;
+        request.metrics.selective_decode_size_sum += batch_size;
+        request.metrics.selective_decode_size_max =
+            std::max(request.metrics.selective_decode_size_max, batch_size);
+        request.metrics.selective_decode_linear_batch_rows += per_request_linear_rows;
+        request.metrics.selective_decode_attention_per_sequence_calls +=
+            per_request_attention_calls;
+        request.metrics.selective_decode_lm_head_rows += per_request_lm_head_rows;
+        request.metrics.selective_decode_model_ms += per_request_model_ms;
+        request.metrics.selective_decode_mode = "selective_batch_decode";
+        request.metrics.decode_ms += per_request_model_ms;
+
+        if (!outputs[i].success || outputs[i].next_token < 0) {
+            fail_request(
+                request,
+                outputs[i].error_message.empty()
+                    ? "selective decode output failed"
+                    : outputs[i].error_message);
+            continue;
+        }
+        if (seq.status == SequenceStatus::FAILED) {
+            fail_request(request, seq.error_message.empty() ? "decode failed" : seq.error_message);
+            continue;
+        }
+        request.next_token = outputs[i].next_token;
+        request.metrics.greedy_tokens++;
+        if (request.num_generated_tokens >= request.sampling.max_new_tokens) {
+            finish_request(request);
+        }
+    }
+    return true;
 }
 
 bool LLMEngine::run_prefill_chunk_step() {
@@ -1922,6 +2218,11 @@ void LLMEngine::emit_metrics_once(RequestState& request) {
         request.metrics.decode_batch_size_avg =
             static_cast<double>(request.metrics.decode_batch_size_sum) /
             static_cast<double>(request.metrics.decode_batch_steps);
+    }
+    if (request.metrics.selective_decode_steps > 0) {
+        request.metrics.selective_decode_size_avg =
+            static_cast<double>(request.metrics.selective_decode_size_sum) /
+            static_cast<double>(request.metrics.selective_decode_steps);
     }
     request.metrics.prefill_batching_enabled =
         request.metrics.prefill_batching_enabled || prefill_batching_enabled_;

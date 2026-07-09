@@ -51,6 +51,14 @@ REQUEST_FIELDS = [
     "jsonl_prefill_microbatch_size_avg",
     "jsonl_prefill_microbatch_size_max",
     "jsonl_prefill_microbatch_executor", "jsonl_final_status",
+    "jsonl_selective_decode_enabled", "jsonl_selective_decode_steps",
+    "jsonl_selective_decode_size_avg", "jsonl_selective_decode_size_max",
+    "jsonl_selective_decode_linear_batch_rows",
+    "jsonl_selective_decode_attention_per_sequence_calls",
+    "jsonl_selective_decode_lm_head_rows",
+    "jsonl_selective_decode_fallbacks",
+    "jsonl_selective_decode_model_ms",
+    "jsonl_selective_decode_mode",
     "jsonl_error_message", "match_method",
 ]
 
@@ -66,6 +74,13 @@ SUMMARY_FIELDS = [
     "decode_batch_size_max", "avg_decode_batch_size",
     "prefill_batching_enabled", "prefill_microbatch_size_max",
     "avg_prefill_microbatch_size", "prefill_microbatch_tokens_total",
+    "selective_decode_enabled", "selective_decode_size_max",
+    "avg_selective_decode_size", "selective_decode_steps_total",
+    "selective_decode_linear_batch_rows_total",
+    "selective_decode_attention_per_sequence_calls_total",
+    "selective_decode_lm_head_rows_total",
+    "selective_decode_fallbacks_total",
+    "selective_decode_model_ms_total",
     "server_requests_total", "server_requests_finished",
     "server_requests_failed", "server_requests_aborted",
     "server_tokens_generated_total", "raw_log_path", "metrics_jsonl_path",
@@ -449,6 +464,7 @@ class BenchmarkRunner:
             "prefix_cache",
             "continuous_batching",
             "prefill_batching",
+            "selective_decode",
             "full_stack",
         ):
             env.update({"LLM_PAGED_KV": "1", "LLM_ENABLE_SESSION_CACHE": "1"})
@@ -457,6 +473,7 @@ class BenchmarkRunner:
             "prefix_cache",
             "continuous_batching",
             "prefill_batching",
+            "selective_decode",
             "full_stack",
         ):
             env["LLM_ENABLE_PAGED_ATTENTION"] = "1"
@@ -466,13 +483,23 @@ class BenchmarkRunner:
                 "LLM_OPENAI_STATELESS": "1",
                 "LLM_HTTP_PREFIX_CACHE_FRIENDLY": "1",
             })
-        if mode in ("continuous_batching", "prefill_batching", "full_stack"):
+        if mode in ("continuous_batching", "prefill_batching", "selective_decode", "full_stack"):
             env.update({
                 "LLM_ENABLE_CONTINUOUS_BATCHING": "1",
                 "LLM_CONT_BATCH_MAX_ACTIVE_DECODE": "8",
                 "LLM_CONT_BATCH_DECODE_FIRST": "1",
                 "LLM_CONT_BATCH_PREFILL_WHEN_DECODE_EMPTY": "1",
                 "LLM_CONT_BATCH_PREFILL_AFTER_DECODE": "0",
+            })
+        if mode in ("selective_decode", "full_stack"):
+            env.update({
+                "LLM_ENABLE_SELECTIVE_BATCH_DECODE": "1",
+                "LLM_SELECTIVE_DECODE_MAX_BATCH": str(max(1, self.args.selective_decode_max_batch)),
+                "LLM_SELECTIVE_DECODE_MIN_BATCH": str(max(1, self.args.selective_decode_min_batch)),
+                "LLM_SELECTIVE_DECODE_GREEDY_ONLY": "1",
+                "LLM_SELECTIVE_DECODE_ALLOW_SAMPLING": "0",
+                "LLM_SELECTIVE_DECODE_FALLBACK": "1",
+                "LLM_SELECTIVE_DECODE_COMPARE": "0",
             })
         if mode in ("prefill_batching", "full_stack"):
             env.update({
@@ -488,6 +515,7 @@ class BenchmarkRunner:
                 "LLM_PREFILL_BATCH_DEBUG": "1",
                 "LLM_DEBUG_PREFIX_CACHE": "1",
                 "LLM_DEBUG_PAGED_ATTENTION": "1",
+                "LLM_SELECTIVE_DECODE_DEBUG": "1",
             })
         return env
 
@@ -685,6 +713,19 @@ class BenchmarkRunner:
                 "jsonl_prefill_microbatch_size_avg": item.get("prefill_microbatch_size_avg", ""),
                 "jsonl_prefill_microbatch_size_max": item.get("prefill_microbatch_size_max", ""),
                 "jsonl_prefill_microbatch_executor": item.get("prefill_microbatch_executor", ""),
+                "jsonl_selective_decode_enabled": item.get("selective_decode_enabled", ""),
+                "jsonl_selective_decode_steps": item.get("selective_decode_steps", ""),
+                "jsonl_selective_decode_size_avg": item.get("selective_decode_size_avg", ""),
+                "jsonl_selective_decode_size_max": item.get("selective_decode_size_max", ""),
+                "jsonl_selective_decode_linear_batch_rows":
+                    item.get("selective_decode_linear_batch_rows", ""),
+                "jsonl_selective_decode_attention_per_sequence_calls":
+                    item.get("selective_decode_attention_per_sequence_calls", ""),
+                "jsonl_selective_decode_lm_head_rows":
+                    item.get("selective_decode_lm_head_rows", ""),
+                "jsonl_selective_decode_fallbacks": item.get("selective_decode_fallbacks", ""),
+                "jsonl_selective_decode_model_ms": item.get("selective_decode_model_ms", ""),
+                "jsonl_selective_decode_mode": item.get("selective_decode_mode", ""),
                 "jsonl_final_status": item.get("final_status", ""),
                 "jsonl_error_message": item.get("error_message", ""),
             })
@@ -757,6 +798,20 @@ class BenchmarkRunner:
             "prefill_microbatch_size_max": server_metrics.get("prefill_microbatch_size_max", 0),
             "avg_prefill_microbatch_size": server_metrics.get("avg_prefill_microbatch_size", 0),
             "prefill_microbatch_tokens_total": server_metrics.get("prefill_microbatch_tokens_total", 0),
+            "selective_decode_enabled": server_metrics.get("selective_decode_enabled", False),
+            "selective_decode_size_max": server_metrics.get("selective_decode_size_max", 0),
+            "avg_selective_decode_size": server_metrics.get("avg_selective_decode_size", 0),
+            "selective_decode_steps_total": server_metrics.get("selective_decode_steps_total", 0),
+            "selective_decode_linear_batch_rows_total":
+                server_metrics.get("selective_decode_linear_batch_rows_total", 0),
+            "selective_decode_attention_per_sequence_calls_total":
+                server_metrics.get("selective_decode_attention_per_sequence_calls_total", 0),
+            "selective_decode_lm_head_rows_total":
+                server_metrics.get("selective_decode_lm_head_rows_total", 0),
+            "selective_decode_fallbacks_total":
+                server_metrics.get("selective_decode_fallbacks_total", 0),
+            "selective_decode_model_ms_total":
+                server_metrics.get("selective_decode_model_ms_total", 0),
             "server_requests_total": server_metrics.get("requests_total", 0),
             "server_requests_finished": server_metrics.get("requests_finished", 0),
             "server_requests_failed": server_metrics.get("requests_failed", 0),
@@ -843,6 +898,22 @@ class BenchmarkRunner:
                     "prefill_batching", rep, conc, reqs, True
                 )
 
+    def run_selective_decode(self):
+        for rep in range(self.args.repeats):
+            for conc in self.args.concurrency_values:
+                reqs = [
+                    self.request_for_topic(TOPICS[i % len(TOPICS)], "short", 96)
+                    for i in range(conc)
+                ]
+                self.run_server_scenario(
+                    "selective-decode", "selective_decode_off",
+                    "continuous_batching", rep, conc, reqs, True
+                )
+                self.run_server_scenario(
+                    "selective-decode", "selective_decode_on",
+                    "selective_decode", rep, conc, reqs, True
+                )
+
     def run_paged_attention(self):
         for rep in range(self.args.repeats):
             for context_repeat in (5, 10, 20, 40):
@@ -866,6 +937,7 @@ class BenchmarkRunner:
             ("paged_attention", "paged_attention"),
             ("prefix_cache", "prefix_cache"),
             ("continuous_batching", "continuous_batching"),
+            ("selective_decode", "selective_decode"),
             ("full_stack", "full_stack"),
         ]
         conc = self.args.concurrency_values[0] if self.args.concurrency_values else 4
@@ -889,7 +961,7 @@ class BenchmarkRunner:
         if self.args.suite == "all":
             suites = [
                 "smoke", "prefix-cache", "continuous-batching",
-                "prefill-batching", "paged-attention", "full",
+                "prefill-batching", "selective-decode", "paged-attention", "full",
             ]
         for suite in suites:
             if suite == "smoke":
@@ -900,6 +972,8 @@ class BenchmarkRunner:
                 self.run_continuous_batching()
             elif suite == "prefill-batching":
                 self.run_prefill_batching()
+            elif suite == "selective-decode":
+                self.run_selective_decode()
             elif suite == "paged-attention":
                 self.run_paged_attention()
             elif suite == "full":
@@ -935,7 +1009,8 @@ class BenchmarkRunner:
             "suite", "scenario", "mode", "repeat", "concurrency",
             "success_count", "fail_count", "p95_client_ttft_ms",
             "aggregate_output_tok_s", "decode_batch_size_max",
-            "prefill_microbatch_size_max", "paged_attention_fallbacks",
+            "selective_decode_size_max", "prefill_microbatch_size_max",
+            "paged_attention_fallbacks",
         ]
         lines.append("| " + " | ".join(cols) + " |")
         lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
@@ -983,6 +1058,15 @@ class BenchmarkRunner:
                 f"tokens = {best.get('prefill_microbatch_tokens_total', 0)}; "
                 "executor=conservative."
             )
+        selective = [s for s in self.summaries if s["scenario"] == "selective_decode_on"]
+        if selective:
+            best = max(selective, key=lambda x: int(x.get("selective_decode_size_max") or 0))
+            lines.append(
+                "- Selective decode: "
+                f"max batch size = {best.get('selective_decode_size_max', 0)}, "
+                f"avg = {fmt(best.get('avg_selective_decode_size'))}, "
+                f"fallbacks = {best.get('selective_decode_fallbacks_total', 0)}."
+            )
         paged = [s for s in self.summaries if "paged_attention" in s["scenario"] or s["mode"] == "paged_attention"]
         if paged:
             fallbacks = sum(int(s.get("paged_attention_fallbacks") or 0) for s in paged)
@@ -1016,7 +1100,7 @@ def build_arg_parser():
         default="smoke",
         choices=[
             "smoke", "prefix-cache", "continuous-batching", "prefill-batching",
-            "paged-attention", "full", "all",
+            "selective-decode", "paged-attention", "full", "all",
         ],
     )
     p.add_argument("--threads", type=int, default=4)
@@ -1035,6 +1119,8 @@ def build_arg_parser():
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--prompt-repeat", type=int, default=20)
     p.add_argument("--stream-prefix-cache", action="store_true")
+    p.add_argument("--selective-decode-max-batch", type=int, default=8)
+    p.add_argument("--selective-decode-min-batch", type=int, default=2)
     p.add_argument("--keep-logs", action="store_true", default=True)
     p.add_argument("--no-kill", action="store_true")
     p.add_argument("--verbose", action="store_true")
@@ -1046,6 +1132,8 @@ def main(argv=None):
     if args.suite == "continuous-batching":
         default_conc = [1, 2, 4, 8]
     elif args.suite == "prefill-batching":
+        default_conc = [2, 4, 8]
+    elif args.suite == "selective-decode":
         default_conc = [2, 4, 8]
     elif args.suite == "full":
         default_conc = [4]

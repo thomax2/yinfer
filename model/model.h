@@ -99,6 +99,25 @@ public:
     };
 
     PrefillChunkStats last_prefill_chunk_stats;
+
+    struct SelectiveDecodeItem {
+        SequenceState* seq = nullptr;
+        int input_token = -1;
+    };
+
+    struct SelectiveDecodeOutput {
+        int next_token = -1;
+        bool success = false;
+        std::string error_message;
+    };
+
+    struct SelectiveDecodeStats {
+        int batch_size = 0;
+        int linear_batch_rows = 0;
+        int attention_per_sequence_calls = 0;
+        int lm_head_rows = 0;
+        double model_ms = 0.0;
+    };
     
     // 【新增】：提供一个手动清空记忆的接口
     void clear_history() {
@@ -167,6 +186,14 @@ public:
         const SamplingParams& sampling,
         std::mt19937_64& rng,
         SamplingRuntimeStats* stats
+    );
+
+    bool decode_selective_batch_for_sequences(
+        const std::vector<SelectiveDecodeItem>& items,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache,
+        std::vector<SelectiveDecodeOutput>* outputs,
+        SelectiveDecodeStats* stats
     );
 
     int sample_next_token_from_last_logits(

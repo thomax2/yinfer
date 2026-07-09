@@ -52,6 +52,18 @@ struct RequestMetrics {
     int scheduler_v2_prefill_steps = 0;
     int active_decode_batch_size_at_finish = 0;
 
+    bool selective_decode_enabled = false;
+    int selective_decode_steps = 0;
+    int selective_decode_size_sum = 0;
+    int selective_decode_size_max = 0;
+    double selective_decode_size_avg = 0.0;
+    int selective_decode_linear_batch_rows = 0;
+    int selective_decode_attention_per_sequence_calls = 0;
+    int selective_decode_lm_head_rows = 0;
+    int selective_decode_fallbacks = 0;
+    double selective_decode_model_ms = 0.0;
+    std::string selective_decode_mode = "none";
+
     bool prefill_batching_enabled = false;
     int prefill_microbatch_steps = 0;
     int prefill_microbatch_size_sum = 0;

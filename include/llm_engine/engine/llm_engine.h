@@ -144,6 +144,10 @@ private:
     void schedule_next_request();
     void admit_waiting_requests_v2();
     bool run_decode_batch_step();
+    bool run_decode_batch_step_conservative();
+    bool run_selective_decode_batch_step();
+    bool build_selective_decode_batch(std::vector<RequestId>* selected);
+    bool run_decode_post_emit_conservative(RequestState& request, SequenceState& seq, int token_id);
     bool run_prefill_chunk_step();
     bool run_prefill_microbatch_step();
     PrefillMicroBatch build_prefill_microbatch();
@@ -203,6 +207,15 @@ private:
     bool prefill_microbatch_when_decode_empty_ = true;
     std::string prefill_microbatch_executor_ = "conservative";
     bool prefill_microbatch_strict_ = false;
+    bool selective_decode_enabled_ = false;
+    int selective_decode_max_batch_ = 8;
+    int selective_decode_min_batch_ = 2;
+    bool selective_decode_greedy_only_ = true;
+    bool selective_decode_allow_sampling_ = false;
+    bool selective_decode_fallback_ = true;
+    bool selective_decode_compare_ = false;
+    bool selective_decode_debug_ = false;
+    bool selective_decode_debug_verbose_ = false;
     int max_active_decode_requests_ = 8;
     int cont_batch_max_prefill_chunks_per_step_ = 1;
     int prefill_step_tokens_ = 1;

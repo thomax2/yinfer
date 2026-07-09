@@ -49,6 +49,15 @@ private:
     int64_t scheduler_v2_decode_steps_total_ = 0;
     int64_t scheduler_v2_prefill_steps_total_ = 0;
     int active_decode_batch_size_ = 0;
+    bool selective_decode_enabled_ = false;
+    int64_t selective_decode_steps_total_ = 0;
+    int64_t selective_decode_size_sum_ = 0;
+    int selective_decode_size_max_ = 0;
+    int64_t selective_decode_linear_batch_rows_total_ = 0;
+    int64_t selective_decode_attention_per_sequence_calls_total_ = 0;
+    int64_t selective_decode_lm_head_rows_total_ = 0;
+    int64_t selective_decode_fallbacks_total_ = 0;
+    double selective_decode_model_ms_total_ = 0.0;
     bool prefill_batching_enabled_ = false;
     int64_t prefill_microbatch_steps_total_ = 0;
     int64_t prefill_microbatch_size_sum_ = 0;

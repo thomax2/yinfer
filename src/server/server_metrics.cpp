@@ -50,6 +50,20 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     scheduler_v2_decode_steps_total_ += metrics.scheduler_v2_decode_steps;
     scheduler_v2_prefill_steps_total_ += metrics.scheduler_v2_prefill_steps;
     active_decode_batch_size_ = metrics.active_decode_batch_size_at_finish;
+    if (metrics.selective_decode_enabled) {
+        selective_decode_enabled_ = true;
+    }
+    selective_decode_steps_total_ += metrics.selective_decode_steps;
+    selective_decode_size_sum_ += metrics.selective_decode_size_sum;
+    if (metrics.selective_decode_size_max > selective_decode_size_max_) {
+        selective_decode_size_max_ = metrics.selective_decode_size_max;
+    }
+    selective_decode_linear_batch_rows_total_ += metrics.selective_decode_linear_batch_rows;
+    selective_decode_attention_per_sequence_calls_total_ +=
+        metrics.selective_decode_attention_per_sequence_calls;
+    selective_decode_lm_head_rows_total_ += metrics.selective_decode_lm_head_rows;
+    selective_decode_fallbacks_total_ += metrics.selective_decode_fallbacks;
+    selective_decode_model_ms_total_ += metrics.selective_decode_model_ms;
     if (metrics.prefill_batching_enabled) {
         prefill_batching_enabled_ = true;
     }
@@ -127,6 +141,10 @@ std::string ServerMetrics::to_json() const {
         ? static_cast<double>(prefill_microbatch_size_sum_) /
               static_cast<double>(prefill_microbatch_steps_total_)
         : 0.0;
+    double avg_selective_decode_batch = selective_decode_steps_total_ > 0
+        ? static_cast<double>(selective_decode_size_sum_) /
+              static_cast<double>(selective_decode_steps_total_)
+        : 0.0;
     std::ostringstream os;
     os << '{'
        << "\"requests_total\":" << requests_total_
@@ -153,6 +171,18 @@ std::string ServerMetrics::to_json() const {
        << ",\"active_decode_batch_size\":" << active_decode_batch_size_
        << ",\"scheduler_v2_decode_steps\":" << scheduler_v2_decode_steps_total_
        << ",\"scheduler_v2_prefill_steps\":" << scheduler_v2_prefill_steps_total_
+       << ",\"selective_decode_enabled\":" << (selective_decode_enabled_ ? "true" : "false")
+       << ",\"selective_decode_steps_total\":" << selective_decode_steps_total_
+       << ",\"selective_decode_size_sum\":" << selective_decode_size_sum_
+       << ",\"selective_decode_size_max\":" << selective_decode_size_max_
+       << ",\"avg_selective_decode_size\":" << avg_selective_decode_batch
+       << ",\"selective_decode_linear_batch_rows_total\":"
+       << selective_decode_linear_batch_rows_total_
+       << ",\"selective_decode_attention_per_sequence_calls_total\":"
+       << selective_decode_attention_per_sequence_calls_total_
+       << ",\"selective_decode_lm_head_rows_total\":" << selective_decode_lm_head_rows_total_
+       << ",\"selective_decode_fallbacks_total\":" << selective_decode_fallbacks_total_
+       << ",\"selective_decode_model_ms_total\":" << selective_decode_model_ms_total_
        << ",\"prefill_batching_enabled\":" << (prefill_batching_enabled_ ? "true" : "false")
        << ",\"prefill_microbatch_steps_total\":" << prefill_microbatch_steps_total_
        << ",\"prefill_microbatch_size_sum\":" << prefill_microbatch_size_sum_

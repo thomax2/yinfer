@@ -1,5 +1,6 @@
 #include "model.h"
 #include "backends/cpu/arm_neon/kernel_common.h"
+#include "llm_engine/metrics/metrics.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1018,6 +1019,300 @@ int QwenModel::decode_one_for_sequence(
     seq.all_tokens.push_back(input_token);
     seq.history_pos++;
     return next_token;
+}
+
+bool QwenModel::decode_selective_batch_for_sequences(
+    const std::vector<SelectiveDecodeItem>& items,
+    KVCacheManager& kv_manager,
+    PrefixCache* /*prefix_cache*/,
+    std::vector<SelectiveDecodeOutput>* outputs,
+    SelectiveDecodeStats* stats
+) {
+    const uint64_t begin_us = model_now_us();
+    if (outputs) {
+        outputs->assign(items.size(), SelectiveDecodeOutput{});
+    }
+    if (stats) {
+        *stats = SelectiveDecodeStats{};
+        stats->batch_size = static_cast<int>(items.size());
+    }
+    if (!kv_cache || items.empty()) {
+        return false;
+    }
+
+    const int B = static_cast<int>(items.size());
+    const int H = config.hidden_dim;
+    const int q_size = config.num_q_heads * config.head_dim;
+    const int kv_size = config.num_kv_heads * config.head_dim;
+    const int num_rep = config.num_q_heads / config.num_kv_heads;
+    const int max_seq_len = kv_cache->get_max_seq_len();
+
+    for (int i = 0; i < B; ++i) {
+        SequenceState* seq = items[(size_t)i].seq;
+        int token_id = items[(size_t)i].input_token;
+        if (!seq || token_id < 0 || token_id >= config.vocab_size ||
+            seq->history_pos < 0 || seq->history_pos >= config.max_seq_len) {
+            if (outputs) {
+                (*outputs)[(size_t)i].error_message = "invalid selective decode item";
+            }
+            return false;
+        }
+        if (!kv_manager.ensure_block_for_position(*seq, seq->history_pos)) {
+            seq->status = SequenceStatus::FAILED;
+            seq->error_message = "failed to allocate decode KV block";
+            if (outputs) {
+                (*outputs)[(size_t)i].error_message = seq->error_message;
+            }
+            return false;
+        }
+    }
+
+    ensure_block_workspace();
+    last_batch_norm_out_valid_ = false;
+
+    std::vector<int> positions((size_t)B);
+    std::vector<fp16_t> hidden((size_t)B * H);
+    std::vector<fp16_t> residual((size_t)B * H);
+    std::vector<fp16_t> norm((size_t)B * H);
+    std::vector<fp16_t> q((size_t)B * q_size);
+    std::vector<fp16_t> k((size_t)B * kv_size);
+    std::vector<fp16_t> v((size_t)B * kv_size);
+    std::vector<fp16_t> attn_out((size_t)B * q_size);
+    std::vector<fp16_t> proj_out((size_t)B * H);
+    std::vector<fp16_t> score((size_t)num_rep * max_seq_len);
+
+    for (int row = 0; row < B; ++row) {
+        positions[(size_t)row] = items[(size_t)row].seq->history_pos;
+        const fp16_t* embed =
+            embed_tokens_w.ptr<fp16_t>() + (size_t)items[(size_t)row].input_token * H;
+        std::memcpy(
+            hidden.data() + (size_t)row * H,
+            embed,
+            (size_t)H * sizeof(fp16_t));
+    }
+
+    arm_neon::AttentionConfig attn_config{
+        config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim};
+    arm_neon::FFNConfig ffn_config{config.hidden_dim, config.intermediate_size};
+    Workspace block_ws(block_workspace, block_workspace_bytes);
+    const bool paged_attention_requested = env_flag("LLM_ENABLE_PAGED_ATTENTION");
+    const bool strict_paged_attention = env_flag("LLM_PAGED_ATTENTION_STRICT");
+
+    for (int layer_id = 0; layer_id < config.num_layers; ++layer_id) {
+        auto& layer = layers[(size_t)layer_id];
+        std::memcpy(residual.data(), hidden.data(), (size_t)B * H * sizeof(fp16_t));
+        for (int row = 0; row < B; ++row) {
+            arm_neon::rmsnorm_f16_neon(
+                hidden.data() + (size_t)row * H,
+                layer.norm1_w.ptr<fp16_t>(),
+                norm.data() + (size_t)row * H,
+                H,
+                config.rms_norm_eps);
+        }
+
+        Status status = arm_neon::linear_gptq_int8_batch_neon(
+            norm.data(), B, layer.q_proj, q.data(), layer.b_q.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return false;
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            norm.data(), B, layer.k_proj, k.data(), layer.b_k.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return false;
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            norm.data(), B, layer.v_proj, v.data(), layer.b_v.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return false;
+        if (stats) {
+            stats->linear_batch_rows += B * 3;
+        }
+
+        for (int row = 0; row < B; ++row) {
+            SequenceState* seq = items[(size_t)row].seq;
+            int pos = positions[(size_t)row];
+            const fp16_t* cos_ptr = cos_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
+            const fp16_t* sin_ptr = sin_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
+            fp16_t* q_row = q.data() + (size_t)row * q_size;
+            fp16_t* k_row = k.data() + (size_t)row * kv_size;
+            fp16_t* v_row = v.data() + (size_t)row * kv_size;
+            for (int h = 0; h < config.num_q_heads; ++h) {
+                arm_neon::rope_f16_neon(q_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+            }
+            for (int h = 0; h < config.num_kv_heads; ++h) {
+                arm_neon::rope_f16_neon(k_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
+            }
+            kv_cache->set_active_sequence(&seq->block_table, &seq->max_written_pos);
+            kv_cache->update(layer_id, pos, k_row, v_row);
+            kv_cache->clear_active_sequence();
+        }
+
+        float scale = 1.0f / std::sqrt((float)config.head_dim);
+        for (int row = 0; row < B; ++row) {
+            SequenceState* seq = items[(size_t)row].seq;
+            int current_seq_len = positions[(size_t)row] + 1;
+            fp16_t* q_row = q.data() + (size_t)row * q_size;
+            fp16_t* out_row = attn_out.data() + (size_t)row * q_size;
+            kv_cache->set_active_sequence(&seq->block_table, &seq->max_written_pos);
+
+            PagedKVView paged_view;
+            bool use_paged_attention = false;
+            const fp16_t* raw_k_pages = nullptr;
+            const fp16_t* raw_v_pages = nullptr;
+            const int* paged_block_table = nullptr;
+            int paged_block_table_size = 0;
+            if (paged_attention_requested &&
+                kv_cache->is_paged() &&
+                kv_cache->get_active_paged_view(&paged_view) &&
+                paged_view.block_table &&
+                paged_view.seq_len >= current_seq_len &&
+                paged_view.head_dim == config.head_dim &&
+                paged_view.num_kv_heads == config.num_kv_heads &&
+                paged_view.num_layers > layer_id &&
+                paged_view.block_size > 0) {
+                raw_k_pages = kv_cache->raw_k_pages();
+                raw_v_pages = kv_cache->raw_v_pages();
+                if (raw_k_pages && raw_v_pages) {
+                    paged_block_table = paged_view.block_table->data();
+                    paged_block_table_size = static_cast<int>(paged_view.block_table->size());
+                    use_paged_attention = true;
+                }
+            }
+            if (paged_attention_requested && !use_paged_attention) {
+                llm_engine::record_paged_attention_fallback();
+            }
+
+            for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
+                fp16_t* q_group_ptr = q_row + kv_head * num_rep * config.head_dim;
+                fp16_t* out_group_ptr = out_row + kv_head * num_rep * config.head_dim;
+                Tensor Score({num_rep, current_seq_len}, score.data(), DataType::FP16);
+                bool used_paged_group = false;
+                if (use_paged_attention) {
+                    Status paged_status = arm_neon::attention_decode_score_paged_f16_neon(
+                        q_group_ptr, score.data(), num_rep, current_seq_len,
+                        config.head_dim, scale, raw_k_pages, paged_block_table,
+                        paged_block_table_size, paged_view.block_size, layer_id,
+                        kv_head, paged_view.num_layers, paged_view.num_kv_heads,
+                        paged_view.num_physical_blocks);
+                    if (paged_status == Status::SUCCESS) {
+                        paged_status = arm_neon::softmax_f16_neon(Score, Score);
+                    }
+                    if (paged_status == Status::SUCCESS) {
+                        paged_status = arm_neon::attention_decode_value_paged_f16_neon(
+                            score.data(), out_group_ptr, num_rep, current_seq_len,
+                            config.head_dim, raw_v_pages, paged_block_table,
+                            paged_block_table_size, paged_view.block_size, layer_id,
+                            kv_head, paged_view.num_layers, paged_view.num_kv_heads,
+                            paged_view.num_physical_blocks);
+                    }
+                    if (paged_status == Status::SUCCESS) {
+                        used_paged_group = true;
+                        llm_engine::record_paged_attention_call();
+                    } else {
+                        llm_engine::record_paged_attention_fallback();
+                        if (strict_paged_attention) {
+                            kv_cache->clear_active_sequence();
+                            return false;
+                        }
+                    }
+                }
+                if (!used_paged_group) {
+                    fp16_t* k_cache_ptr = kv_cache->get_k_head_ptr(layer_id, kv_head);
+                    fp16_t* v_cache_ptr = kv_cache->get_v_head_ptr(layer_id, kv_head);
+                    arm_neon::attention_decode_score_f16_neon(
+                        q_group_ptr, k_cache_ptr, score.data(), num_rep,
+                        current_seq_len, config.head_dim, scale);
+                    status = arm_neon::softmax_f16_neon(Score, Score);
+                    if (status != Status::SUCCESS) {
+                        kv_cache->clear_active_sequence();
+                        return false;
+                    }
+                    arm_neon::attention_decode_value_f16_neon(
+                        score.data(), v_cache_ptr, out_group_ptr, num_rep,
+                        current_seq_len, config.head_dim);
+                }
+            }
+            kv_cache->clear_active_sequence();
+            if (stats) {
+                stats->attention_per_sequence_calls++;
+            }
+        }
+
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            attn_out.data(), B, layer.o_proj, proj_out.data(), nullptr, nullptr, 0);
+        if (status != Status::SUCCESS) return false;
+        if (stats) {
+            stats->linear_batch_rows += B;
+        }
+        for (size_t i = 0; i < hidden.size(); ++i) {
+            hidden[i] = (fp16_t)((float)residual[i] + (float)proj_out[i]);
+        }
+
+        std::memcpy(residual.data(), hidden.data(), (size_t)B * H * sizeof(fp16_t));
+        for (int row = 0; row < B; ++row) {
+            arm_neon::rmsnorm_f16_neon(
+                hidden.data() + (size_t)row * H,
+                layer.norm2_w.ptr<fp16_t>(),
+                norm.data() + (size_t)row * H,
+                H,
+                config.rms_norm_eps);
+        }
+        Tensor norm_tensor({B, H}, norm.data(), DataType::FP16);
+        Tensor ffn_out({B, H}, proj_out.data(), DataType::FP16);
+        status = arm_neon::ffn_f16_gptq_batch_neon(
+            norm_tensor, ffn_out, layer.gate_proj, layer.up_proj,
+            layer.down_proj, ffn_config, block_ws);
+        if (status != Status::SUCCESS) return false;
+        if (stats) {
+            stats->linear_batch_rows += B * 3;
+        }
+        for (size_t i = 0; i < hidden.size(); ++i) {
+            hidden[i] = (fp16_t)((float)residual[i] + (float)proj_out[i]);
+        }
+    }
+
+    std::vector<fp16_t> final_norm((size_t)B * H);
+    for (int row = 0; row < B; ++row) {
+        arm_neon::rmsnorm_f16_neon(
+            hidden.data() + (size_t)row * H,
+            final_norm_w.ptr<fp16_t>(),
+            final_norm.data() + (size_t)row * H,
+            H,
+            config.rms_norm_eps);
+    }
+    std::vector<fp16_t> logits((size_t)B * config.vocab_size);
+    Status status = arm_neon::linear_gptq_int8_batch_neon(
+        final_norm.data(), B, lm_head, logits.data(), nullptr, nullptr, 0);
+    if (status != Status::SUCCESS) return false;
+    if (stats) {
+        stats->linear_batch_rows += B;
+        stats->lm_head_rows = B;
+    }
+    for (int row = 0; row < B; ++row) {
+        const fp16_t* row_logits = logits.data() + (size_t)row * config.vocab_size;
+        int best_id = -1;
+        float best_value = -std::numeric_limits<float>::infinity();
+        for (int id = 0; id < config.vocab_size; ++id) {
+            float value = static_cast<float>(row_logits[(size_t)id]);
+            if (value > best_value) {
+                best_value = value;
+                best_id = id;
+            }
+        }
+        if (best_id < 0 || best_id >= config.vocab_size) {
+            if (outputs) {
+                (*outputs)[(size_t)row].error_message = "selective lm_head argmax failed";
+            }
+            return false;
+        }
+        SequenceState* seq = items[(size_t)row].seq;
+        seq->all_tokens.push_back(items[(size_t)row].input_token);
+        seq->history_pos++;
+        seq->max_written_pos = std::max(seq->max_written_pos, seq->history_pos - 1);
+        if (outputs) {
+            (*outputs)[(size_t)row].next_token = best_id;
+            (*outputs)[(size_t)row].success = true;
+        }
+    }
+    if (stats) {
+        stats->model_ms = static_cast<double>(model_now_us() - begin_us) / 1000.0;
+    }
+    return true;
 }
 
 int QwenModel::decode_one_for_sequence_sampled(

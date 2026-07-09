@@ -180,6 +180,60 @@ Status softmax_f16_neon(
     Tensor& output
 );
 
+void attention_decode_score_f16_neon(
+    const fp16_t* q,
+    const fp16_t* k_cache,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale
+);
+
+void attention_decode_value_f16_neon(
+    const fp16_t* score,
+    const fp16_t* v_cache,
+    fp16_t* out,
+    int num_rep,
+    int seq_len,
+    int head_dim
+);
+
+Status attention_decode_score_paged_f16_neon(
+    const fp16_t* q,
+    fp16_t* score,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    float scale,
+    const fp16_t* raw_k_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+);
+
+Status attention_decode_value_paged_f16_neon(
+    const fp16_t* score,
+    fp16_t* out,
+    int num_rep,
+    int seq_len,
+    int head_dim,
+    const fp16_t* raw_v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks
+);
+
 void add_neon(
     const Tensor& A,
     const Tensor& B,
