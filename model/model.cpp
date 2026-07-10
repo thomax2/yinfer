@@ -193,9 +193,27 @@ bool QwenModel::load_gptq_weight_from_bins(const std::string& prefix, arm_neon::
 
     std::string gidx_path = prefix + ".g_idx.i32.bin";
     if (file_exists(gidx_path)) {
-        allocate_tensor(w.g_idx, {w.K}, DataType::INT32);
-        if (!load_tensor_from_bin(gidx_path, w.g_idx)) return false;
-        w.has_g_idx = true;
+        std::vector<int32_t> g_idx((size_t)w.K);
+        if (!read_exact_file(gidx_path, g_idx.data(), g_idx.size() * sizeof(int32_t))) {
+            return false;
+        }
+        bool canonical = true;
+        for (int k = 0; k < w.K; ++k) {
+            if (g_idx[(size_t)k] != k / w.group_size) {
+                canonical = false;
+                break;
+            }
+        }
+        if (canonical) {
+            // A canonical g_idx carries no permutation information. Treating it
+            // as the implicit group mapping preserves the exact quantization
+            // semantics and keeps the true batch kernel on its optimized path.
+            w.has_g_idx = false;
+        } else {
+            allocate_tensor(w.g_idx, {w.K}, DataType::INT32);
+            std::memcpy(w.g_idx.data, g_idx.data(), g_idx.size() * sizeof(int32_t));
+            w.has_g_idx = true;
+        }
     }
     return true;
 }

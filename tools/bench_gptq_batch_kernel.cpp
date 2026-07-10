@@ -33,6 +33,7 @@ struct OwnedWeight {
     std::vector<int8_t> qweight;
     std::vector<fp16_t> scales;
     std::vector<int8_t> zeros;
+    std::vector<int32_t> g_idx;
 };
 
 bool read_exact(const std::string& path, void* data, size_t bytes) {
@@ -78,6 +79,30 @@ bool load_weight(const std::string& dir, const OpSpec& spec, OwnedWeight* owned)
     w.zeros_pack.data = owned->zeros.data();
     w.zeros_pack.dtype = llm_engine::DataType::INT8;
     w.zeros_pack.owns_data = false;
+    std::string gidx_path = prefix + ".g_idx.i32.bin";
+    std::ifstream gidx_probe(gidx_path, std::ios::binary);
+    if (gidx_probe.good()) {
+        gidx_probe.close();
+        owned->g_idx.resize((size_t)w.K);
+        if (!read_exact(gidx_path, owned->g_idx.data(),
+                        owned->g_idx.size() * sizeof(int32_t))) {
+            std::cerr << "failed to load g_idx: " << gidx_path << std::endl;
+            return false;
+        }
+        bool canonical = true;
+        for (int k = 0; k < w.K; ++k) {
+            if (owned->g_idx[(size_t)k] != k / w.group_size) {
+                canonical = false;
+                break;
+            }
+        }
+        if (!canonical) {
+            w.g_idx.data = owned->g_idx.data();
+            w.g_idx.dtype = llm_engine::DataType::INT32;
+            w.g_idx.owns_data = false;
+            w.has_g_idx = true;
+        }
+    }
     return true;
 }
 
