@@ -92,5 +92,27 @@ void rmsnorm_f16_neon(
     }
 }
 
+Status rmsnorm_f16_batch_neon(
+    const fp16_t* x,
+    const fp16_t* weight,
+    fp16_t* y,
+    int rows,
+    int hidden_size,
+    float eps
+) {
+    if (!x || !weight || !y || rows <= 0 || hidden_size <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+    for (int row = 0; row < rows; ++row) {
+        rmsnorm_f16_neon(
+            x + (size_t)row * hidden_size,
+            weight,
+            y + (size_t)row * hidden_size,
+            hidden_size,
+            eps);
+    }
+    return Status::SUCCESS;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

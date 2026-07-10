@@ -73,6 +73,19 @@ struct ArgmaxResult {
     float value;
 };
 
+struct GPTQBatchKernelStats {
+    uint64_t kernel_calls = 0;
+    uint64_t rows_total = 0;
+    uint64_t output_panel_tasks = 0;
+    uint64_t row_gemv_fallbacks = 0;
+    uint64_t weight_vector_loads = 0;
+    uint64_t dequant_vector_ops = 0;
+    uint64_t argmax_calls = 0;
+    uint64_t argmax_rows = 0;
+    uint64_t full_logits_elements_written = 0;
+    uint64_t compare_mismatches = 0;
+};
+
 // LM Head 专用：fused parallel argmax，不输出完整 logits。
 // 每个 worker 维护一个 local 最大值，最后归并。
 ArgmaxResult linear_decode_prepacked_argmax_parallel_neon(
@@ -115,6 +128,26 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
     const GPTQInt8Weight& w,
     void* workspace = nullptr,
     size_t workspace_bytes = 0
+);
+
+size_t linear_gptq_int8_batch_argmax_workspace_bytes(
+    int rows,
+    const GPTQInt8Weight& w
+);
+
+Status linear_gptq_int8_decode_argmax_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    ArgmaxResult* results,
+    void* workspace = nullptr,
+    size_t workspace_bytes = 0
+);
+
+GPTQBatchKernelStats snapshot_gptq_batch_kernel_stats();
+GPTQBatchKernelStats diff_gptq_batch_kernel_stats(
+    const GPTQBatchKernelStats& begin,
+    const GPTQBatchKernelStats& end
 );
 
 Status fused_gate_up_swiglu_gptq_int8_decode_neon(
@@ -178,6 +211,12 @@ Status softmax_neon(
 Status softmax_f16_neon(
     const Tensor& input,
     Tensor& output
+);
+
+Status softmax_f16_inplace_neon(
+    fp16_t* data,
+    int rows,
+    int cols
 );
 
 void attention_decode_score_f16_neon_public(
@@ -246,6 +285,13 @@ void add_f16_neon(
     Tensor& C
 );
 
+void add_f16_batch_neon(
+    const fp16_t* a,
+    const fp16_t* b,
+    fp16_t* out,
+    size_t elements
+);
+
 void rmsnorm_neon(
     const float* x,
     const float* weight,
@@ -259,6 +305,15 @@ void rmsnorm_f16_neon(
     const fp16_t* weight,
     fp16_t* y,
     int n,
+    float eps
+);
+
+Status rmsnorm_f16_batch_neon(
+    const fp16_t* x,
+    const fp16_t* weight,
+    fp16_t* y,
+    int rows,
+    int hidden_size,
     float eps
 );
 
@@ -276,6 +331,18 @@ void rope_f16_neon(
     int n
 );
 
+Status rope_qk_f16_batch_neon(
+    fp16_t* q,
+    fp16_t* k,
+    const int* positions,
+    int rows,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const fp16_t* cos_cache,
+    const fp16_t* sin_cache
+);
+
 void swiglu_neon(
     const float* x,
     const float* up,
@@ -288,6 +355,13 @@ void swiglu_f16_neon(
     const fp16_t* up,
     fp16_t* y,
     int n
+);
+
+void swiglu_f16_batch_neon(
+    fp16_t* gate,
+    const fp16_t* up,
+    int rows,
+    int intermediate_size
 );
 
 struct AttentionConfig {

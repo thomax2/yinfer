@@ -115,6 +115,12 @@ QwenModel::QwenModel(const QwenConfig& cfg)
 }
 
 QwenModel::~QwenModel() {
+    if (selective_decode_workspace) {
+        g_memory_pool->free_block(selective_decode_workspace);
+        selective_decode_workspace = nullptr;
+        selective_decode_workspace_bytes = 0;
+        selective_decode_workspace_max_batch = 0;
+    }
     if (block_workspace) {
         g_memory_pool->free_block(block_workspace);
         block_workspace = nullptr;
@@ -258,6 +264,86 @@ void QwenModel::ensure_block_workspace() {
     block_workspace_bytes = required_block_workspace;
     std::cerr << "[WORKSPACE] persistent_block_workspace_mb="
               << (block_workspace_bytes / 1024.0 / 1024.0) << std::endl;
+}
+
+bool QwenModel::ensure_selective_decode_workspace(int max_batch) {
+    if (max_batch <= 0 || max_batch > 8) return false;
+    if (selective_decode_workspace && selective_decode_workspace_max_batch >= max_batch) {
+        return true;
+    }
+
+    const int H = config.hidden_dim;
+    const int q_size = config.num_q_heads * config.head_dim;
+    const int kv_size = config.num_kv_heads * config.head_dim;
+    const int num_rep = config.num_q_heads / config.num_kv_heads;
+    size_t required = 64;
+    auto add_fp16 = [&](size_t elements) {
+        required += align_size(elements * sizeof(fp16_t));
+    };
+    add_fp16((size_t)max_batch * H);       // hidden
+    add_fp16((size_t)max_batch * H);       // residual
+    add_fp16((size_t)max_batch * H);       // norm/final norm
+    add_fp16((size_t)max_batch * q_size);  // q
+    add_fp16((size_t)max_batch * kv_size); // k
+    add_fp16((size_t)max_batch * kv_size); // v
+    add_fp16((size_t)max_batch * q_size);  // attention output
+    add_fp16((size_t)max_batch * H);       // projection output
+    add_fp16((size_t)max_batch * config.intermediate_size); // gate/activation
+    add_fp16((size_t)max_batch * config.intermediate_size); // up
+    add_fp16((size_t)num_rep * config.max_seq_len);          // per-request score
+    required += align_size(arm_neon::linear_gptq_int8_batch_argmax_workspace_bytes(
+        max_batch, lm_head));
+
+    void* replacement = g_memory_pool->allocate(required);
+    if (!replacement) return false;
+    if (selective_decode_workspace) {
+        g_memory_pool->free_block(selective_decode_workspace);
+    }
+    selective_decode_workspace = replacement;
+    selective_decode_workspace_bytes = required;
+    selective_decode_workspace_max_batch = max_batch;
+    selective_decode_workspace_reallocations++;
+    std::cerr << "[SELECTIVE_DECODE] workspace_mb="
+              << (required / 1024.0 / 1024.0)
+              << " workspace_max_batch=" << max_batch << std::endl;
+    return true;
+}
+
+QwenModel::SelectiveDecodeWorkspaceView
+QwenModel::selective_decode_workspace_view(int batch_size) {
+    SelectiveDecodeWorkspaceView view;
+    if (!selective_decode_workspace || batch_size <= 0 ||
+        batch_size > selective_decode_workspace_max_batch) {
+        return view;
+    }
+    const int H = config.hidden_dim;
+    const int q_size = config.num_q_heads * config.head_dim;
+    const int kv_size = config.num_kv_heads * config.head_dim;
+    const int num_rep = config.num_q_heads / config.num_kv_heads;
+    char* cursor = static_cast<char*>(selective_decode_workspace);
+    auto take_fp16 = [&](size_t elements) {
+        fp16_t* result = reinterpret_cast<fp16_t*>(cursor);
+        cursor += align_size(elements * sizeof(fp16_t));
+        return result;
+    };
+    view.hidden = take_fp16((size_t)selective_decode_workspace_max_batch * H);
+    view.residual = take_fp16((size_t)selective_decode_workspace_max_batch * H);
+    view.norm = take_fp16((size_t)selective_decode_workspace_max_batch * H);
+    view.q = take_fp16((size_t)selective_decode_workspace_max_batch * q_size);
+    view.k = take_fp16((size_t)selective_decode_workspace_max_batch * kv_size);
+    view.v = take_fp16((size_t)selective_decode_workspace_max_batch * kv_size);
+    view.attn_out = take_fp16((size_t)selective_decode_workspace_max_batch * q_size);
+    view.proj_out = take_fp16((size_t)selective_decode_workspace_max_batch * H);
+    view.gate = take_fp16(
+        (size_t)selective_decode_workspace_max_batch * config.intermediate_size);
+    view.up = take_fp16(
+        (size_t)selective_decode_workspace_max_batch * config.intermediate_size);
+    view.score = take_fp16((size_t)num_rep * config.max_seq_len);
+    view.argmax_partials = cursor;
+    view.argmax_partials_bytes =
+        selective_decode_workspace_bytes - (size_t)(cursor - static_cast<char*>(selective_decode_workspace));
+    view.bytes = selective_decode_workspace_bytes;
+    return view;
 }
 
 void QwenModel::build_graph(KVCache& cache) {
@@ -1029,125 +1115,161 @@ bool QwenModel::decode_selective_batch_for_sequences(
     SelectiveDecodeStats* stats
 ) {
     const uint64_t begin_us = model_now_us();
-    if (outputs) {
-        outputs->assign(items.size(), SelectiveDecodeOutput{});
-    }
+    const arm_neon::GPTQBatchKernelStats kernel_begin =
+        arm_neon::snapshot_gptq_batch_kernel_stats();
     if (stats) {
         *stats = SelectiveDecodeStats{};
         stats->batch_size = static_cast<int>(items.size());
     }
-    if (!kv_cache || items.empty()) {
+    if (!outputs || !kv_cache || items.empty() || items.size() > 8) {
         return false;
     }
+    outputs->resize(items.size());
+    for (auto& output : *outputs) output = SelectiveDecodeOutput{};
 
     const int B = static_cast<int>(items.size());
     const int H = config.hidden_dim;
     const int q_size = config.num_q_heads * config.head_dim;
     const int kv_size = config.num_kv_heads * config.head_dim;
     const int num_rep = config.num_q_heads / config.num_kv_heads;
-    const int max_seq_len = kv_cache->get_max_seq_len();
+    std::array<int, 8> positions{};
+
+    auto finish_stats = [&]() {
+        if (!stats) return;
+        arm_neon::GPTQBatchKernelStats kernel_end =
+            arm_neon::snapshot_gptq_batch_kernel_stats();
+        arm_neon::GPTQBatchKernelStats delta =
+            arm_neon::diff_gptq_batch_kernel_stats(kernel_begin, kernel_end);
+        stats->gptq_batch_kernel_calls = delta.kernel_calls;
+        stats->gptq_batch_rows_total = delta.rows_total;
+        stats->gptq_batch_output_panel_tasks = delta.output_panel_tasks;
+        stats->gptq_batch_row_gemv_fallbacks = delta.row_gemv_fallbacks;
+        stats->gptq_batch_weight_vector_loads = delta.weight_vector_loads;
+        stats->gptq_batch_dequant_vector_ops = delta.dequant_vector_ops;
+        stats->gptq_batch_argmax_calls = delta.argmax_calls;
+        stats->gptq_batch_argmax_rows = delta.argmax_rows;
+        stats->gptq_batch_full_logits_elements_written = delta.full_logits_elements_written;
+        stats->gptq_batch_compare_mismatches = delta.compare_mismatches;
+        stats->model_ms = static_cast<double>(model_now_us() - begin_us) / 1000.0;
+    };
+    auto fail_all = [&](const char* message) {
+        for (auto& output : *outputs) output.error_message = message;
+        finish_stats();
+        return false;
+    };
+
+    auto valid_batch_weight = [](const arm_neon::GPTQInt8Weight& weight) {
+        return weight.K > 0 && weight.N > 0 &&
+               weight.qweight_pack.data && weight.scales_pack.data &&
+               !weight.has_g_idx;
+    };
+    if (!valid_batch_weight(lm_head)) {
+        return fail_all("selective decode does not support lm_head g_idx or missing weights");
+    }
+    for (const auto& layer : layers) {
+        if (!valid_batch_weight(layer.q_proj) || !valid_batch_weight(layer.k_proj) ||
+            !valid_batch_weight(layer.v_proj) || !valid_batch_weight(layer.o_proj) ||
+            !valid_batch_weight(layer.gate_proj) || !valid_batch_weight(layer.up_proj) ||
+            !valid_batch_weight(layer.down_proj)) {
+            return fail_all("selective decode does not support g_idx or missing weights");
+        }
+    }
+
+    uint64_t reallocations_before = selective_decode_workspace_reallocations;
+    if (!ensure_selective_decode_workspace(B)) {
+        return fail_all("failed to allocate selective decode workspace");
+    }
+    if (stats) {
+        stats->selective_decode_workspace_reallocations =
+            selective_decode_workspace_reallocations - reallocations_before;
+    }
+    SelectiveDecodeWorkspaceView ws = selective_decode_workspace_view(B);
+    if (!ws.hidden || !ws.argmax_partials) {
+        return fail_all("invalid selective decode workspace");
+    }
 
     for (int i = 0; i < B; ++i) {
         SequenceState* seq = items[(size_t)i].seq;
         int token_id = items[(size_t)i].input_token;
         if (!seq || token_id < 0 || token_id >= config.vocab_size ||
             seq->history_pos < 0 || seq->history_pos >= config.max_seq_len) {
-            if (outputs) {
-                (*outputs)[(size_t)i].error_message = "invalid selective decode item";
-            }
+            (*outputs)[(size_t)i].error_message = "invalid selective decode item";
+            finish_stats();
             return false;
         }
+        positions[(size_t)i] = seq->history_pos;
+    }
+
+    // All checks and workspace preparation are complete before block-table or KV mutation.
+    for (int i = 0; i < B; ++i) {
+        SequenceState* seq = items[(size_t)i].seq;
         if (!kv_manager.ensure_block_for_position(*seq, seq->history_pos)) {
             seq->status = SequenceStatus::FAILED;
             seq->error_message = "failed to allocate decode KV block";
-            if (outputs) {
-                (*outputs)[(size_t)i].error_message = seq->error_message;
-            }
+            (*outputs)[(size_t)i].error_message = seq->error_message;
+            finish_stats();
             return false;
         }
     }
 
-    ensure_block_workspace();
     last_batch_norm_out_valid_ = false;
 
-    std::vector<int> positions((size_t)B);
-    std::vector<fp16_t> hidden((size_t)B * H);
-    std::vector<fp16_t> residual((size_t)B * H);
-    std::vector<fp16_t> norm((size_t)B * H);
-    std::vector<fp16_t> q((size_t)B * q_size);
-    std::vector<fp16_t> k((size_t)B * kv_size);
-    std::vector<fp16_t> v((size_t)B * kv_size);
-    std::vector<fp16_t> attn_out((size_t)B * q_size);
-    std::vector<fp16_t> proj_out((size_t)B * H);
-    std::vector<fp16_t> score((size_t)num_rep * max_seq_len);
-
     for (int row = 0; row < B; ++row) {
-        positions[(size_t)row] = items[(size_t)row].seq->history_pos;
         const fp16_t* embed =
             embed_tokens_w.ptr<fp16_t>() + (size_t)items[(size_t)row].input_token * H;
         std::memcpy(
-            hidden.data() + (size_t)row * H,
+            ws.hidden + (size_t)row * H,
             embed,
             (size_t)H * sizeof(fp16_t));
     }
 
-    arm_neon::AttentionConfig attn_config{
-        config.hidden_dim, config.num_q_heads, config.num_kv_heads, config.head_dim};
-    arm_neon::FFNConfig ffn_config{config.hidden_dim, config.intermediate_size};
-    Workspace block_ws(block_workspace, block_workspace_bytes);
     const bool paged_attention_requested = env_flag("LLM_ENABLE_PAGED_ATTENTION");
     const bool strict_paged_attention = env_flag("LLM_PAGED_ATTENTION_STRICT");
 
     for (int layer_id = 0; layer_id < config.num_layers; ++layer_id) {
         auto& layer = layers[(size_t)layer_id];
-        std::memcpy(residual.data(), hidden.data(), (size_t)B * H * sizeof(fp16_t));
-        for (int row = 0; row < B; ++row) {
-            arm_neon::rmsnorm_f16_neon(
-                hidden.data() + (size_t)row * H,
-                layer.norm1_w.ptr<fp16_t>(),
-                norm.data() + (size_t)row * H,
-                H,
-                config.rms_norm_eps);
-        }
+        std::memcpy(ws.residual, ws.hidden, (size_t)B * H * sizeof(fp16_t));
+        Status status = arm_neon::rmsnorm_f16_batch_neon(
+            ws.hidden, layer.norm1_w.ptr<fp16_t>(), ws.norm,
+            B, H, config.rms_norm_eps);
+        if (status != Status::SUCCESS) return fail_all("selective batch norm1 failed");
 
-        Status status = arm_neon::linear_gptq_int8_batch_neon(
-            norm.data(), B, layer.q_proj, q.data(), layer.b_q.ptr<fp16_t>(), nullptr, 0);
-        if (status != Status::SUCCESS) return false;
         status = arm_neon::linear_gptq_int8_batch_neon(
-            norm.data(), B, layer.k_proj, k.data(), layer.b_k.ptr<fp16_t>(), nullptr, 0);
-        if (status != Status::SUCCESS) return false;
+            ws.norm, B, layer.q_proj, ws.q, layer.b_q.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective q projection failed");
         status = arm_neon::linear_gptq_int8_batch_neon(
-            norm.data(), B, layer.v_proj, v.data(), layer.b_v.ptr<fp16_t>(), nullptr, 0);
-        if (status != Status::SUCCESS) return false;
+            ws.norm, B, layer.k_proj, ws.k, layer.b_k.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective k projection failed");
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            ws.norm, B, layer.v_proj, ws.v, layer.b_v.ptr<fp16_t>(), nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective v projection failed");
         if (stats) {
             stats->linear_batch_rows += B * 3;
         }
 
+        status = arm_neon::rope_qk_f16_batch_neon(
+            ws.q, ws.k, positions.data(), B,
+            config.num_q_heads, config.num_kv_heads, config.head_dim,
+            cos_cache.ptr<fp16_t>(), sin_cache.ptr<fp16_t>());
+        if (status != Status::SUCCESS) return fail_all("selective batch rope failed");
+
         for (int row = 0; row < B; ++row) {
             SequenceState* seq = items[(size_t)row].seq;
             int pos = positions[(size_t)row];
-            const fp16_t* cos_ptr = cos_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
-            const fp16_t* sin_ptr = sin_cache.ptr<fp16_t>() + (size_t)pos * config.head_dim;
-            fp16_t* q_row = q.data() + (size_t)row * q_size;
-            fp16_t* k_row = k.data() + (size_t)row * kv_size;
-            fp16_t* v_row = v.data() + (size_t)row * kv_size;
-            for (int h = 0; h < config.num_q_heads; ++h) {
-                arm_neon::rope_f16_neon(q_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
-            }
-            for (int h = 0; h < config.num_kv_heads; ++h) {
-                arm_neon::rope_f16_neon(k_row + h * config.head_dim, cos_ptr, sin_ptr, config.head_dim);
-            }
+            fp16_t* k_row = ws.k + (size_t)row * kv_size;
+            fp16_t* v_row = ws.v + (size_t)row * kv_size;
             kv_cache->set_active_sequence(&seq->block_table, &seq->max_written_pos);
             kv_cache->update(layer_id, pos, k_row, v_row);
             kv_cache->clear_active_sequence();
+            if (stats) stats->state_modified = true;
         }
 
         float scale = 1.0f / std::sqrt((float)config.head_dim);
         for (int row = 0; row < B; ++row) {
             SequenceState* seq = items[(size_t)row].seq;
             int current_seq_len = positions[(size_t)row] + 1;
-            fp16_t* q_row = q.data() + (size_t)row * q_size;
-            fp16_t* out_row = attn_out.data() + (size_t)row * q_size;
+            fp16_t* q_row = ws.q + (size_t)row * q_size;
+            fp16_t* out_row = ws.attn_out + (size_t)row * q_size;
             kv_cache->set_active_sequence(&seq->block_table, &seq->max_written_pos);
 
             PagedKVView paged_view;
@@ -1180,21 +1302,21 @@ bool QwenModel::decode_selective_batch_for_sequences(
             for (int kv_head = 0; kv_head < config.num_kv_heads; ++kv_head) {
                 fp16_t* q_group_ptr = q_row + kv_head * num_rep * config.head_dim;
                 fp16_t* out_group_ptr = out_row + kv_head * num_rep * config.head_dim;
-                Tensor Score({num_rep, current_seq_len}, score.data(), DataType::FP16);
                 bool used_paged_group = false;
                 if (use_paged_attention) {
                     Status paged_status = arm_neon::attention_decode_score_paged_f16_neon_public(
-                        q_group_ptr, score.data(), num_rep, current_seq_len,
+                        q_group_ptr, ws.score, num_rep, current_seq_len,
                         config.head_dim, scale, raw_k_pages, paged_block_table,
                         paged_block_table_size, paged_view.block_size, layer_id,
                         kv_head, paged_view.num_layers, paged_view.num_kv_heads,
                         paged_view.num_physical_blocks);
                     if (paged_status == Status::SUCCESS) {
-                        paged_status = arm_neon::softmax_f16_neon(Score, Score);
+                        paged_status = arm_neon::softmax_f16_inplace_neon(
+                            ws.score, num_rep, current_seq_len);
                     }
                     if (paged_status == Status::SUCCESS) {
                         paged_status = arm_neon::attention_decode_value_paged_f16_neon_public(
-                            score.data(), out_group_ptr, num_rep, current_seq_len,
+                            ws.score, out_group_ptr, num_rep, current_seq_len,
                             config.head_dim, raw_v_pages, paged_block_table,
                             paged_block_table_size, paged_view.block_size, layer_id,
                             kv_head, paged_view.num_layers, paged_view.num_kv_heads,
@@ -1207,7 +1329,7 @@ bool QwenModel::decode_selective_batch_for_sequences(
                         llm_engine::record_paged_attention_fallback();
                         if (strict_paged_attention) {
                             kv_cache->clear_active_sequence();
-                            return false;
+                            return fail_all("strict paged attention failed");
                         }
                     }
                 }
@@ -1215,15 +1337,16 @@ bool QwenModel::decode_selective_batch_for_sequences(
                     fp16_t* k_cache_ptr = kv_cache->get_k_head_ptr(layer_id, kv_head);
                     fp16_t* v_cache_ptr = kv_cache->get_v_head_ptr(layer_id, kv_head);
                     arm_neon::attention_decode_score_f16_neon_public(
-                        q_group_ptr, k_cache_ptr, score.data(), num_rep,
+                        q_group_ptr, k_cache_ptr, ws.score, num_rep,
                         current_seq_len, config.head_dim, scale);
-                    status = arm_neon::softmax_f16_neon(Score, Score);
+                    status = arm_neon::softmax_f16_inplace_neon(
+                        ws.score, num_rep, current_seq_len);
                     if (status != Status::SUCCESS) {
                         kv_cache->clear_active_sequence();
-                        return false;
+                        return fail_all("selective attention softmax failed");
                     }
                     arm_neon::attention_decode_value_f16_neon_public(
-                        score.data(), v_cache_ptr, out_group_ptr, num_rep,
+                        ws.score, v_cache_ptr, out_group_ptr, num_rep,
                         current_seq_len, config.head_dim);
                 }
             }
@@ -1234,84 +1357,65 @@ bool QwenModel::decode_selective_batch_for_sequences(
         }
 
         status = arm_neon::linear_gptq_int8_batch_neon(
-            attn_out.data(), B, layer.o_proj, proj_out.data(), nullptr, nullptr, 0);
-        if (status != Status::SUCCESS) return false;
+            ws.attn_out, B, layer.o_proj, ws.proj_out, nullptr, nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective o projection failed");
         if (stats) {
             stats->linear_batch_rows += B;
         }
-        for (size_t i = 0; i < hidden.size(); ++i) {
-            hidden[i] = (fp16_t)((float)residual[i] + (float)proj_out[i]);
-        }
+        arm_neon::add_f16_batch_neon(
+            ws.residual, ws.proj_out, ws.hidden, (size_t)B * H);
 
-        std::memcpy(residual.data(), hidden.data(), (size_t)B * H * sizeof(fp16_t));
-        for (int row = 0; row < B; ++row) {
-            arm_neon::rmsnorm_f16_neon(
-                hidden.data() + (size_t)row * H,
-                layer.norm2_w.ptr<fp16_t>(),
-                norm.data() + (size_t)row * H,
-                H,
-                config.rms_norm_eps);
-        }
-        Tensor norm_tensor({B, H}, norm.data(), DataType::FP16);
-        Tensor ffn_out({B, H}, proj_out.data(), DataType::FP16);
-        status = arm_neon::ffn_f16_gptq_batch_neon(
-            norm_tensor, ffn_out, layer.gate_proj, layer.up_proj,
-            layer.down_proj, ffn_config, block_ws);
-        if (status != Status::SUCCESS) return false;
+        std::memcpy(ws.residual, ws.hidden, (size_t)B * H * sizeof(fp16_t));
+        status = arm_neon::rmsnorm_f16_batch_neon(
+            ws.hidden, layer.norm2_w.ptr<fp16_t>(), ws.norm,
+            B, H, config.rms_norm_eps);
+        if (status != Status::SUCCESS) return fail_all("selective batch norm2 failed");
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            ws.norm, B, layer.gate_proj, ws.gate, nullptr, nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective gate projection failed");
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            ws.norm, B, layer.up_proj, ws.up, nullptr, nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective up projection failed");
+        arm_neon::swiglu_f16_batch_neon(
+            ws.gate, ws.up, B, config.intermediate_size);
+        status = arm_neon::linear_gptq_int8_batch_neon(
+            ws.gate, B, layer.down_proj, ws.proj_out, nullptr, nullptr, 0);
+        if (status != Status::SUCCESS) return fail_all("selective down projection failed");
         if (stats) {
             stats->linear_batch_rows += B * 3;
         }
-        for (size_t i = 0; i < hidden.size(); ++i) {
-            hidden[i] = (fp16_t)((float)residual[i] + (float)proj_out[i]);
-        }
+        arm_neon::add_f16_batch_neon(
+            ws.residual, ws.proj_out, ws.hidden, (size_t)B * H);
     }
 
-    std::vector<fp16_t> final_norm((size_t)B * H);
-    for (int row = 0; row < B; ++row) {
-        arm_neon::rmsnorm_f16_neon(
-            hidden.data() + (size_t)row * H,
-            final_norm_w.ptr<fp16_t>(),
-            final_norm.data() + (size_t)row * H,
-            H,
-            config.rms_norm_eps);
-    }
-    std::vector<fp16_t> logits((size_t)B * config.vocab_size);
-    Status status = arm_neon::linear_gptq_int8_batch_neon(
-        final_norm.data(), B, lm_head, logits.data(), nullptr, nullptr, 0);
-    if (status != Status::SUCCESS) return false;
+    Status status = arm_neon::rmsnorm_f16_batch_neon(
+        ws.hidden, final_norm_w.ptr<fp16_t>(), ws.norm,
+        B, H, config.rms_norm_eps);
+    if (status != Status::SUCCESS) return fail_all("selective final norm failed");
+    std::array<arm_neon::ArgmaxResult, 8> argmax_results{};
+    status = arm_neon::linear_gptq_int8_decode_argmax_batch_neon(
+        ws.norm, B, lm_head, argmax_results.data(),
+        ws.argmax_partials, ws.argmax_partials_bytes);
+    if (status != Status::SUCCESS) return fail_all("selective batch lm_head argmax failed");
     if (stats) {
         stats->linear_batch_rows += B;
         stats->lm_head_rows = B;
     }
     for (int row = 0; row < B; ++row) {
-        const fp16_t* row_logits = logits.data() + (size_t)row * config.vocab_size;
-        int best_id = -1;
-        float best_value = -std::numeric_limits<float>::infinity();
-        for (int id = 0; id < config.vocab_size; ++id) {
-            float value = static_cast<float>(row_logits[(size_t)id]);
-            if (value > best_value) {
-                best_value = value;
-                best_id = id;
-            }
-        }
+        int best_id = argmax_results[(size_t)row].index;
         if (best_id < 0 || best_id >= config.vocab_size) {
-            if (outputs) {
-                (*outputs)[(size_t)row].error_message = "selective lm_head argmax failed";
-            }
+            (*outputs)[(size_t)row].error_message = "selective lm_head argmax failed";
+            finish_stats();
             return false;
         }
         SequenceState* seq = items[(size_t)row].seq;
         seq->all_tokens.push_back(items[(size_t)row].input_token);
         seq->history_pos++;
         seq->max_written_pos = std::max(seq->max_written_pos, seq->history_pos - 1);
-        if (outputs) {
-            (*outputs)[(size_t)row].next_token = best_id;
-            (*outputs)[(size_t)row].success = true;
-        }
+        (*outputs)[(size_t)row].next_token = best_id;
+        (*outputs)[(size_t)row].success = true;
     }
-    if (stats) {
-        stats->model_ms = static_cast<double>(model_now_us() - begin_us) / 1000.0;
-    }
+    finish_stats();
     return true;
 }
 

@@ -217,5 +217,56 @@ Status softmax_f16_neon(const Tensor& input, Tensor& output) {
     return Status::SUCCESS;
 }
 
+Status softmax_f16_inplace_neon(fp16_t* data, int rows, int cols) {
+    if (!data || rows <= 0 || cols <= 0) return Status::INVALID_ARGUMENT;
+    for (int row = 0; row < rows; ++row) {
+        fp16_t* values = data + (size_t)row * cols;
+        float max_val = -std::numeric_limits<float>::infinity();
+        int i = 0;
+        for (; i <= cols - 8; i += 8) {
+            float16x8_t hv = vld1q_f16(values + i);
+            max_val = std::max(max_val, vmaxvq_f32(vcvt_f32_f16(vget_low_f16(hv))));
+            max_val = std::max(max_val, vmaxvq_f32(vcvt_f32_f16(vget_high_f16(hv))));
+        }
+        for (; i < cols; ++i) max_val = std::max(max_val, (float)values[i]);
+        if (std::isinf(max_val)) {
+            int count = 0;
+            for (i = 0; i < cols; ++i) if ((float)values[i] == max_val) ++count;
+            fp16_t probability = (fp16_t)(count > 0 ? 1.0f / count : 0.0f);
+            for (i = 0; i < cols; ++i) {
+                values[i] = ((float)values[i] == max_val) ? probability : (fp16_t)0;
+            }
+            continue;
+        }
+        float32x4_t vmax = vdupq_n_f32(max_val);
+        float32x4_t sum0 = vdupq_n_f32(0.0f);
+        float32x4_t sum1 = vdupq_n_f32(0.0f);
+        i = 0;
+        for (; i <= cols - 8; i += 8) {
+            float16x8_t hv = vld1q_f16(values + i);
+            float32x4_t e0 = exp_neon_f32(
+                vsubq_f32(vcvt_f32_f16(vget_low_f16(hv)), vmax));
+            float32x4_t e1 = exp_neon_f32(
+                vsubq_f32(vcvt_f32_f16(vget_high_f16(hv)), vmax));
+            sum0 = vaddq_f32(sum0, e0);
+            sum1 = vaddq_f32(sum1, e1);
+            vst1q_f16(values + i, vcombine_f16(vcvt_f16_f32(e0), vcvt_f16_f32(e1)));
+        }
+        float sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+        for (; i < cols; ++i) {
+            float value = std::exp((float)values[i] - max_val);
+            values[i] = (fp16_t)value;
+            sum += value;
+        }
+        float inv = 1.0f / sum;
+        float16x8_t hinv = vdupq_n_f16((fp16_t)inv);
+        for (i = 0; i <= cols - 8; i += 8) {
+            vst1q_f16(values + i, vmulq_f16(vld1q_f16(values + i), hinv));
+        }
+        for (; i < cols; ++i) values[i] = (fp16_t)((float)values[i] * inv);
+    }
+    return Status::SUCCESS;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

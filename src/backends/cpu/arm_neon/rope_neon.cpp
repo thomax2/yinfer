@@ -74,5 +74,38 @@ void rope_f16_neon(
     }
 }
 
+Status rope_qk_f16_batch_neon(
+    fp16_t* q,
+    fp16_t* k,
+    const int* positions,
+    int rows,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const fp16_t* cos_cache,
+    const fp16_t* sin_cache
+) {
+    if (!q || !k || !positions || !cos_cache || !sin_cache ||
+        rows <= 0 || num_q_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+    const int q_stride = num_q_heads * head_dim;
+    const int kv_stride = num_kv_heads * head_dim;
+    for (int row = 0; row < rows; ++row) {
+        if (positions[row] < 0) return Status::INVALID_ARGUMENT;
+        const fp16_t* cos_ptr = cos_cache + (size_t)positions[row] * head_dim;
+        const fp16_t* sin_ptr = sin_cache + (size_t)positions[row] * head_dim;
+        fp16_t* q_row = q + (size_t)row * q_stride;
+        fp16_t* k_row = k + (size_t)row * kv_stride;
+        for (int head = 0; head < num_q_heads; ++head) {
+            rope_f16_neon(q_row + (size_t)head * head_dim, cos_ptr, sin_ptr, head_dim);
+        }
+        for (int head = 0; head < num_kv_heads; ++head) {
+            rope_f16_neon(k_row + (size_t)head * head_dim, cos_ptr, sin_ptr, head_dim);
+        }
+    }
+    return Status::SUCCESS;
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

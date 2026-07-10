@@ -125,5 +125,15 @@ void swiglu_f16_neon(
     }
 }
 
+void swiglu_f16_batch_neon(
+    fp16_t* gate,
+    const fp16_t* up,
+    int rows,
+    int intermediate_size
+) {
+    if (!gate || !up || rows <= 0 || intermediate_size <= 0) return;
+    swiglu_f16_neon(gate, up, gate, rows * intermediate_size);
+}
+
 } // namespace arm_neon
 } // namespace llm_engine

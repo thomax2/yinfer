@@ -94,6 +94,7 @@ struct RequestState {
 class LLMEngine {
 public:
     explicit LLMEngine(QwenModel& model);
+    ~LLMEngine();
 
     RequestId submit(
         const std::vector<int>& prompt_tokens,
@@ -227,6 +228,8 @@ private:
     std::deque<RequestId> prefill_queue_;
     std::deque<RequestId> decode_ready_queue_;
     std::vector<RequestId> active_decode_requests_;
+    struct SelectiveDecodeScratch;
+    std::unique_ptr<SelectiveDecodeScratch> selective_decode_scratch_;
     std::unordered_map<RequestId, RequestState> requests_;
     std::unordered_map<SessionId, SequenceState> sessions_;
 };

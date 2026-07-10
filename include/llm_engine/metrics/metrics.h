@@ -62,6 +62,18 @@ struct RequestMetrics {
     int selective_decode_lm_head_rows = 0;
     int selective_decode_fallbacks = 0;
     double selective_decode_model_ms = 0.0;
+    uint64_t gptq_batch_kernel_calls = 0;
+    uint64_t gptq_batch_rows_total = 0;
+    uint64_t gptq_batch_output_panel_tasks = 0;
+    uint64_t gptq_batch_row_gemv_fallbacks = 0;
+    uint64_t gptq_batch_weight_vector_loads = 0;
+    uint64_t gptq_batch_dequant_vector_ops = 0;
+    uint64_t gptq_batch_argmax_calls = 0;
+    uint64_t gptq_batch_argmax_rows = 0;
+    uint64_t gptq_batch_full_logits_elements_written = 0;
+    uint64_t gptq_batch_compare_mismatches = 0;
+    uint64_t selective_decode_hotpath_allocations = 0;
+    uint64_t selective_decode_workspace_reallocations = 0;
     std::string selective_decode_mode = "none";
 
     bool prefill_batching_enabled = false;

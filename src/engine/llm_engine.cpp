@@ -71,6 +71,13 @@ bool is_stop_token(int token_id) {
 
 } // namespace
 
+struct LLMEngine::SelectiveDecodeScratch {
+    std::vector<RequestId> selected;
+    std::vector<RequestId> model_ids;
+    std::vector<QwenModel::SelectiveDecodeItem> items;
+    std::vector<QwenModel::SelectiveDecodeOutput> outputs;
+};
+
 LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     scheduler_enabled_ = env_flag("LLM_ENABLE_SCHEDULER");
     continuous_batching_enabled_ = scheduler_enabled_ && env_flag("LLM_ENABLE_CONTINUOUS_BATCHING");
@@ -148,6 +155,13 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
     if (selective_decode_min_batch_ <= 0) {
         selective_decode_min_batch_ = 1;
     }
+    selective_decode_max_batch_ = std::min(selective_decode_max_batch_, 8);
+    selective_decode_min_batch_ = std::min(selective_decode_min_batch_, selective_decode_max_batch_);
+    selective_decode_scratch_ = std::make_unique<SelectiveDecodeScratch>();
+    selective_decode_scratch_->selected.reserve(8);
+    selective_decode_scratch_->model_ids.reserve(8);
+    selective_decode_scratch_->items.reserve(8);
+    selective_decode_scratch_->outputs.reserve(8);
     if (debug_scheduler_enabled()) {
         std::cerr << "[SCHED] enabled=" << (scheduler_enabled_ ? 1 : 0)
                   << " prefill_step_tokens=" << prefill_step_tokens_
@@ -227,6 +241,8 @@ LLMEngine::LLMEngine(QwenModel& model) : model_(model) {
                   << std::endl;
     }
 }
+
+LLMEngine::~LLMEngine() = default;
 
 RequestId LLMEngine::submit(
     const std::vector<int>& prompt_tokens,
@@ -1041,15 +1057,18 @@ bool LLMEngine::run_decode_post_emit_conservative(
 }
 
 bool LLMEngine::run_selective_decode_batch_step() {
-    std::vector<RequestId> selected;
+    SelectiveDecodeScratch& scratch = *selective_decode_scratch_;
+    scratch.selected.clear();
+    scratch.model_ids.clear();
+    scratch.items.clear();
+    scratch.outputs.clear();
+    std::vector<RequestId>& selected = scratch.selected;
     if (!build_selective_decode_batch(&selected)) {
         return false;
     }
 
-    std::vector<RequestId> model_ids;
-    std::vector<QwenModel::SelectiveDecodeItem> items;
-    model_ids.reserve(selected.size());
-    items.reserve(selected.size());
+    std::vector<RequestId>& model_ids = scratch.model_ids;
+    std::vector<QwenModel::SelectiveDecodeItem>& items = scratch.items;
 
     for (RequestId id : selected) {
         auto it = requests_.find(id);
@@ -1112,7 +1131,7 @@ bool LLMEngine::run_selective_decode_batch_step() {
                   << std::endl;
     }
 
-    std::vector<QwenModel::SelectiveDecodeOutput> outputs;
+    std::vector<QwenModel::SelectiveDecodeOutput>& outputs = scratch.outputs;
     QwenModel::SelectiveDecodeStats stats;
     bool ok = model_.decode_selective_batch_for_sequences(
         items,
@@ -1134,9 +1153,20 @@ bool LLMEngine::run_selective_decode_batch_step() {
             }
             RequestState& request = it->second;
             request.metrics.selective_decode_fallbacks++;
-            request.metrics.selective_decode_mode = "fallback_model_failed";
-            if (!selective_decode_fallback_) {
-                fail_request(request, "selective decode failed");
+            request.metrics.selective_decode_mode = stats.state_modified
+                ? "failed_after_kv_write"
+                : "fallback_model_preflight";
+            if (stats.state_modified || !selective_decode_fallback_) {
+                if (stats.state_modified) {
+                    SequenceState& seq = get_or_create_session(request.session_id);
+                    seq.status = SequenceStatus::FAILED;
+                    seq.error_message = "selective decode failed after KV write";
+                }
+                std::string error = "selective decode failed";
+                if (!outputs.empty() && !outputs[0].error_message.empty()) {
+                    error = outputs[0].error_message;
+                }
+                fail_request(request, error);
                 continue;
             }
             SequenceState& seq = get_or_create_session(request.session_id);
@@ -1156,6 +1186,12 @@ bool LLMEngine::run_selective_decode_batch_step() {
             : stats.attention_per_sequence_calls;
     int per_request_lm_head_rows =
         batch_size > 0 ? stats.lm_head_rows / batch_size : stats.lm_head_rows;
+    auto share_counter = [batch_size](uint64_t value, size_t index) -> uint64_t {
+        if (batch_size <= 0) return value;
+        uint64_t base = value / (uint64_t)batch_size;
+        uint64_t remainder = value % (uint64_t)batch_size;
+        return base + (index < remainder ? 1u : 0u);
+    };
     for (size_t i = 0; i < model_ids.size(); ++i) {
         RequestId id = model_ids[i];
         auto it = requests_.find(id);
@@ -1181,6 +1217,30 @@ bool LLMEngine::run_selective_decode_batch_step() {
             per_request_attention_calls;
         request.metrics.selective_decode_lm_head_rows += per_request_lm_head_rows;
         request.metrics.selective_decode_model_ms += per_request_model_ms;
+        request.metrics.gptq_batch_kernel_calls +=
+            share_counter(stats.gptq_batch_kernel_calls, i);
+        request.metrics.gptq_batch_rows_total +=
+            share_counter(stats.gptq_batch_rows_total, i);
+        request.metrics.gptq_batch_output_panel_tasks +=
+            share_counter(stats.gptq_batch_output_panel_tasks, i);
+        request.metrics.gptq_batch_row_gemv_fallbacks +=
+            share_counter(stats.gptq_batch_row_gemv_fallbacks, i);
+        request.metrics.gptq_batch_weight_vector_loads +=
+            share_counter(stats.gptq_batch_weight_vector_loads, i);
+        request.metrics.gptq_batch_dequant_vector_ops +=
+            share_counter(stats.gptq_batch_dequant_vector_ops, i);
+        request.metrics.gptq_batch_argmax_calls +=
+            share_counter(stats.gptq_batch_argmax_calls, i);
+        request.metrics.gptq_batch_argmax_rows +=
+            share_counter(stats.gptq_batch_argmax_rows, i);
+        request.metrics.gptq_batch_full_logits_elements_written +=
+            share_counter(stats.gptq_batch_full_logits_elements_written, i);
+        request.metrics.gptq_batch_compare_mismatches +=
+            share_counter(stats.gptq_batch_compare_mismatches, i);
+        request.metrics.selective_decode_hotpath_allocations +=
+            share_counter(stats.selective_decode_hotpath_allocations, i);
+        request.metrics.selective_decode_workspace_reallocations +=
+            share_counter(stats.selective_decode_workspace_reallocations, i);
         request.metrics.selective_decode_mode = "selective_batch_decode";
         request.metrics.decode_ms += per_request_model_ms;
 

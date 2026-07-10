@@ -416,5 +416,23 @@ void add_f16_neon(const Tensor& A, const Tensor& B, Tensor& C) {
     }
 }
 
+void add_f16_batch_neon(
+    const fp16_t* a,
+    const fp16_t* b,
+    fp16_t* out,
+    size_t elements
+) {
+    if (!a || !b || !out) return;
+    size_t i = 0;
+    for (; i + 8 <= elements; i += 8) {
+        float16x8_t va = vld1q_f16(a + i);
+        float16x8_t vb = vld1q_f16(b + i);
+        vst1q_f16(out + i, vaddq_f16(va, vb));
+    }
+    for (; i < elements; ++i) {
+        out[i] = (fp16_t)((float)a[i] + (float)b[i]);
+    }
+}
+
 }
 }

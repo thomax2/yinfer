@@ -763,6 +763,279 @@ Status linear_gptq_int8_decode_neon(
     return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
 }
 
+namespace {
+
+constexpr int GPTQ_BATCH_MAX_ROWS = 8;
+constexpr int GPTQ_BATCH_PANEL_GRAIN = 8;
+constexpr int GPTQ_BATCH_ARGMAX_GRAIN = 16;
+
+std::atomic<uint64_t> g_batch_kernel_calls{0};
+std::atomic<uint64_t> g_batch_rows_total{0};
+std::atomic<uint64_t> g_batch_output_panel_tasks{0};
+std::atomic<uint64_t> g_batch_row_gemv_fallbacks{0};
+std::atomic<uint64_t> g_batch_weight_vector_loads{0};
+std::atomic<uint64_t> g_batch_dequant_vector_ops{0};
+std::atomic<uint64_t> g_batch_argmax_calls{0};
+std::atomic<uint64_t> g_batch_argmax_rows{0};
+std::atomic<uint64_t> g_batch_full_logits_elements_written{0};
+std::atomic<uint64_t> g_batch_compare_mismatches{0};
+
+bool gptq_batch_env_flag(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    std::string text(value);
+    return text == "1" || text == "true" || text == "TRUE" ||
+           text == "on" || text == "ON";
+}
+
+float gptq_batch_compare_tolerance() {
+    const char* value = std::getenv("LLM_GPTQ_BATCH_COMPARE_TOL");
+    if (!value || !*value) return 0.02f;
+    char* end = nullptr;
+    float result = std::strtof(value, &end);
+    return end == value || result <= 0.0f ? 0.02f : result;
+}
+
+template <int ActiveRows, int Channels>
+inline void gptq_batch_compute_subpanel(
+    const fp16_t* x,
+    const GPTQInt8Weight& w,
+    int panel,
+    int channel_offset,
+    float* panel_out
+) {
+    static_assert(Channels == 8 || Channels == 16, "unsupported output tile");
+    constexpr int Vecs = Channels / 4;
+    for (int row = 0; row < ActiveRows; ++row) {
+        for (int vec = 0; vec < Vecs; ++vec) {
+            vst1q_f32(
+                panel_out + (size_t)row * NR_F16 + channel_offset + vec * 4,
+                vdupq_n_f32(0.0f));
+        }
+    }
+
+    const int K_pad = ((w.K + 7) / 8) * 8;
+    const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
+    const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
+    const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+
+    for (int group = 0; group < w.num_groups; ++group) {
+        float32x4_t group_sum[ActiveRows][Vecs];
+        float xsum[ActiveRows];
+        int k_begin = group * w.group_size;
+        int k_end = std::min(k_begin + w.group_size, w.K);
+        for (int row = 0; row < ActiveRows; ++row) {
+            xsum[row] = 0.0f;
+            for (int k_index = k_begin; k_index < k_end; ++k_index) {
+                xsum[row] += (float)x[(size_t)row * w.K + k_index];
+            }
+            for (int vec = 0; vec < Vecs; ++vec) {
+                group_sum[row][vec] = vdupq_n_f32(0.0f);
+            }
+        }
+        for (int k_index = k_begin; k_index < k_end; ++k_index) {
+            const int8_t* q_ptr =
+                qpack + ((size_t)panel * K_pad + k_index) * NR_F16 + channel_offset;
+            float32x4_t qvalue[Vecs];
+            if constexpr (Channels == 16) {
+                int8x16_t q8 = vld1q_s8(q_ptr);
+                int16x8_t q0 = vmovl_s8(vget_low_s8(q8));
+                int16x8_t q1 = vmovl_s8(vget_high_s8(q8));
+                qvalue[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q0)));
+                qvalue[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q0)));
+                qvalue[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1)));
+                qvalue[3] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1)));
+            } else {
+                int16x8_t q8 = vmovl_s8(vld1_s8(q_ptr));
+                qvalue[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q8)));
+                qvalue[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q8)));
+            }
+            for (int row = 0; row < ActiveRows; ++row) {
+                float activation = (float)x[(size_t)row * w.K + k_index];
+                for (int vec = 0; vec < Vecs; ++vec) {
+                    group_sum[row][vec] =
+                        vfmaq_n_f32(group_sum[row][vec], qvalue[vec], activation);
+                }
+            }
+        }
+
+        const fp16_t* scale_ptr =
+            spack + ((size_t)panel * w.num_groups + group) * NR_F16 + channel_offset;
+        const int8_t* zero_ptr = zpack
+            ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 + channel_offset
+            : nullptr;
+        float32x4_t scale[Vecs];
+        float32x4_t zero[Vecs];
+        if constexpr (Channels == 16) {
+            float16x8_t s0 = vld1q_f16(scale_ptr);
+            float16x8_t s1 = vld1q_f16(scale_ptr + 8);
+            scale[0] = vcvt_f32_f16(vget_low_f16(s0));
+            scale[1] = vcvt_f32_f16(vget_high_f16(s0));
+            scale[2] = vcvt_f32_f16(vget_low_f16(s1));
+            scale[3] = vcvt_f32_f16(vget_high_f16(s1));
+            if (zero_ptr) {
+                int8x16_t z8 = vld1q_s8(zero_ptr);
+                int16x8_t z0 = vmovl_s8(vget_low_s8(z8));
+                int16x8_t z1 = vmovl_s8(vget_high_s8(z8));
+                zero[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0)));
+                zero[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0)));
+                zero[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1)));
+                zero[3] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1)));
+            }
+        } else {
+            float16x8_t s = vld1q_f16(scale_ptr);
+            scale[0] = vcvt_f32_f16(vget_low_f16(s));
+            scale[1] = vcvt_f32_f16(vget_high_f16(s));
+            if (zero_ptr) {
+                int16x8_t z = vmovl_s8(vld1_s8(zero_ptr));
+                zero[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z)));
+                zero[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z)));
+            }
+        }
+        if (!zero_ptr) {
+            for (int vec = 0; vec < Vecs; ++vec) zero[vec] = vdupq_n_f32(0.0f);
+        }
+        for (int row = 0; row < ActiveRows; ++row) {
+            float32x4_t xsum_vector = vdupq_n_f32(xsum[row]);
+            for (int vec = 0; vec < Vecs; ++vec) {
+                float* output =
+                    panel_out + (size_t)row * NR_F16 + channel_offset + vec * 4;
+                float32x4_t corrected =
+                    vmlsq_f32(group_sum[row][vec], zero[vec], xsum_vector);
+                float32x4_t total = vld1q_f32(output);
+                vst1q_f32(output, vfmaq_f32(total, corrected, scale[vec]));
+            }
+        }
+    }
+}
+
+inline Status gptq_batch_compute_panel(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    int panel,
+    float* panel_out
+) {
+    if (w.has_g_idx) return Status::INVALID_ARGUMENT;
+    switch (rows) {
+        case 1:
+            gptq_batch_compute_subpanel<1, 16>(x, w, panel, 0, panel_out);
+            break;
+        case 2:
+            gptq_batch_compute_subpanel<2, 16>(x, w, panel, 0, panel_out);
+            break;
+        case 3:
+            gptq_batch_compute_subpanel<3, 16>(x, w, panel, 0, panel_out);
+            break;
+        case 4:
+            gptq_batch_compute_subpanel<4, 16>(x, w, panel, 0, panel_out);
+            break;
+        case 5:
+            gptq_batch_compute_subpanel<5, 8>(x, w, panel, 0, panel_out);
+            gptq_batch_compute_subpanel<5, 8>(x, w, panel, 8, panel_out);
+            break;
+        case 6:
+            gptq_batch_compute_subpanel<6, 8>(x, w, panel, 0, panel_out);
+            gptq_batch_compute_subpanel<6, 8>(x, w, panel, 8, panel_out);
+            break;
+        case 7:
+            gptq_batch_compute_subpanel<7, 8>(x, w, panel, 0, panel_out);
+            gptq_batch_compute_subpanel<7, 8>(x, w, panel, 8, panel_out);
+            break;
+        case 8:
+            gptq_batch_compute_subpanel<8, 8>(x, w, panel, 0, panel_out);
+            gptq_batch_compute_subpanel<8, 8>(x, w, panel, 8, panel_out);
+            break;
+        default:
+            return Status::INVALID_ARGUMENT;
+    }
+    return Status::SUCCESS;
+}
+
+Status linear_gptq_int8_batch_panel_range_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    int panel_begin,
+    int panel_end
+) {
+    alignas(64) float panel_out[GPTQ_BATCH_MAX_ROWS * NR_F16];
+    for (int panel = panel_begin; panel < panel_end; ++panel) {
+        int col = panel * NR_F16;
+        int actual_n = std::min(NR_F16, w.N - col);
+        for (int row_base = 0; row_base < rows; row_base += GPTQ_BATCH_MAX_ROWS) {
+            int tile_rows = std::min(GPTQ_BATCH_MAX_ROWS, rows - row_base);
+            Status status = gptq_batch_compute_panel(
+                x + (size_t)row_base * w.K, tile_rows, w, panel, panel_out);
+            if (status != Status::SUCCESS) return status;
+            for (int row = 0; row < tile_rows; ++row) {
+                fp16_t* row_y = y + (size_t)(row_base + row) * w.N + col;
+                const float* row_panel = panel_out + (size_t)row * NR_F16;
+                for (int lane = 0; lane < actual_n; ++lane) {
+                    float value = row_panel[lane] +
+                        (bias ? (float)bias[col + lane] : 0.0f);
+                    row_y[lane] = (fp16_t)value;
+                }
+            }
+        }
+    }
+    return Status::SUCCESS;
+}
+
+Status gptq_batch_argmax_panel_range_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    int panel_begin,
+    int panel_end,
+    ArgmaxResult* results
+) {
+    for (int row = 0; row < rows; ++row) {
+        results[row] = ArgmaxResult{-1, -std::numeric_limits<float>::infinity()};
+    }
+    alignas(64) float panel_out[GPTQ_BATCH_MAX_ROWS * NR_F16];
+    for (int panel = panel_begin; panel < panel_end; ++panel) {
+        Status status = gptq_batch_compute_panel(x, rows, w, panel, panel_out);
+        if (status != Status::SUCCESS) return status;
+        int col = panel * NR_F16;
+        int actual_n = std::min(NR_F16, w.N - col);
+        for (int row = 0; row < rows; ++row) {
+            const float* values = panel_out + (size_t)row * NR_F16;
+            for (int lane = 0; lane < actual_n; ++lane) {
+                int index = col + lane;
+                float value = values[lane];
+                ArgmaxResult& best = results[row];
+                if (value > best.value ||
+                    (value == best.value && (best.index < 0 || index < best.index))) {
+                    best.index = index;
+                    best.value = value;
+                }
+            }
+        }
+    }
+    return Status::SUCCESS;
+}
+
+void record_batch_shape(int rows, int np, int grain, int K) {
+    g_batch_kernel_calls.fetch_add(1, std::memory_order_relaxed);
+    g_batch_rows_total.fetch_add((uint64_t)rows, std::memory_order_relaxed);
+    g_batch_output_panel_tasks.fetch_add(
+        (uint64_t)((np + grain - 1) / grain), std::memory_order_relaxed);
+    uint64_t subpanels = 0;
+    for (int row_base = 0; row_base < rows; row_base += GPTQ_BATCH_MAX_ROWS) {
+        int tile_rows = std::min(GPTQ_BATCH_MAX_ROWS, rows - row_base);
+        subpanels += tile_rows <= 4 ? 1u : 2u;
+    }
+    g_batch_weight_vector_loads.fetch_add(
+        (uint64_t)np * (uint64_t)K * subpanels, std::memory_order_relaxed);
+    g_batch_dequant_vector_ops.fetch_add(
+        (uint64_t)np * (uint64_t)K * 4u, std::memory_order_relaxed);
+}
+
+} // namespace
+
 Status linear_gptq_int8_batch_neon(
     const fp16_t* x,
     int rows,
@@ -781,43 +1054,49 @@ Status linear_gptq_int8_batch_neon(
     if (rows == 1) {
         return linear_gptq_int8_decode_neon(x, w, y, bias, nullptr, 0);
     }
+    if (w.has_g_idx) return Status::INVALID_ARGUMENT;
 
     const int np = (w.N + NR_F16 - 1) / NR_F16;
-    const int panel_grain = GPTQ_LINEAR_PARALLEL_GRAIN_PANELS;
-    const int chunks_per_row = (np + panel_grain - 1) / panel_grain;
-    const int total_tasks = rows * chunks_per_row;
-    const int64_t work = (int64_t)rows * w.K * w.N;
-
-    auto run_task_range = [&](int tb, int te) -> Status {
-        for (int task = tb; task < te; ++task) {
-            int row = task / chunks_per_row;
-            int chunk = task - row * chunks_per_row;
-            int pb = chunk * panel_grain;
-            int pe = std::min(pb + panel_grain, np);
-            const fp16_t* row_x = x + (size_t)row * w.K;
-            fp16_t* row_y = y + (size_t)row * w.N;
-            Status s = linear_gptq_int8_decode_range_neon(row_x, w, row_y, bias, pb, pe);
-            if (s != Status::SUCCESS) return s;
-        }
-        return Status::SUCCESS;
-    };
-
-    if (g_thread_pool == nullptr ||
-        g_thread_pool->num_threads() <= 1 ||
-        (w.N < GPTQ_PARALLEL_N_THRESHOLD && work < GPTQ_PARALLEL_WORK_THRESHOLD)) {
-        return run_task_range(0, total_tasks);
+    record_batch_shape(rows, np, GPTQ_BATCH_PANEL_GRAIN, w.K);
+    Status result = Status::SUCCESS;
+    if (g_thread_pool == nullptr || g_thread_pool->num_threads() <= 1) {
+        result = linear_gptq_int8_batch_panel_range_neon(x, rows, w, y, bias, 0, np);
+    } else {
+        std::atomic<int> err_flag(0);
+        g_thread_pool->parallel_for(0, np, GPTQ_BATCH_PANEL_GRAIN, [&](int pb, int pe) {
+            Status status = linear_gptq_int8_batch_panel_range_neon(
+                x, rows, w, y, bias, pb, pe);
+            if (status != Status::SUCCESS) {
+                err_flag.store(static_cast<int>(status), std::memory_order_relaxed);
+            }
+        });
+        int err = err_flag.load(std::memory_order_relaxed);
+        result = err == 0 ? Status::SUCCESS : static_cast<Status>(err);
     }
 
-    std::atomic<int> err_flag(0);
-    g_thread_pool->parallel_for(0, total_tasks, 1, [&](int tb, int te) {
-        Status s = run_task_range(tb, te);
-        if (s != Status::SUCCESS) {
-            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
+    if (result == Status::SUCCESS && gptq_batch_env_flag("LLM_GPTQ_BATCH_COMPARE")) {
+        float tolerance = gptq_batch_compare_tolerance();
+        float max_abs = 0.0f;
+        uint64_t mismatches = 0;
+        std::vector<fp16_t> reference((size_t)rows * w.N);
+        for (int row = 0; row < rows; ++row) {
+            Status status = linear_gptq_int8_decode_neon(
+                x + (size_t)row * w.K, w,
+                reference.data() + (size_t)row * w.N, bias, nullptr, 0);
+            if (status != Status::SUCCESS) return status;
         }
-    });
-
-    int err = err_flag.load(std::memory_order_relaxed);
-    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+        for (size_t i = 0; i < reference.size(); ++i) {
+            float diff = std::fabs((float)y[i] - (float)reference[i]);
+            max_abs = std::max(max_abs, diff);
+            if (diff > tolerance) ++mismatches;
+        }
+        g_batch_compare_mismatches.fetch_add(mismatches, std::memory_order_relaxed);
+        std::cerr << "[GPTQ_BATCH_COMPARE] B=" << rows
+                  << " K=" << w.K << " N=" << w.N
+                  << " max_abs=" << max_abs
+                  << " mismatches=" << mismatches << std::endl;
+    }
+    return result;
 }
 
 static Status fused_gate_up_swiglu_gptq_int8_decode_range_neon(
@@ -1100,8 +1379,8 @@ Status fused_gate_up_swiglu_gptq_int8_batch_neon(
     const GPTQInt8Weight& gate_proj,
     const GPTQInt8Weight& up_proj,
     fp16_t* y,
-    void*,
-    size_t
+    void* workspace,
+    size_t workspace_bytes
 ) {
     if (!x || !y || rows <= 0 ||
         !gate_proj.qweight_pack.data || !gate_proj.scales_pack.data ||
@@ -1116,42 +1395,17 @@ Status fused_gate_up_swiglu_gptq_int8_batch_neon(
             x, gate_proj, up_proj, y, nullptr, 0);
     }
 
-    const int np = (gate_proj.N + NR_F16 - 1) / NR_F16;
-    const int panel_grain = GPTQ_PARALLEL_GRAIN_PANELS;
-    const int chunks_per_row = (np + panel_grain - 1) / panel_grain;
-    const int total_tasks = rows * chunks_per_row;
-
-    auto run_task_range = [&](int tb, int te) -> Status {
-        for (int task = tb; task < te; ++task) {
-            int row = task / chunks_per_row;
-            int chunk = task - row * chunks_per_row;
-            int pb = chunk * panel_grain;
-            int pe = std::min(pb + panel_grain, np);
-            const fp16_t* row_x = x + (size_t)row * gate_proj.K;
-            fp16_t* row_y = y + (size_t)row * gate_proj.N;
-            Status s = fused_gate_up_swiglu_gptq_int8_decode_range_neon(
-                row_x, gate_proj, up_proj, row_y, pb, pe);
-            if (s != Status::SUCCESS) return s;
-        }
-        return Status::SUCCESS;
-    };
-
-    if (g_thread_pool == nullptr ||
-        g_thread_pool->num_threads() <= 1 ||
-        gate_proj.N < GPTQ_FUSED_PARALLEL_N_THRESHOLD) {
-        return run_task_range(0, total_tasks);
-    }
-
-    std::atomic<int> err_flag(0);
-    g_thread_pool->parallel_for(0, total_tasks, 1, [&](int tb, int te) {
-        Status s = run_task_range(tb, te);
-        if (s != Status::SUCCESS) {
-            err_flag.store(static_cast<int>(s), std::memory_order_relaxed);
-        }
-    });
-
-    int err = err_flag.load(std::memory_order_relaxed);
-    return err == 0 ? Status::SUCCESS : static_cast<Status>(err);
+    size_t up_bytes = (size_t)rows * gate_proj.N * sizeof(fp16_t);
+    if (!workspace || workspace_bytes < up_bytes) return Status::OUT_OF_MEMORY;
+    fp16_t* up = static_cast<fp16_t*>(workspace);
+    Status status = linear_gptq_int8_batch_neon(
+        x, rows, gate_proj, y, nullptr, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    status = linear_gptq_int8_batch_neon(
+        x, rows, up_proj, up, nullptr, nullptr, 0);
+    if (status != Status::SUCCESS) return status;
+    swiglu_f16_batch_neon(y, up, rows, gate_proj.N);
+    return Status::SUCCESS;
 }
 
 struct GptqArgmaxDebugStats {
@@ -1628,6 +1882,134 @@ ArgmaxResult linear_gptq_int8_decode_argmax_neon(
                   << std::endl;
     }
 
+    return result;
+}
+
+size_t linear_gptq_int8_batch_argmax_workspace_bytes(
+    int rows,
+    const GPTQInt8Weight& w
+) {
+    if (rows <= 1 || rows > GPTQ_BATCH_MAX_ROWS || w.N <= 0) return 0;
+    int np = (w.N + NR_F16 - 1) / NR_F16;
+    int chunks = (np + GPTQ_BATCH_ARGMAX_GRAIN - 1) / GPTQ_BATCH_ARGMAX_GRAIN;
+    return (size_t)chunks * rows * sizeof(ArgmaxResult);
+}
+
+Status linear_gptq_int8_decode_argmax_batch_neon(
+    const fp16_t* x,
+    int rows,
+    const GPTQInt8Weight& w,
+    ArgmaxResult* results,
+    void* workspace,
+    size_t workspace_bytes
+) {
+    if (!x || !results || rows <= 0 || rows > GPTQ_BATCH_MAX_ROWS ||
+        !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0 ||
+        w.has_g_idx) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (rows == 1) {
+        results[0] = linear_gptq_int8_decode_argmax_neon(x, w, nullptr, 0);
+        return results[0].index >= 0 ? Status::SUCCESS : Status::INVALID_ARGUMENT;
+    }
+
+    int np = (w.N + NR_F16 - 1) / NR_F16;
+    int chunks = (np + GPTQ_BATCH_ARGMAX_GRAIN - 1) / GPTQ_BATCH_ARGMAX_GRAIN;
+    size_t required = (size_t)chunks * rows * sizeof(ArgmaxResult);
+    if (!workspace || workspace_bytes < required) return Status::OUT_OF_MEMORY;
+    ArgmaxResult* partials = static_cast<ArgmaxResult*>(workspace);
+
+    g_batch_argmax_calls.fetch_add(1, std::memory_order_relaxed);
+    g_batch_argmax_rows.fetch_add((uint64_t)rows, std::memory_order_relaxed);
+    record_batch_shape(rows, np, GPTQ_BATCH_ARGMAX_GRAIN, w.K);
+
+    std::atomic<int> err_flag(0);
+    auto run_chunks = [&](int begin, int end) {
+        for (int chunk = begin; chunk < end; ++chunk) {
+            int pb = chunk * GPTQ_BATCH_ARGMAX_GRAIN;
+            int pe = std::min(pb + GPTQ_BATCH_ARGMAX_GRAIN, np);
+            Status status = gptq_batch_argmax_panel_range_neon(
+                x, rows, w, pb, pe, partials + (size_t)chunk * rows);
+            if (status != Status::SUCCESS) {
+                err_flag.store(static_cast<int>(status), std::memory_order_relaxed);
+            }
+        }
+    };
+    if (g_thread_pool == nullptr || g_thread_pool->num_threads() <= 1 || chunks <= 1) {
+        run_chunks(0, chunks);
+    } else {
+        g_thread_pool->parallel_for(0, chunks, 1, run_chunks);
+    }
+    int err = err_flag.load(std::memory_order_relaxed);
+    if (err != 0) return static_cast<Status>(err);
+
+    for (int row = 0; row < rows; ++row) {
+        ArgmaxResult best{-1, -std::numeric_limits<float>::infinity()};
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const ArgmaxResult& candidate = partials[(size_t)chunk * rows + row];
+            if (candidate.index >= 0 &&
+                (candidate.value > best.value ||
+                 (candidate.value == best.value &&
+                  (best.index < 0 || candidate.index < best.index)))) {
+                best = candidate;
+            }
+        }
+        results[row] = best;
+        if (best.index < 0) return Status::INVALID_ARGUMENT;
+    }
+
+    if (gptq_batch_env_flag("LLM_GPTQ_BATCH_COMPARE")) {
+        uint64_t mismatches = 0;
+        for (int row = 0; row < rows; ++row) {
+            ArgmaxResult reference = linear_gptq_int8_decode_argmax_neon(
+                x + (size_t)row * w.K, w, nullptr, 0);
+            bool match = reference.index == results[row].index;
+            if (!match) ++mismatches;
+            std::cerr << "[GPTQ_BATCH_ARGMAX_COMPARE] B=" << rows
+                      << " row=" << row
+                      << " token=" << results[row].index
+                      << " ref_token=" << reference.index
+                      << " value=" << results[row].value
+                      << " ref_value=" << reference.value
+                      << " match=" << (match ? 1 : 0) << std::endl;
+        }
+        g_batch_compare_mismatches.fetch_add(mismatches, std::memory_order_relaxed);
+    }
+    return Status::SUCCESS;
+}
+
+GPTQBatchKernelStats snapshot_gptq_batch_kernel_stats() {
+    GPTQBatchKernelStats stats;
+    stats.kernel_calls = g_batch_kernel_calls.load(std::memory_order_relaxed);
+    stats.rows_total = g_batch_rows_total.load(std::memory_order_relaxed);
+    stats.output_panel_tasks = g_batch_output_panel_tasks.load(std::memory_order_relaxed);
+    stats.row_gemv_fallbacks = g_batch_row_gemv_fallbacks.load(std::memory_order_relaxed);
+    stats.weight_vector_loads = g_batch_weight_vector_loads.load(std::memory_order_relaxed);
+    stats.dequant_vector_ops = g_batch_dequant_vector_ops.load(std::memory_order_relaxed);
+    stats.argmax_calls = g_batch_argmax_calls.load(std::memory_order_relaxed);
+    stats.argmax_rows = g_batch_argmax_rows.load(std::memory_order_relaxed);
+    stats.full_logits_elements_written =
+        g_batch_full_logits_elements_written.load(std::memory_order_relaxed);
+    stats.compare_mismatches = g_batch_compare_mismatches.load(std::memory_order_relaxed);
+    return stats;
+}
+
+GPTQBatchKernelStats diff_gptq_batch_kernel_stats(
+    const GPTQBatchKernelStats& begin,
+    const GPTQBatchKernelStats& end
+) {
+    GPTQBatchKernelStats result;
+    result.kernel_calls = end.kernel_calls - begin.kernel_calls;
+    result.rows_total = end.rows_total - begin.rows_total;
+    result.output_panel_tasks = end.output_panel_tasks - begin.output_panel_tasks;
+    result.row_gemv_fallbacks = end.row_gemv_fallbacks - begin.row_gemv_fallbacks;
+    result.weight_vector_loads = end.weight_vector_loads - begin.weight_vector_loads;
+    result.dequant_vector_ops = end.dequant_vector_ops - begin.dequant_vector_ops;
+    result.argmax_calls = end.argmax_calls - begin.argmax_calls;
+    result.argmax_rows = end.argmax_rows - begin.argmax_rows;
+    result.full_logits_elements_written =
+        end.full_logits_elements_written - begin.full_logits_elements_written;
+    result.compare_mismatches = end.compare_mismatches - begin.compare_mismatches;
     return result;
 }
 

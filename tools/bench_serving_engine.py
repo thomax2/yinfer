@@ -58,6 +58,16 @@ REQUEST_FIELDS = [
     "jsonl_selective_decode_lm_head_rows",
     "jsonl_selective_decode_fallbacks",
     "jsonl_selective_decode_model_ms",
+    "jsonl_gptq_batch_kernel_calls", "jsonl_gptq_batch_rows_total",
+    "jsonl_gptq_batch_output_panel_tasks",
+    "jsonl_gptq_batch_row_gemv_fallbacks",
+    "jsonl_gptq_batch_weight_vector_loads",
+    "jsonl_gptq_batch_dequant_vector_ops",
+    "jsonl_gptq_batch_argmax_calls", "jsonl_gptq_batch_argmax_rows",
+    "jsonl_gptq_batch_full_logits_elements_written",
+    "jsonl_gptq_batch_compare_mismatches",
+    "jsonl_selective_decode_hotpath_allocations",
+    "jsonl_selective_decode_workspace_reallocations",
     "jsonl_selective_decode_mode",
     "jsonl_error_message", "match_method",
     "valid_effective_run", "validity_warnings",
@@ -85,6 +95,13 @@ SUMMARY_FIELDS = [
     "selective_decode_lm_head_rows_total",
     "selective_decode_fallbacks_total",
     "selective_decode_model_ms_total",
+    "gptq_batch_kernel_calls", "gptq_batch_rows_total",
+    "gptq_batch_output_panel_tasks", "gptq_batch_row_gemv_fallbacks",
+    "gptq_batch_weight_vector_loads", "gptq_batch_dequant_vector_ops",
+    "gptq_batch_argmax_calls", "gptq_batch_argmax_rows",
+    "gptq_batch_full_logits_elements_written", "gptq_batch_compare_mismatches",
+    "selective_decode_hotpath_allocations",
+    "selective_decode_workspace_reallocations",
     "valid_effective_run", "validity_warnings",
     "server_requests_total", "server_requests_finished",
     "server_requests_failed", "server_requests_aborted",
@@ -865,6 +882,26 @@ class BenchmarkRunner:
                     item.get("selective_decode_lm_head_rows", ""),
                 "jsonl_selective_decode_fallbacks": item.get("selective_decode_fallbacks", ""),
                 "jsonl_selective_decode_model_ms": item.get("selective_decode_model_ms", ""),
+                "jsonl_gptq_batch_kernel_calls": item.get("gptq_batch_kernel_calls", ""),
+                "jsonl_gptq_batch_rows_total": item.get("gptq_batch_rows_total", ""),
+                "jsonl_gptq_batch_output_panel_tasks":
+                    item.get("gptq_batch_output_panel_tasks", ""),
+                "jsonl_gptq_batch_row_gemv_fallbacks":
+                    item.get("gptq_batch_row_gemv_fallbacks", ""),
+                "jsonl_gptq_batch_weight_vector_loads":
+                    item.get("gptq_batch_weight_vector_loads", ""),
+                "jsonl_gptq_batch_dequant_vector_ops":
+                    item.get("gptq_batch_dequant_vector_ops", ""),
+                "jsonl_gptq_batch_argmax_calls": item.get("gptq_batch_argmax_calls", ""),
+                "jsonl_gptq_batch_argmax_rows": item.get("gptq_batch_argmax_rows", ""),
+                "jsonl_gptq_batch_full_logits_elements_written":
+                    item.get("gptq_batch_full_logits_elements_written", ""),
+                "jsonl_gptq_batch_compare_mismatches":
+                    item.get("gptq_batch_compare_mismatches", ""),
+                "jsonl_selective_decode_hotpath_allocations":
+                    item.get("selective_decode_hotpath_allocations", ""),
+                "jsonl_selective_decode_workspace_reallocations":
+                    item.get("selective_decode_workspace_reallocations", ""),
                 "jsonl_selective_decode_mode": item.get("selective_decode_mode", ""),
                 "jsonl_final_status": item.get("final_status", ""),
                 "jsonl_error_message": item.get("error_message", ""),
@@ -978,6 +1015,26 @@ class BenchmarkRunner:
                 server_metrics.get("selective_decode_fallbacks_total", 0),
             "selective_decode_model_ms_total":
                 server_metrics.get("selective_decode_model_ms_total", 0),
+            "gptq_batch_kernel_calls": server_metrics.get("gptq_batch_kernel_calls", 0),
+            "gptq_batch_rows_total": server_metrics.get("gptq_batch_rows_total", 0),
+            "gptq_batch_output_panel_tasks":
+                server_metrics.get("gptq_batch_output_panel_tasks", 0),
+            "gptq_batch_row_gemv_fallbacks":
+                server_metrics.get("gptq_batch_row_gemv_fallbacks", 0),
+            "gptq_batch_weight_vector_loads":
+                server_metrics.get("gptq_batch_weight_vector_loads", 0),
+            "gptq_batch_dequant_vector_ops":
+                server_metrics.get("gptq_batch_dequant_vector_ops", 0),
+            "gptq_batch_argmax_calls": server_metrics.get("gptq_batch_argmax_calls", 0),
+            "gptq_batch_argmax_rows": server_metrics.get("gptq_batch_argmax_rows", 0),
+            "gptq_batch_full_logits_elements_written":
+                server_metrics.get("gptq_batch_full_logits_elements_written", 0),
+            "gptq_batch_compare_mismatches":
+                server_metrics.get("gptq_batch_compare_mismatches", 0),
+            "selective_decode_hotpath_allocations":
+                server_metrics.get("selective_decode_hotpath_allocations", 0),
+            "selective_decode_workspace_reallocations":
+                server_metrics.get("selective_decode_workspace_reallocations", 0),
             "server_requests_total": server_metrics.get("requests_total", 0),
             "server_requests_finished": server_metrics.get("requests_finished", 0),
             "server_requests_failed": server_metrics.get("requests_failed", 0),
@@ -1026,7 +1083,7 @@ class BenchmarkRunner:
         selective_steps = to_int(summary.get("selective_decode_steps_total"), 0)
 
         if summary.get("scenario") == "selective_decode_on":
-            if not selective_enabled:
+            if concurrency >= 2 and not selective_enabled:
                 valid = False
                 warnings.append("selective_decode_enabled=false")
             if concurrency >= 2 and selective_size_max < 2:
@@ -1035,18 +1092,42 @@ class BenchmarkRunner:
             if concurrency >= 2 and avg_selective_size <= 1.0:
                 valid = False
                 warnings.append(f"avg_selective_decode_size={avg_selective_size}<=1")
-            if to_int(summary.get("selective_decode_linear_batch_rows_total"), 0) <= 0:
+            if concurrency >= 2 and to_int(
+                summary.get("selective_decode_linear_batch_rows_total"), 0
+            ) <= 0:
                 valid = False
                 warnings.append("selective_decode_linear_batch_rows_total=0")
-            if to_int(summary.get("selective_decode_attention_per_sequence_calls_total"), 0) <= 0:
+            if concurrency >= 2 and to_int(
+                summary.get("selective_decode_attention_per_sequence_calls_total"), 0
+            ) <= 0:
                 valid = False
                 warnings.append("selective_decode_attention_per_sequence_calls_total=0")
-            if to_int(summary.get("selective_decode_lm_head_rows_total"), 0) <= 0:
+            if concurrency >= 2 and to_int(
+                summary.get("selective_decode_lm_head_rows_total"), 0
+            ) <= 0:
                 valid = False
                 warnings.append("selective_decode_lm_head_rows_total=0")
             if paged_fallbacks != 0:
                 valid = False
                 warnings.append(f"paged_attention_fallbacks={paged_fallbacks}")
+            if concurrency >= 2 and to_int(summary.get("gptq_batch_kernel_calls"), 0) <= 0:
+                valid = False
+                warnings.append("gptq_batch_kernel_calls=0")
+            if concurrency >= 2 and to_int(
+                summary.get("gptq_batch_row_gemv_fallbacks"), 0
+            ) != 0:
+                valid = False
+                warnings.append("gptq_batch_row_gemv_fallbacks!=0")
+            if concurrency >= 2 and to_int(
+                summary.get("gptq_batch_full_logits_elements_written"), 0
+            ) != 0:
+                valid = False
+                warnings.append("gptq_batch_full_logits_elements_written!=0")
+            if concurrency >= 2 and to_int(
+                summary.get("selective_decode_hotpath_allocations"), 0
+            ) != 0:
+                valid = False
+                warnings.append("selective_decode_hotpath_allocations!=0")
             if selective_steps > 0 and selective_fallbacks > max(2, int(0.25 * selective_steps)):
                 warnings.append(
                     f"selective_decode_fallbacks_high={selective_fallbacks}/{selective_steps}"
@@ -1407,6 +1488,8 @@ class BenchmarkRunner:
             "concurrency", "off_tok_s", "on_tok_s", "speedup_pct",
             "off_p95_total_ms", "on_p95_total_ms",
             "selective_decode_size_max", "avg_selective_decode_size",
+            "gptq_batch_kernel_calls", "row_gemv_fallbacks",
+            "full_logits_written", "hotpath_allocations",
             "paged_attention_fallbacks",
         ]
         lines.append("| " + " | ".join(cols) + " |")
@@ -1435,6 +1518,10 @@ class BenchmarkRunner:
                 fmt(on.get("p95_client_total_ms")),
                 fmt(on.get("selective_decode_size_max")),
                 fmt(on.get("avg_selective_decode_size")),
+                fmt(on.get("gptq_batch_kernel_calls")),
+                fmt(on.get("gptq_batch_row_gemv_fallbacks")),
+                fmt(on.get("gptq_batch_full_logits_elements_written")),
+                fmt(on.get("selective_decode_hotpath_allocations")),
                 fmt(on.get("paged_attention_fallbacks")),
             ]
             lines.append("| " + " | ".join(str(v) for v in vals) + " |")
@@ -1444,6 +1531,8 @@ class BenchmarkRunner:
         best_speedup = None
         best_pair = None
         for key, pair in by_key.items():
+            if to_int(key[1], 1) < 2:
+                continue
             off = pair.get("selective_decode_off")
             on = pair.get("selective_decode_on")
             if not off or not on:
@@ -1463,9 +1552,8 @@ class BenchmarkRunner:
                 lines.append(f"- Best observed selective decode speedup: {fmt(speedup)}% at concurrency={conc}.")
             else:
                 lines.append(
-                    "- Selective decode was slower in this run. Likely causes include cache pressure, "
-                    "too few generated tokens, too many fallbacks, per-sequence attention, thread contention, "
-                    "or limited LM Head batch benefit."
+                    "- Selective decode was slower in every effective concurrency case; inspect the "
+                    "kernel benchmark before attributing the result to scheduling or attention."
                 )
         lines.append(
             "- Selective Batch Decode is not batch attention. It batches token-independent operators "

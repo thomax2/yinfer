@@ -12,6 +12,7 @@
 #include "llm_engine/runtime/thread_pool.h"
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include <memory>
+#include <array>
 #include <random>
 #include <vector>
 #include <string>
@@ -85,6 +86,10 @@ public:
     std::unique_ptr<ThreadPool> thread_pool;
     void* block_workspace = nullptr;
     size_t block_workspace_bytes = 0;
+    void* selective_decode_workspace = nullptr;
+    size_t selective_decode_workspace_bytes = 0;
+    int selective_decode_workspace_max_batch = 0;
+    uint64_t selective_decode_workspace_reallocations = 0;
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 
@@ -116,6 +121,19 @@ public:
         int linear_batch_rows = 0;
         int attention_per_sequence_calls = 0;
         int lm_head_rows = 0;
+        bool state_modified = false;
+        uint64_t gptq_batch_kernel_calls = 0;
+        uint64_t gptq_batch_rows_total = 0;
+        uint64_t gptq_batch_output_panel_tasks = 0;
+        uint64_t gptq_batch_row_gemv_fallbacks = 0;
+        uint64_t gptq_batch_weight_vector_loads = 0;
+        uint64_t gptq_batch_dequant_vector_ops = 0;
+        uint64_t gptq_batch_argmax_calls = 0;
+        uint64_t gptq_batch_argmax_rows = 0;
+        uint64_t gptq_batch_full_logits_elements_written = 0;
+        uint64_t gptq_batch_compare_mismatches = 0;
+        uint64_t selective_decode_hotpath_allocations = 0;
+        uint64_t selective_decode_workspace_reallocations = 0;
         double model_ms = 0.0;
     };
     
@@ -212,6 +230,26 @@ private:
     void init_rope_cache();
     void build_graph(KVCache& kv_cache);
     void ensure_block_workspace();
+    bool ensure_selective_decode_workspace(int max_batch);
+
+    struct SelectiveDecodeWorkspaceView {
+        fp16_t* hidden = nullptr;
+        fp16_t* residual = nullptr;
+        fp16_t* norm = nullptr;
+        fp16_t* q = nullptr;
+        fp16_t* k = nullptr;
+        fp16_t* v = nullptr;
+        fp16_t* attn_out = nullptr;
+        fp16_t* proj_out = nullptr;
+        fp16_t* gate = nullptr;
+        fp16_t* up = nullptr;
+        fp16_t* score = nullptr;
+        void* argmax_partials = nullptr;
+        size_t argmax_partials_bytes = 0;
+        size_t bytes = 0;
+    };
+
+    SelectiveDecodeWorkspaceView selective_decode_workspace_view(int batch_size);
     int prefill_prompt_batch(const std::vector<int>& input_tokens, int start_pos, KVCache& kv_cache);
 
     // ========== Debug 辅助 ==========

@@ -64,6 +64,19 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     selective_decode_lm_head_rows_total_ += metrics.selective_decode_lm_head_rows;
     selective_decode_fallbacks_total_ += metrics.selective_decode_fallbacks;
     selective_decode_model_ms_total_ += metrics.selective_decode_model_ms;
+    gptq_batch_kernel_calls_ += metrics.gptq_batch_kernel_calls;
+    gptq_batch_rows_total_ += metrics.gptq_batch_rows_total;
+    gptq_batch_output_panel_tasks_ += metrics.gptq_batch_output_panel_tasks;
+    gptq_batch_row_gemv_fallbacks_ += metrics.gptq_batch_row_gemv_fallbacks;
+    gptq_batch_weight_vector_loads_ += metrics.gptq_batch_weight_vector_loads;
+    gptq_batch_dequant_vector_ops_ += metrics.gptq_batch_dequant_vector_ops;
+    gptq_batch_argmax_calls_ += metrics.gptq_batch_argmax_calls;
+    gptq_batch_argmax_rows_ += metrics.gptq_batch_argmax_rows;
+    gptq_batch_full_logits_elements_written_ += metrics.gptq_batch_full_logits_elements_written;
+    gptq_batch_compare_mismatches_ += metrics.gptq_batch_compare_mismatches;
+    selective_decode_hotpath_allocations_ += metrics.selective_decode_hotpath_allocations;
+    selective_decode_workspace_reallocations_ +=
+        metrics.selective_decode_workspace_reallocations;
     if (metrics.prefill_batching_enabled) {
         prefill_batching_enabled_ = true;
     }
@@ -183,6 +196,21 @@ std::string ServerMetrics::to_json() const {
        << ",\"selective_decode_lm_head_rows_total\":" << selective_decode_lm_head_rows_total_
        << ",\"selective_decode_fallbacks_total\":" << selective_decode_fallbacks_total_
        << ",\"selective_decode_model_ms_total\":" << selective_decode_model_ms_total_
+       << ",\"gptq_batch_kernel_calls\":" << gptq_batch_kernel_calls_
+       << ",\"gptq_batch_rows_total\":" << gptq_batch_rows_total_
+       << ",\"gptq_batch_output_panel_tasks\":" << gptq_batch_output_panel_tasks_
+       << ",\"gptq_batch_row_gemv_fallbacks\":" << gptq_batch_row_gemv_fallbacks_
+       << ",\"gptq_batch_weight_vector_loads\":" << gptq_batch_weight_vector_loads_
+       << ",\"gptq_batch_dequant_vector_ops\":" << gptq_batch_dequant_vector_ops_
+       << ",\"gptq_batch_argmax_calls\":" << gptq_batch_argmax_calls_
+       << ",\"gptq_batch_argmax_rows\":" << gptq_batch_argmax_rows_
+       << ",\"gptq_batch_full_logits_elements_written\":"
+       << gptq_batch_full_logits_elements_written_
+       << ",\"gptq_batch_compare_mismatches\":" << gptq_batch_compare_mismatches_
+       << ",\"selective_decode_hotpath_allocations\":"
+       << selective_decode_hotpath_allocations_
+       << ",\"selective_decode_workspace_reallocations\":"
+       << selective_decode_workspace_reallocations_
        << ",\"prefill_batching_enabled\":" << (prefill_batching_enabled_ ? "true" : "false")
        << ",\"prefill_microbatch_steps_total\":" << prefill_microbatch_steps_total_
        << ",\"prefill_microbatch_size_sum\":" << prefill_microbatch_size_sum_

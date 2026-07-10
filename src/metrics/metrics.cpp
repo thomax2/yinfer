@@ -150,6 +150,21 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"selective_decode_lm_head_rows\":" << m.selective_decode_lm_head_rows
        << ",\"selective_decode_fallbacks\":" << m.selective_decode_fallbacks
        << ",\"selective_decode_model_ms\":" << m.selective_decode_model_ms
+       << ",\"gptq_batch_kernel_calls\":" << m.gptq_batch_kernel_calls
+       << ",\"gptq_batch_rows_total\":" << m.gptq_batch_rows_total
+       << ",\"gptq_batch_output_panel_tasks\":" << m.gptq_batch_output_panel_tasks
+       << ",\"gptq_batch_row_gemv_fallbacks\":" << m.gptq_batch_row_gemv_fallbacks
+       << ",\"gptq_batch_weight_vector_loads\":" << m.gptq_batch_weight_vector_loads
+       << ",\"gptq_batch_dequant_vector_ops\":" << m.gptq_batch_dequant_vector_ops
+       << ",\"gptq_batch_argmax_calls\":" << m.gptq_batch_argmax_calls
+       << ",\"gptq_batch_argmax_rows\":" << m.gptq_batch_argmax_rows
+       << ",\"gptq_batch_full_logits_elements_written\":"
+       << m.gptq_batch_full_logits_elements_written
+       << ",\"gptq_batch_compare_mismatches\":" << m.gptq_batch_compare_mismatches
+       << ",\"selective_decode_hotpath_allocations\":"
+       << m.selective_decode_hotpath_allocations
+       << ",\"selective_decode_workspace_reallocations\":"
+       << m.selective_decode_workspace_reallocations
        << ",\"selective_decode_mode\":\"" << json_escape(m.selective_decode_mode) << "\""
        << ",\"prefill_batching_enabled\":" << (m.prefill_batching_enabled ? "true" : "false")
        << ",\"prefill_microbatch_steps\":" << m.prefill_microbatch_steps
