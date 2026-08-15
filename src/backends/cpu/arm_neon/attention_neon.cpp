@@ -583,6 +583,527 @@ Status attention_decode_value_paged_f16_neon(
     return Status::SUCCESS;
 }
 
+// 4 个 Query × 16 个 Key 的 QK^T 小块。K 已由当前物理页转置成
+// [head_dim, 16]，因此每个 d 都能连续读取 16 个 Key。累加始终使用 FP32。
+inline void attention_prefill_qk_tile_4x16(
+    const fp16_t* q_tile,
+    int q_row_stride,
+    int active_rows,
+    const fp16_t* k_tile,
+    int head_dim,
+    float scale,
+    fp16_t* score,
+    int score_row_stride,
+    int query_base,
+    int key_base,
+    int valid_keys,
+    int query_position_base
+) {
+    float32x4_t acc[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int v = 0; v < 4; ++v) {
+            acc[r][v] = vdupq_n_f32(0.0f);
+        }
+    }
+
+    for (int d = 0; d < head_dim; ++d) {
+        const fp16_t* packed_k = k_tile + (size_t)d * 16;
+        const float16x8_t hk0 = vld1q_f16(packed_k);
+        const float16x8_t hk1 = vld1q_f16(packed_k + 8);
+        const float32x4_t k0 = vcvt_f32_f16(vget_low_f16(hk0));
+        const float32x4_t k1 = vcvt_f32_f16(vget_high_f16(hk0));
+        const float32x4_t k2 = vcvt_f32_f16(vget_low_f16(hk1));
+        const float32x4_t k3 = vcvt_f32_f16(vget_high_f16(hk1));
+
+        for (int r = 0; r < active_rows; ++r) {
+            const float32x4_t qv = vdupq_n_f32(
+                (float)q_tile[(size_t)r * q_row_stride + d]);
+            acc[r][0] = vfmaq_f32(acc[r][0], k0, qv);
+            acc[r][1] = vfmaq_f32(acc[r][1], k1, qv);
+            acc[r][2] = vfmaq_f32(acc[r][2], k2, qv);
+            acc[r][3] = vfmaq_f32(acc[r][3], k3, qv);
+        }
+    }
+
+    const float negative_infinity = -std::numeric_limits<float>::infinity();
+    for (int r = 0; r < active_rows; ++r) {
+        alignas(16) float values[16];
+        for (int v = 0; v < 4; ++v) {
+            vst1q_f32(values + v * 4, vmulq_n_f32(acc[r][v], scale));
+        }
+        fp16_t* score_row = score + (size_t)(query_base + r) * score_row_stride;
+        const int query_position = query_position_base + query_base + r;
+        for (int lane = 0; lane < valid_keys; ++lane) {
+            const int key_position = key_base + lane;
+            // Chunk 内未来位置直接写 -inf，Softmax 后自然变为 0。
+            score_row[key_position] = (fp16_t)(
+                key_position <= query_position ? values[lane] : negative_infinity);
+        }
+    }
+}
+
+// Online Softmax 使用的 4 Query × 16 Key QK^T 微内核。
+//
+// 与 Dense-Score 版本不同，这里把 score 保持为 FP32，避免在每个 KV Tile
+// 之间反复做 FP16 舍入。因果边界由调用者按 Query 行裁剪 valid_keys；这样
+// 同一个 score Tile 可以紧接着参与 max / exp / P×V，不必落到完整 Score 矩阵。
+inline void attention_prefill_qk_tile_4x16_f32(
+    const fp16_t* q_tile,
+    int q_row_stride,
+    int active_rows,
+    const fp16_t* k_tile,
+    int head_dim,
+    float scale,
+    float* score_tile
+) {
+    float32x4_t acc[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int v = 0; v < 4; ++v) {
+            acc[r][v] = vdupq_n_f32(0.0f);
+        }
+    }
+
+    for (int d = 0; d < head_dim; ++d) {
+        const fp16_t* packed_k = k_tile + (size_t)d * 16;
+        const float16x8_t hk0 = vld1q_f16(packed_k);
+        const float16x8_t hk1 = vld1q_f16(packed_k + 8);
+        const float32x4_t k0 = vcvt_f32_f16(vget_low_f16(hk0));
+        const float32x4_t k1 = vcvt_f32_f16(vget_high_f16(hk0));
+        const float32x4_t k2 = vcvt_f32_f16(vget_low_f16(hk1));
+        const float32x4_t k3 = vcvt_f32_f16(vget_high_f16(hk1));
+
+        for (int r = 0; r < active_rows; ++r) {
+            const float32x4_t qv = vdupq_n_f32(
+                (float)q_tile[(size_t)r * q_row_stride + d]);
+            acc[r][0] = vfmaq_f32(acc[r][0], k0, qv);
+            acc[r][1] = vfmaq_f32(acc[r][1], k1, qv);
+            acc[r][2] = vfmaq_f32(acc[r][2], k2, qv);
+            acc[r][3] = vfmaq_f32(acc[r][3], k3, qv);
+        }
+    }
+
+    for (int r = 0; r < active_rows; ++r) {
+        float* row = score_tile + (size_t)r * 16;
+        for (int v = 0; v < 4; ++v) {
+            vst1q_f32(row + v * 4, vmulq_n_f32(acc[r][v], scale));
+        }
+    }
+}
+
+Status attention_prefill_paged_online_f16_neon(
+    const fp16_t* q_chunk,
+    fp16_t* out_chunk,
+    int query_rows,
+    int start_position,
+    int q_row_stride,
+    int num_rep,
+    int head_dim,
+    float scale,
+    const fp16_t* k_pages,
+    const fp16_t* v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head_id,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks,
+    fp16_t* k_tile_workspace,
+    size_t k_tile_elements,
+    float* output_acc_workspace,
+    size_t output_acc_elements
+) {
+    if (!q_chunk || !out_chunk || !k_pages || !v_pages || !block_table ||
+        !k_tile_workspace || !output_acc_workspace || query_rows <= 1 ||
+        start_position < 0 || q_row_stride < num_rep * head_dim ||
+        num_rep <= 0 || head_dim <= 0 || block_size <= 0 ||
+        block_table_size <= 0 || layer_id < 0 || layer_id >= num_layers ||
+        kv_head_id < 0 || kv_head_id >= num_kv_heads ||
+        num_physical_blocks <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (k_tile_elements < (size_t)head_dim * 16 ||
+        output_acc_elements < (size_t)4 * head_dim) {
+        return Status::OUT_OF_MEMORY;
+    }
+
+    const int seq_len = start_position + query_rows;
+    const int logical_blocks_needed = (seq_len + block_size - 1) / block_size;
+    if (logical_blocks_needed > block_table_size) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    // 工作集固定为一个 Query Tile：4×16 个 FP32 score、4 组 m/l，外加
+    // Workspace 中的 [4, head_dim] FP32 O。历史越长，只会增加扫描次数，
+    // 不会增加临时内存。
+    alignas(64) float score_tile[4 * 16];
+    alignas(16) float running_max[4];
+    alignas(16) float running_sum[4];
+    alignas(64) float probabilities[4 * 16];
+
+    for (int qh = 0; qh < num_rep; ++qh) {
+        const fp16_t* q_head = q_chunk + (size_t)qh * head_dim;
+        fp16_t* out_head = out_chunk + (size_t)qh * head_dim;
+
+        for (int query_base = 0; query_base < query_rows; query_base += 4) {
+            const int active_rows = std::min(4, query_rows - query_base);
+            for (int r = 0; r < active_rows; ++r) {
+                running_max[r] = -std::numeric_limits<float>::infinity();
+                running_sum[r] = 0.0f;
+                std::fill_n(
+                    output_acc_workspace + (size_t)r * head_dim,
+                    head_dim,
+                    0.0f);
+            }
+
+            const fp16_t* q_tile =
+                q_head + (size_t)query_base * q_row_stride;
+            const int last_query_position =
+                start_position + query_base + active_rows - 1;
+
+            // 按逻辑页顺序查 Block Table。物理页可以完全不连续，但每次只把
+            // 当前 16 个 K 转置到小 Tile；V 仍从对应物理页原位读取。
+            for (int logical_block = 0;
+                 logical_block < logical_blocks_needed;
+                 ++logical_block) {
+                const int physical_block = block_table[logical_block];
+                if (physical_block < 0 || physical_block >= num_physical_blocks) {
+                    return Status::INVALID_ARGUMENT;
+                }
+
+                const int block_token_begin = logical_block * block_size;
+                if (block_token_begin > last_query_position) {
+                    break;  // 整个物理页都位于当前 Query Tile 的因果边界之后。
+                }
+                const int valid_block_tokens =
+                    std::min(block_size, seq_len - block_token_begin);
+                const fp16_t* k_block = paged_kv_token_ptr(
+                    k_pages, physical_block, layer_id, kv_head_id, 0,
+                    num_layers, num_kv_heads, block_size, head_dim);
+                const fp16_t* v_block = paged_kv_token_ptr(
+                    v_pages, physical_block, layer_id, kv_head_id, 0,
+                    num_layers, num_kv_heads, block_size, head_dim);
+
+                for (int block_offset = 0;
+                     block_offset < valid_block_tokens;
+                     block_offset += 16) {
+                    const int key_base = block_token_begin + block_offset;
+                    if (key_base > last_query_position) break;
+                    const int valid_keys =
+                        std::min(16, valid_block_tokens - block_offset);
+
+                    // Paged K 的原布局是 [token, head_dim]。QK^T 内层需要对同一
+                    // d 连续读取 16 个 Key，因此先转置为 [head_dim, 16]。
+                    for (int d = 0; d < head_dim; ++d) {
+                        fp16_t* packed_k =
+                            k_tile_workspace + (size_t)d * 16;
+                        int lane = 0;
+                        for (; lane < valid_keys; ++lane) {
+                            packed_k[lane] = k_block[
+                                (size_t)(block_offset + lane) * head_dim + d];
+                        }
+                        for (; lane < 16; ++lane) {
+                            packed_k[lane] = (fp16_t)0;
+                        }
+                    }
+
+                    attention_prefill_qk_tile_4x16_f32(
+                        q_tile, q_row_stride, active_rows, k_tile_workspace,
+                        head_dim, scale, score_tile);
+
+                    int causal_keys_per_row[4] = {0, 0, 0, 0};
+                    for (int r = 0; r < active_rows; ++r) {
+                        const int query_position =
+                            start_position + query_base + r;
+                        const int causal_keys = std::min(
+                            valid_keys, query_position - key_base + 1);
+                        if (causal_keys <= 0) continue;
+                        causal_keys_per_row[r] = causal_keys;
+
+                        const float* score_row =
+                            score_tile + (size_t)r * 16;
+                        float tile_max = score_row[0];
+                        for (int lane = 1; lane < causal_keys; ++lane) {
+                            tile_max = std::max(tile_max, score_row[lane]);
+                        }
+
+                        // Online Softmax 合并公式：
+                        //   m_new = max(m_old, max(score_tile))
+                        //   alpha = exp(m_old - m_new)
+                        //   l_new = alpha*l_old + sum(exp(score-m_new))
+                        //   O_new = alpha*O_old + exp(score-m_new) * V
+                        // 当最大值被新 Tile 刷新时，旧的 l 和 O 必须一起缩放。
+                        const float new_max =
+                            std::max(running_max[r], tile_max);
+                        const float old_scale = std::isfinite(running_max[r])
+                            ? std::exp(running_max[r] - new_max)
+                            : 0.0f;
+                        float* out_acc =
+                            output_acc_workspace + (size_t)r * head_dim;
+                        int d = 0;
+                        const float32x4_t old_scale_v =
+                            vdupq_n_f32(old_scale);
+                        for (; d <= head_dim - 4; d += 4) {
+                            vst1q_f32(
+                                out_acc + d,
+                                vmulq_f32(vld1q_f32(out_acc + d), old_scale_v));
+                        }
+                        for (; d < head_dim; ++d) out_acc[d] *= old_scale;
+
+                        float tile_sum = 0.0f;
+                        float* probability_row =
+                            probabilities + (size_t)r * 16;
+                        for (int lane = 0; lane < causal_keys; ++lane) {
+                            const float p = std::exp(score_row[lane] - new_max);
+                            probability_row[lane] = p;
+                            tile_sum += p;
+                        }
+
+                        running_sum[r] =
+                            old_scale * running_sum[r] + tile_sum;
+                        running_max[r] = new_max;
+                    }
+
+                    // 先算完 4 行 probability，再让同一次 V Load 同时服务所有
+                    // Query 行。这样 Multi-Query Prefill 不会像逐 Query Decode 那样
+                    // 为每一行重新读取整块 V；每行不同的 causal_keys 负责跳过未来 lane。
+                    for (int lane = 0; lane < valid_keys; ++lane) {
+                        const fp16_t* value = v_block +
+                            (size_t)(block_offset + lane) * head_dim;
+                        int value_d = 0;
+                        for (; value_d <= head_dim - 8; value_d += 8) {
+                            const float16x8_t hv = vld1q_f16(value + value_d);
+                            const float32x4_t value_lo =
+                                vcvt_f32_f16(vget_low_f16(hv));
+                            const float32x4_t value_hi =
+                                vcvt_f32_f16(vget_high_f16(hv));
+                            for (int r = 0; r < active_rows; ++r) {
+                                if (lane >= causal_keys_per_row[r]) continue;
+                                const float p = probabilities[(size_t)r * 16 + lane];
+                                float* out_acc = output_acc_workspace +
+                                    (size_t)r * head_dim + value_d;
+                                vst1q_f32(
+                                    out_acc,
+                                    vfmaq_n_f32(vld1q_f32(out_acc), value_lo, p));
+                                vst1q_f32(
+                                    out_acc + 4,
+                                    vfmaq_n_f32(
+                                        vld1q_f32(out_acc + 4), value_hi, p));
+                            }
+                        }
+                        for (; value_d < head_dim; ++value_d) {
+                            const float scalar_value = (float)value[value_d];
+                            for (int r = 0; r < active_rows; ++r) {
+                                if (lane >= causal_keys_per_row[r]) continue;
+                                output_acc_workspace[(size_t)r * head_dim + value_d] +=
+                                    probabilities[(size_t)r * 16 + lane] * scalar_value;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 所有可见 KV Tile 扫描完毕后只做一次归一化并写回 FP16。
+            for (int r = 0; r < active_rows; ++r) {
+                if (!(running_sum[r] > 0.0f) ||
+                    !std::isfinite(running_sum[r])) {
+                    return Status::INVALID_ARGUMENT;
+                }
+                const float inverse_sum = 1.0f / running_sum[r];
+                const float* out_acc =
+                    output_acc_workspace + (size_t)r * head_dim;
+                fp16_t* output = out_head +
+                    (size_t)(query_base + r) * q_row_stride;
+                int d = 0;
+                for (; d <= head_dim - 8; d += 8) {
+                    const float32x4_t lo = vmulq_n_f32(
+                        vld1q_f32(out_acc + d), inverse_sum);
+                    const float32x4_t hi = vmulq_n_f32(
+                        vld1q_f32(out_acc + d + 4), inverse_sum);
+                    vst1q_f16(
+                        output + d,
+                        vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi)));
+                }
+                for (; d < head_dim; ++d) {
+                    output[d] = (fp16_t)(out_acc[d] * inverse_sum);
+                }
+            }
+        }
+    }
+
+    return Status::SUCCESS;
+}
+
+Status attention_prefill_paged_f16_neon(
+    const fp16_t* q_chunk,
+    fp16_t* out_chunk,
+    int query_rows,
+    int start_position,
+    int q_row_stride,
+    int num_rep,
+    int head_dim,
+    float scale,
+    const fp16_t* k_pages,
+    const fp16_t* v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head_id,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks,
+    fp16_t* score,
+    size_t score_elements,
+    fp16_t* k_tile_workspace,
+    size_t k_tile_elements
+) {
+    if (!q_chunk || !out_chunk || !k_pages || !v_pages || !block_table ||
+        !score || !k_tile_workspace || query_rows <= 1 || start_position < 0 ||
+        q_row_stride < num_rep * head_dim || num_rep <= 0 || head_dim <= 0 ||
+        block_size <= 0 || block_table_size <= 0 || num_layers <= layer_id ||
+        num_kv_heads <= kv_head_id || num_physical_blocks <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int seq_len = start_position + query_rows;
+    const size_t required_score =
+        (size_t)query_rows * num_rep * (size_t)seq_len;
+    if (score_elements < required_score ||
+        k_tile_elements < (size_t)head_dim * 16) {
+        return Status::OUT_OF_MEMORY;
+    }
+    const int logical_blocks_needed = (seq_len + block_size - 1) / block_size;
+    if (logical_blocks_needed > block_table_size) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    // Score 的逻辑布局为 [query, q_head_in_group, seq_len]。按物理页读取 K，
+    // 每次最多取 16 个 token，并转置为 [head_dim, 16] 后服务所有 Query Tile。
+    for (int logical_block = 0; logical_block < logical_blocks_needed; ++logical_block) {
+        const int physical_block = block_table[logical_block];
+        if (physical_block < 0 || physical_block >= num_physical_blocks) {
+            return Status::INVALID_ARGUMENT;
+        }
+        const int block_token_begin = logical_block * block_size;
+        const int valid_block_tokens = std::min(block_size, seq_len - block_token_begin);
+        const fp16_t* k_block = paged_kv_token_ptr(
+            k_pages, physical_block, layer_id, kv_head_id, 0,
+            num_layers, num_kv_heads, block_size, head_dim);
+
+        for (int block_offset = 0; block_offset < valid_block_tokens;
+             block_offset += 16) {
+            const int valid_keys = std::min(16, valid_block_tokens - block_offset);
+            for (int d = 0; d < head_dim; ++d) {
+                fp16_t* packed_k = k_tile_workspace + (size_t)d * 16;
+                int lane = 0;
+                for (; lane < valid_keys; ++lane) {
+                    packed_k[lane] =
+                        k_block[(size_t)(block_offset + lane) * head_dim + d];
+                }
+                for (; lane < 16; ++lane) packed_k[lane] = (fp16_t)0;
+            }
+
+            const int key_base = block_token_begin + block_offset;
+            for (int qh = 0; qh < num_rep; ++qh) {
+                const fp16_t* q_head = q_chunk + (size_t)qh * head_dim;
+                fp16_t* score_head = score + (size_t)qh * seq_len;
+                for (int query_base = 0; query_base < query_rows; query_base += 4) {
+                    const int active_rows = std::min(4, query_rows - query_base);
+                    attention_prefill_qk_tile_4x16(
+                        q_head + (size_t)query_base * q_row_stride,
+                        q_row_stride, active_rows, k_tile_workspace, head_dim,
+                        scale, score_head, num_rep * seq_len, query_base,
+                        key_base, valid_keys, start_position);
+                }
+            }
+        }
+    }
+
+    Status status = softmax_f16_inplace_neon(
+        score, query_rows * num_rep, seq_len);
+    if (status != Status::SUCCESS) return status;
+
+    // Dense-Score 第一阶段：P×V 仍按 4 个 Query 为一块，但同一 V Load 同时
+    // 服务 4 行，避免 Prefill 每一行分别重扫 V Cache。
+    for (int qh = 0; qh < num_rep; ++qh) {
+        fp16_t* out_head = out_chunk + (size_t)qh * head_dim;
+        for (int query_base = 0; query_base < query_rows; query_base += 4) {
+            const int active_rows = std::min(4, query_rows - query_base);
+            int d = 0;
+            for (; d <= head_dim - 8; d += 8) {
+                float32x4_t acc_lo[4];
+                float32x4_t acc_hi[4];
+                for (int r = 0; r < 4; ++r) {
+                    acc_lo[r] = vdupq_n_f32(0.0f);
+                    acc_hi[r] = vdupq_n_f32(0.0f);
+                }
+
+                for (int logical_block = 0; logical_block < logical_blocks_needed;
+                     ++logical_block) {
+                    const int physical_block = block_table[logical_block];
+                    const int token_begin = logical_block * block_size;
+                    const int valid_tokens = std::min(block_size, seq_len - token_begin);
+                    const fp16_t* v_block = paged_kv_token_ptr(
+                        v_pages, physical_block, layer_id, kv_head_id, 0,
+                        num_layers, num_kv_heads, block_size, head_dim);
+                    for (int offset = 0; offset < valid_tokens; ++offset) {
+                        const float16x8_t hv = vld1q_f16(
+                            v_block + (size_t)offset * head_dim + d);
+                        const float32x4_t v_lo = vcvt_f32_f16(vget_low_f16(hv));
+                        const float32x4_t v_hi = vcvt_f32_f16(vget_high_f16(hv));
+                        const int key = token_begin + offset;
+                        for (int r = 0; r < active_rows; ++r) {
+                            const fp16_t* probability = score +
+                                ((size_t)(query_base + r) * num_rep + qh) * seq_len;
+                            const float p = (float)probability[key];
+                            acc_lo[r] = vfmaq_n_f32(acc_lo[r], v_lo, p);
+                            acc_hi[r] = vfmaq_n_f32(acc_hi[r], v_hi, p);
+                        }
+                    }
+                }
+
+                for (int r = 0; r < active_rows; ++r) {
+                    fp16_t* output = out_head +
+                        (size_t)(query_base + r) * q_row_stride + d;
+                    vst1q_f16(output, vcombine_f16(
+                        vcvt_f16_f32(acc_lo[r]), vcvt_f16_f32(acc_hi[r])));
+                }
+            }
+
+            // head_dim 通常为 128；此分支只处理极少见的非 8 对齐尾部。
+            for (; d < head_dim; ++d) {
+                float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int logical_block = 0; logical_block < logical_blocks_needed;
+                     ++logical_block) {
+                    const int physical_block = block_table[logical_block];
+                    const int token_begin = logical_block * block_size;
+                    const int valid_tokens = std::min(block_size, seq_len - token_begin);
+                    const fp16_t* v_block = paged_kv_token_ptr(
+                        v_pages, physical_block, layer_id, kv_head_id, 0,
+                        num_layers, num_kv_heads, block_size, head_dim);
+                    for (int offset = 0; offset < valid_tokens; ++offset) {
+                        const int key = token_begin + offset;
+                        const float value = (float)v_block[
+                            (size_t)offset * head_dim + d];
+                        for (int r = 0; r < active_rows; ++r) {
+                            const fp16_t* probability = score +
+                                ((size_t)(query_base + r) * num_rep + qh) * seq_len;
+                            acc[r] += (float)probability[key] * value;
+                        }
+                    }
+                }
+                for (int r = 0; r < active_rows; ++r) {
+                    out_head[(size_t)(query_base + r) * q_row_stride + d] =
+                        (fp16_t)acc[r];
+                }
+            }
+        }
+    }
+    return Status::SUCCESS;
+}
+
 void compare_paged_attention_output(
     const fp16_t* paged,
     const fp16_t* gather,
@@ -717,6 +1238,70 @@ Status attention_decode_value_paged_f16_neon_public(
         num_layers,
         num_kv_heads,
         num_physical_blocks);
+}
+
+Status attention_prefill_paged_f16_neon_public(
+    const fp16_t* q_chunk,
+    fp16_t* out_chunk,
+    int query_rows,
+    int start_position,
+    int q_row_stride,
+    int num_rep,
+    int head_dim,
+    float scale,
+    const fp16_t* raw_k_pages,
+    const fp16_t* raw_v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks,
+    fp16_t* score,
+    size_t score_elements,
+    fp16_t* k_tile_workspace,
+    size_t k_tile_elements
+) {
+    return attention_prefill_paged_f16_neon(
+        q_chunk, out_chunk, query_rows, start_position, q_row_stride,
+        num_rep, head_dim, scale, raw_k_pages, raw_v_pages, block_table,
+        block_table_size, block_size, layer_id, kv_head, num_layers,
+        num_kv_heads, num_physical_blocks, score, score_elements,
+        k_tile_workspace, k_tile_elements);
+}
+
+Status attention_prefill_paged_online_f16_neon_public(
+    const fp16_t* q_chunk,
+    fp16_t* out_chunk,
+    int query_rows,
+    int start_position,
+    int q_row_stride,
+    int num_rep,
+    int head_dim,
+    float scale,
+    const fp16_t* raw_k_pages,
+    const fp16_t* raw_v_pages,
+    const int* block_table,
+    int block_table_size,
+    int block_size,
+    int layer_id,
+    int kv_head,
+    int num_layers,
+    int num_kv_heads,
+    int num_physical_blocks,
+    fp16_t* k_tile_workspace,
+    size_t k_tile_elements,
+    float* output_acc_workspace,
+    size_t output_acc_elements
+) {
+    return attention_prefill_paged_online_f16_neon(
+        q_chunk, out_chunk, query_rows, start_position, q_row_stride,
+        num_rep, head_dim, scale, raw_k_pages, raw_v_pages, block_table,
+        block_table_size, block_size, layer_id, kv_head, num_layers,
+        num_kv_heads, num_physical_blocks, k_tile_workspace,
+        k_tile_elements, output_acc_workspace, output_acc_elements);
 }
 
 Status attention_neon(
@@ -1031,7 +1616,7 @@ Status attention_f16_gptq_neon(
     int num_tokens = hidden_states.shape.empty() ? 0 : hidden_states.shape[0];
 
     PagedKVView paged_view;
-    bool paged_attention_requested = attention_env_flag("LLM_ENABLE_PAGED_ATTENTION");
+    bool paged_attention_requested = kv_cache.is_paged();
     bool debug_paged_attention = attention_env_flag("LLM_DEBUG_PAGED_ATTENTION");
     bool strict_paged_attention = attention_env_flag("LLM_PAGED_ATTENTION_STRICT");
     bool compare_paged_attention = attention_env_flag("LLM_PAGED_ATTENTION_COMPARE");

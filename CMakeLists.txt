@@ -4,6 +4,9 @@ project(llm_engine)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(LLM_ENGINE_BUILD_MODEL_LOADER "Build the tokenizer-backed model loader executable" ON)
+option(LLM_ENGINE_BUILD_BENCHMARKS "Build Google Benchmark targets" ON)
+
 include_directories(include src)
 
 # 公共源文件（非架构相关）
@@ -14,6 +17,7 @@ set(LLM_ENGINE_SOURCES
     # Sprint 3: 计算图
     src/graph/graph.cpp
     src/graph/compiler.cpp
+    src/graph/executable_plan.cpp
 
     # Sprint 4: 内存管理
     src/cache/prefix_cache.cpp
@@ -22,6 +26,7 @@ set(LLM_ENGINE_SOURCES
     src/memory/kv_cache.cpp
     src/memory/kv_cache_manager.cpp
     src/metrics/metrics.cpp
+    src/engine/mixed_batch.cpp
     src/server/json_lite.cpp
     src/server/http_types.cpp
     src/server/server_metrics.cpp
@@ -47,55 +52,72 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
         src/backends/cpu/arm_neon/swiglu_neon.cpp
         src/backends/cpu/arm_neon/qwen_block_neon.cpp
     )
+else()
+    list(APPEND LLM_ENGINE_SOURCES
+        src/backends/cpu/reference/graph_ops_fallback.cpp
+    )
 endif()
 
 add_library(llm_engine ${LLM_ENGINE_SOURCES})
+
+add_executable(bench_executable_plan
+    tools/bench_executable_plan.cpp
+    model/qwen_execution_plan.cpp
+)
+target_include_directories(bench_executable_plan PRIVATE model)
+target_link_libraries(bench_executable_plan PRIVATE llm_engine)
 
 # 线程池依赖：POSIX 平台上 std::thread 需要 pthread
 find_package(Threads REQUIRED)
 target_link_libraries(llm_engine PUBLIC Threads::Threads)
 
-# 1. 寻找 PCRE2 依赖
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
+if(LLM_ENGINE_BUILD_MODEL_LOADER)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
 
-# 2. 引入第三方库的头文件搜索路径
-include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken)
-include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken/tiktoken)
-include_directories(${PCRE2_INCLUDE_DIRS})
+    include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken)
+    include_directories(${CMAKE_SOURCE_DIR}/third_party/cpp-tiktoken/tiktoken)
+    include_directories(${PCRE2_INCLUDE_DIRS})
 
-# 3. 收集 tiktoken 的源文件
-file(GLOB TIKTOKEN_SRCS "third_party/cpp-tiktoken/*.cc")
+    file(GLOB TIKTOKEN_SRCS "third_party/cpp-tiktoken/*.cc")
 
-add_executable(qwen_model_loader
-    model/main.cpp
-    model/model.cpp
-    src/engine/llm_engine.cpp
-    src/engine/engine_service.cpp
-    src/server/tcp_jsonl_server.cpp
-    src/server/http_sse_server.cpp
-    ${TIKTOKEN_SRCS}
-)
+    add_executable(qwen_model_loader
+        model/main.cpp
+        model/model.cpp
+        model/qwen_execution_plan.cpp
+        src/engine/llm_engine.cpp
+        src/engine/engine_service.cpp
+        src/server/tcp_jsonl_server.cpp
+        src/server/http_sse_server.cpp
+        ${TIKTOKEN_SRCS}
+    )
 
-target_link_libraries(qwen_model_loader
-    llm_engine
-    ${PCRE2_LIBRARIES}
-)
+    target_link_libraries(qwen_model_loader
+        llm_engine
+        ${PCRE2_LIBRARIES}
+    )
+endif()
 
 # 针对不同平台选择合适的编译选项
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
     target_compile_options(llm_engine PRIVATE -O3 -march=armv8.2-a+fp16+dotprod)
-    target_compile_options(qwen_model_loader PRIVATE -O3 -march=armv8.2-a+fp16+dotprod)
+    if(TARGET qwen_model_loader)
+        target_compile_options(qwen_model_loader PRIVATE -O3 -march=armv8.2-a+fp16+dotprod)
+    endif()
     add_executable(bench_gptq_batch_kernel tools/bench_gptq_batch_kernel.cpp)
     target_link_libraries(bench_gptq_batch_kernel PRIVATE llm_engine Threads::Threads)
     target_compile_options(bench_gptq_batch_kernel PRIVATE -O3 -march=armv8.2-a+fp16+dotprod)
 else()
+    target_compile_definitions(llm_engine PUBLIC __fp16=uint16_t)
     target_compile_options(llm_engine PRIVATE -O3)
-    target_compile_options(qwen_model_loader PRIVATE -O3)
+    if(TARGET qwen_model_loader)
+        target_compile_options(qwen_model_loader PRIVATE -O3)
+    endif()
 endif()
 
 enable_testing()
 add_subdirectory(tests)
 
-# 新增：挂载 Benchmark 目录
- add_subdirectory(benchmarks)
+if(LLM_ENGINE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()

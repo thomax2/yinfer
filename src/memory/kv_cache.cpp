@@ -32,7 +32,11 @@ int env_int(const char* name, int default_value) {
 KVCache::KVCache(int num_layers, int max_seq_len, int num_kv_heads, int head_dim)
     : num_layers(num_layers), max_seq_len(max_seq_len), 
       num_kv_heads(num_kv_heads), head_dim(head_dim) {
-    layout_ = env_flag("LLM_PAGED_KV") ? KVCacheLayout::PAGED : KVCacheLayout::CONTIGUOUS;
+    // The scheduler owns multiple independent sequences, so paged storage is
+    // part of that mode rather than a second feature switch.
+    layout_ = (env_flag("LLM_ENABLE_SCHEDULER") || env_flag("LLM_PAGED_KV"))
+        ? KVCacheLayout::PAGED
+        : KVCacheLayout::CONTIGUOUS;
 
     if (layout_ == KVCacheLayout::PAGED) {
         block_size_ = env_int("LLM_KV_BLOCK_SIZE", 16);

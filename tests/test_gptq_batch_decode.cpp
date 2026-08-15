@@ -85,6 +85,41 @@ TEST_F(GPTQBatchDecodeTest, LinearMatchesRowReferenceForB2ThroughB8) {
     }
 }
 
+TEST_F(GPTQBatchDecodeTest, PackedAMatchesRowMajorBatchAcrossRowTiles) {
+    constexpr int K = 256;
+    constexpr int N = 53;
+    TestWeight owned(K, N);
+
+    // 覆盖一个 tile 内、8 行边界、尾 tile 补零以及多个 8-row tile。
+    for (int rows = 1; rows <= 17; ++rows) {
+        std::vector<fp16_t> x((size_t)rows * K);
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] = (fp16_t)(0.2f * std::sin((float)i * 0.031f));
+        }
+        const int packed_rows = llm_engine::arm_neon::align_up_int(rows, 8);
+        std::vector<fp16_t> packed_x((size_t)packed_rows * K);
+        std::vector<fp16_t> reference((size_t)rows * N);
+        std::vector<fp16_t> actual((size_t)rows * N);
+
+        ASSERT_EQ(Status::SUCCESS,
+            llm_engine::arm_neon::linear_gptq_int8_batch_neon(
+                x.data(), rows, owned.weight, reference.data(), nullptr, nullptr, 0));
+        ASSERT_EQ(Status::SUCCESS,
+            llm_engine::arm_neon::pack_gptq_batch_a_f16_neon(
+                x.data(), rows, K, packed_x.data()));
+        ASSERT_EQ(Status::SUCCESS,
+            llm_engine::arm_neon::linear_gptq_int8_batch_packed_a_neon(
+                packed_x.data(), rows, owned.weight, actual.data(), nullptr, nullptr, 0));
+
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            max_abs = std::max(
+                max_abs, std::fabs((float)actual[i] - (float)reference[i]));
+        }
+        EXPECT_LE(max_abs, 0.02f) << "rows=" << rows;
+    }
+}
+
 TEST_F(GPTQBatchDecodeTest, BatchedArgmaxMatchesAndDoesNotWriteFullLogits) {
     constexpr int K = 256;
     constexpr int N = 211;

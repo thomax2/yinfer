@@ -7,6 +7,7 @@
 #include "llm_engine/memory/workspace.h"
 #include "llm_engine/graph/graph.h"
 #include "llm_engine/graph/compiler.h"
+#include "llm_engine/graph/executable_plan.h"
 #include "llm_engine/engine/sampling.h"
 #include "llm_engine/engine/sequence_state.h"
 #include "llm_engine/runtime/thread_pool.h"
@@ -17,6 +18,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <unordered_map>
 
 namespace llm_engine {
 
@@ -65,6 +67,29 @@ public:
     GraphRuntime runtime;
     std::vector<GraphNode*> plan;
 
+    // Lowering 后的单 token Decode 执行计划。高层 QwenBlock 不参与运行，
+    // plan 持有 RMSNorm/Attention/Residual/FFN/LMHead 等中粒度 KernelNode。
+    std::unique_ptr<ExecutablePlan> fine_decode_plan; // 单 token Decode 固定执行计划
+    ExecutionWorkspace fine_execution_workspace; // Decode 计划的 Arena
+    PlanValueId fine_hidden_input = kInvalidPlanValue; // Decode 隐藏层输入 ID
+    PlanValueId fine_norm_output = kInvalidPlanValue; // Decode LayerNorm 输出 ID
+    PlanValueId fine_argmax_output = kInvalidPlanValue; // Decode ArgMax 输出 ID
+    size_t coarse_decode_workspace_bytes = 0; // 粗粒度解码工作区字节数
+    bool use_fine_decode_plan = false; // 是否启用精粒度解码计划
+
+    struct BoundExecutablePlan {
+        std::unique_ptr<ExecutablePlan> plan; // 可执行计划
+        PlanValueId hidden_input = kInvalidPlanValue; // 隐藏层输入 ID
+        PlanValueId norm_output = kInvalidPlanValue; // LayerNorm 输出 ID
+        PlanValueId argmax_output = kInvalidPlanValue; // ArgMax 输出 ID
+    };
+    std::unordered_map<int, BoundExecutablePlan> fine_prefill_plans; // 不同 token capacity 对应的 Prefill 计划缓存
+    ExecutionWorkspace fine_prefill_workspace; // 所有 Prefill capacity 计划共享的可扩容 Arena
+    // Scheduler 开启后，Prefill 与 Decode 共用这一份 token-major Mixed Plan。
+    // Plan 保存节点依赖，实际 token 行数由 ExecutionContext::actual_rows 指定。
+    std::unique_ptr<ExecutablePlan> fine_mixed_batch_plan;
+    ExecutionWorkspace fine_mixed_control_workspace;
+
     // 图的边界张量和中间张量指针
     std::vector<fp16_t> ext_hidden_states; // 图的入口物理内存
     Tensor* t_hidden_states = nullptr;    // 图入口张量 (X)
@@ -86,10 +111,13 @@ public:
     std::unique_ptr<ThreadPool> thread_pool;
     void* block_workspace = nullptr;
     size_t block_workspace_bytes = 0;
-    void* selective_decode_workspace = nullptr;
-    size_t selective_decode_workspace_bytes = 0;
-    int selective_decode_workspace_max_batch = 0;
-    uint64_t selective_decode_workspace_reallocations = 0;
+    // Mixed Batch 的计划容量与持久 Workspace 都在 Scheduler 初始化时固定。
+    // 运行阶段只复用这块内存，不允许根据本轮 token 数量扩容。
+    void* mixed_batch_workspace = nullptr;
+    size_t mixed_batch_workspace_bytes = 0;
+    int mixed_batch_workspace_max_rows = 0;
+    uint64_t mixed_batch_workspace_reallocations = 0;
+    int mixed_batch_row_capacity = 0;
 
     // 【新增】：全局历史位置追踪
     int history_pos = 0; 
@@ -105,6 +133,54 @@ public:
 
     PrefillChunkStats last_prefill_chunk_stats;
 
+    enum class MixedBatchItemKind {
+        DECODE,
+        PREFILL
+    };
+
+    // 一个 item 对应同一个 Sequence 上的一段连续 token 行。
+    // Decode 的 row_count 恒为 1；Prefill 的 row_count 是本轮分到的 chunk 大小。
+    struct MixedBatchItem {
+        MixedBatchItemKind kind = MixedBatchItemKind::DECODE;
+        SequenceState* seq = nullptr;
+        int row_begin = 0;
+        int row_count = 0;
+        int start_position = 0;
+        bool requires_logits = false;
+    };
+
+    struct MixedBatchOutput {
+        int next_token = -1;
+        bool success = false;
+        std::string error_message;
+    };
+
+    struct MixedBatchStats {
+        int item_count = 0;
+        int total_rows = 0;
+        int decode_rows = 0;
+        int prefill_rows = 0;
+        int linear_batch_rows = 0;
+        int attention_sequence_segments = 0;
+        int lm_head_rows = 0;
+        bool state_modified = false;
+        uint64_t gptq_batch_kernel_calls = 0;
+        uint64_t gptq_batch_rows_total = 0;
+        uint64_t gptq_batch_output_panel_tasks = 0;
+        uint64_t gptq_batch_row_gemv_fallbacks = 0;
+        uint64_t gptq_batch_weight_vector_loads = 0;
+        uint64_t gptq_batch_dequant_vector_ops = 0;
+        uint64_t gptq_batch_argmax_calls = 0;
+        uint64_t gptq_batch_argmax_rows = 0;
+        uint64_t gptq_batch_full_logits_elements_written = 0;
+        uint64_t gptq_batch_compare_mismatches = 0;
+        uint64_t mixed_batch_hotpath_allocations = 0;
+        uint64_t mixed_batch_workspace_reallocations = 0;
+        double model_ms = 0.0;
+    };
+
+    // 兼容旧的 Decode-only 调用入口。Scheduler 的主路径已经改用 Mixed Batch，
+    // 这组类型仅供保守回退和现有外部调用继续编译，内部仍转成 MixedBatchItem。
     struct SelectiveDecodeItem {
         SequenceState* seq = nullptr;
         int input_token = -1;
@@ -206,6 +282,20 @@ public:
         SamplingRuntimeStats* stats
     );
 
+    // Scheduler 初始化阶段构建并编译固定容量的 Mixed Selective Batch 计划，
+    // 同时按 row_capacity 一次性分配持久 Workspace。
+    // 相同容量的重复调用幂等；不同容量的重复调用属于配置错误。
+    void build_mixed_batch_plan(int row_capacity);
+
+    bool run_mixed_batch_for_sequences(
+        const std::vector<int>& token_ids,
+        const std::vector<MixedBatchItem>& items,
+        KVCacheManager& kv_manager,
+        PrefixCache* prefix_cache,
+        std::vector<MixedBatchOutput>* outputs,
+        MixedBatchStats* stats
+    );
+
     bool decode_selective_batch_for_sequences(
         const std::vector<SelectiveDecodeItem>& items,
         KVCacheManager& kv_manager,
@@ -230,12 +320,16 @@ private:
     void init_rope_cache();
     void build_graph(KVCache& kv_cache);
     void ensure_block_workspace();
-    bool ensure_selective_decode_workspace(int max_batch);
+    bool ensure_mixed_batch_workspace(int max_rows);
 
-    struct SelectiveDecodeWorkspaceView {
+    struct MixedBatchWorkspaceView {
         fp16_t* hidden = nullptr;
         fp16_t* residual = nullptr;
         fp16_t* norm = nullptr;
+        // Mixed 普通 Linear 统一使用的 Packed A 缓冲区。
+        // 容量按 max(hidden_dim, q_size, intermediate_size) 预留，布局为
+        // [ceil(max_rows/8), K, 8]；不同阶段按当前 Linear 的 K 覆盖复用。
+        fp16_t* packed_a = nullptr;
         fp16_t* q = nullptr;
         fp16_t* k = nullptr;
         fp16_t* v = nullptr;
@@ -244,12 +338,31 @@ private:
         fp16_t* gate = nullptr;
         fp16_t* up = nullptr;
         fp16_t* score = nullptr;
+        // Paged Prefill QK^T 的 16-token K 转置区：[head_dim, 16]。
+        fp16_t* attention_k_tile = nullptr;
+        // Online Paged Prefill 的归一化前 FP32 输出累加器：[4, head_dim]。
+        // 它由不同 Query Tile / Q Head 复用，容量不随历史长度增长。
+        float* attention_online_out = nullptr;
         void* argmax_partials = nullptr;
         size_t argmax_partials_bytes = 0;
         size_t bytes = 0;
     };
 
-    SelectiveDecodeWorkspaceView selective_decode_workspace_view(int batch_size);
+    struct MixedPlanRunState {
+        const std::vector<MixedBatchItem>* items = nullptr;
+        std::vector<MixedBatchOutput>* outputs = nullptr;
+        MixedBatchStats* stats = nullptr;
+        MixedBatchWorkspaceView ws;
+        const std::vector<int>* positions = nullptr;
+        const std::vector<int>* logit_rows = nullptr;
+        std::vector<arm_neon::ArgmaxResult>* argmax_results = nullptr;
+        int total_rows = 0;
+        bool paged_attention_requested = false;
+        bool strict_paged_attention = false;
+        std::string error;
+    };
+
+    MixedBatchWorkspaceView mixed_batch_workspace_view(int total_rows);
     int prefill_prompt_batch(const std::vector<int>& input_tokens, int start_pos, KVCache& kv_cache);
 
     // ========== Debug 辅助 ==========

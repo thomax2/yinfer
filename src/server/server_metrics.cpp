@@ -38,8 +38,8 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     real_batch_prefill_chunks_total_ += metrics.real_batch_prefill_chunks;
     paged_attention_calls_ += metrics.paged_attention_calls;
     paged_attention_fallbacks_ += metrics.paged_attention_fallbacks;
-    if (metrics.continuous_batching_enabled) {
-        continuous_batching_enabled_ = true;
+    if (metrics.scheduler_enabled) {
+        scheduler_enabled_ = true;
     }
     decode_batch_steps_total_ += metrics.decode_batch_steps;
     decode_batch_size_sum_ += metrics.decode_batch_size_sum;
@@ -47,9 +47,21 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
         decode_batch_size_max_ = metrics.decode_batch_size_max;
     }
     prefill_chunk_steps_total_ += metrics.prefill_chunk_steps;
-    scheduler_v2_decode_steps_total_ += metrics.scheduler_v2_decode_steps;
-    scheduler_v2_prefill_steps_total_ += metrics.scheduler_v2_prefill_steps;
-    active_decode_batch_size_ = metrics.active_decode_batch_size_at_finish;
+    scheduler_decode_steps_total_ += metrics.scheduler_decode_steps;
+    scheduler_prefill_steps_total_ += metrics.scheduler_prefill_steps;
+    decode_queue_size_ = metrics.decode_queue_size_at_finish;
+    if (metrics.mixed_batch_enabled) mixed_batch_enabled_ = true;
+    mixed_batch_steps_total_ += metrics.mixed_batch_steps;
+    mixed_batch_total_rows_sum_ += metrics.mixed_batch_total_rows_sum;
+    if (metrics.mixed_batch_total_rows_max > mixed_batch_total_rows_max_) {
+        mixed_batch_total_rows_max_ = metrics.mixed_batch_total_rows_max;
+    }
+    mixed_batch_decode_rows_total_ += metrics.mixed_batch_decode_rows;
+    mixed_batch_prefill_rows_total_ += metrics.mixed_batch_prefill_rows;
+    mixed_batch_attention_segments_total_ += metrics.mixed_batch_attention_segments;
+    mixed_batch_lm_head_rows_total_ += metrics.mixed_batch_lm_head_rows;
+    mixed_batch_fallbacks_total_ += metrics.mixed_batch_fallbacks;
+    mixed_batch_model_ms_total_ += metrics.mixed_batch_model_ms;
     if (metrics.selective_decode_enabled) {
         selective_decode_enabled_ = true;
     }
@@ -77,17 +89,6 @@ void ServerMetrics::request_finished(const RequestMetrics& metrics) {
     selective_decode_hotpath_allocations_ += metrics.selective_decode_hotpath_allocations;
     selective_decode_workspace_reallocations_ +=
         metrics.selective_decode_workspace_reallocations;
-    if (metrics.prefill_batching_enabled) {
-        prefill_batching_enabled_ = true;
-    }
-    prefill_microbatch_steps_total_ += metrics.prefill_microbatch_steps;
-    prefill_microbatch_size_sum_ += metrics.prefill_microbatch_size_sum;
-    if (metrics.prefill_microbatch_size_max > prefill_microbatch_size_max_) {
-        prefill_microbatch_size_max_ = metrics.prefill_microbatch_size_max;
-    }
-    prefill_full_chunk_steps_total_ += metrics.prefill_full_chunk_steps;
-    prefill_tail_chunk_steps_total_ += metrics.prefill_tail_chunk_steps;
-    prefill_microbatch_tokens_total_ += metrics.prefill_microbatch_tokens_total;
     if (metrics.tokens_per_second > 0.0) {
         tokens_per_second_sum_ += metrics.tokens_per_second;
     }
@@ -150,13 +151,13 @@ std::string ServerMetrics::to_json() const {
         ? static_cast<double>(decode_batch_size_sum_) /
               static_cast<double>(decode_batch_steps_total_)
         : 0.0;
-    double avg_prefill_microbatch = prefill_microbatch_steps_total_ > 0
-        ? static_cast<double>(prefill_microbatch_size_sum_) /
-              static_cast<double>(prefill_microbatch_steps_total_)
-        : 0.0;
     double avg_selective_decode_batch = selective_decode_steps_total_ > 0
         ? static_cast<double>(selective_decode_size_sum_) /
               static_cast<double>(selective_decode_steps_total_)
+        : 0.0;
+    double avg_mixed_batch_rows = mixed_batch_steps_total_ > 0
+        ? static_cast<double>(mixed_batch_total_rows_sum_) /
+              static_cast<double>(mixed_batch_steps_total_)
         : 0.0;
     std::ostringstream os;
     os << '{'
@@ -175,15 +176,27 @@ std::string ServerMetrics::to_json() const {
        << ",\"real_batch_prefill_chunks_total\":" << real_batch_prefill_chunks_total_
        << ",\"paged_attention_calls\":" << paged_attention_calls_
        << ",\"paged_attention_fallbacks\":" << paged_attention_fallbacks_
-       << ",\"continuous_batching_enabled\":" << (continuous_batching_enabled_ ? "true" : "false")
+       << ",\"scheduler_enabled\":" << (scheduler_enabled_ ? "true" : "false")
        << ",\"decode_batch_steps_total\":" << decode_batch_steps_total_
        << ",\"decode_batch_size_sum\":" << decode_batch_size_sum_
        << ",\"decode_batch_size_max\":" << decode_batch_size_max_
        << ",\"avg_decode_batch_size\":" << avg_decode_batch
        << ",\"prefill_chunk_steps_total\":" << prefill_chunk_steps_total_
-       << ",\"active_decode_batch_size\":" << active_decode_batch_size_
-       << ",\"scheduler_v2_decode_steps\":" << scheduler_v2_decode_steps_total_
-       << ",\"scheduler_v2_prefill_steps\":" << scheduler_v2_prefill_steps_total_
+       << ",\"decode_queue_size\":" << decode_queue_size_
+       << ",\"scheduler_decode_steps\":" << scheduler_decode_steps_total_
+       << ",\"scheduler_prefill_steps\":" << scheduler_prefill_steps_total_
+       << ",\"mixed_batch_enabled\":" << (mixed_batch_enabled_ ? "true" : "false")
+       << ",\"mixed_batch_steps_total\":" << mixed_batch_steps_total_
+       << ",\"mixed_batch_total_rows_sum\":" << mixed_batch_total_rows_sum_
+       << ",\"mixed_batch_total_rows_max\":" << mixed_batch_total_rows_max_
+       << ",\"avg_mixed_batch_rows\":" << avg_mixed_batch_rows
+       << ",\"mixed_batch_decode_rows_total\":" << mixed_batch_decode_rows_total_
+       << ",\"mixed_batch_prefill_rows_total\":" << mixed_batch_prefill_rows_total_
+       << ",\"mixed_batch_attention_segments_total\":"
+       << mixed_batch_attention_segments_total_
+       << ",\"mixed_batch_lm_head_rows_total\":" << mixed_batch_lm_head_rows_total_
+       << ",\"mixed_batch_fallbacks_total\":" << mixed_batch_fallbacks_total_
+       << ",\"mixed_batch_model_ms_total\":" << mixed_batch_model_ms_total_
        << ",\"selective_decode_enabled\":" << (selective_decode_enabled_ ? "true" : "false")
        << ",\"selective_decode_steps_total\":" << selective_decode_steps_total_
        << ",\"selective_decode_size_sum\":" << selective_decode_size_sum_
@@ -211,14 +224,6 @@ std::string ServerMetrics::to_json() const {
        << selective_decode_hotpath_allocations_
        << ",\"selective_decode_workspace_reallocations\":"
        << selective_decode_workspace_reallocations_
-       << ",\"prefill_batching_enabled\":" << (prefill_batching_enabled_ ? "true" : "false")
-       << ",\"prefill_microbatch_steps_total\":" << prefill_microbatch_steps_total_
-       << ",\"prefill_microbatch_size_sum\":" << prefill_microbatch_size_sum_
-       << ",\"prefill_microbatch_size_max\":" << prefill_microbatch_size_max_
-       << ",\"avg_prefill_microbatch_size\":" << avg_prefill_microbatch
-       << ",\"prefill_full_chunk_steps_total\":" << prefill_full_chunk_steps_total_
-       << ",\"prefill_tail_chunk_steps_total\":" << prefill_tail_chunk_steps_total_
-       << ",\"prefill_microbatch_tokens_total\":" << prefill_microbatch_tokens_total_
        << ",\"avg_tokens_per_second\":" << avg_tps
        << ",\"avg_first_token_ms\":" << avg_first
        << '}';

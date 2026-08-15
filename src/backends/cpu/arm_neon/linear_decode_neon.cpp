@@ -1,5 +1,6 @@
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include "backends/cpu/arm_neon/kernel_common.h"
+#include "backends/cpu/arm_neon/pack.h"
 #include "llm_engine/runtime/thread_pool.h"
 #include <algorithm>
 #include <atomic>
@@ -952,6 +953,185 @@ inline Status gptq_batch_compute_panel(
     return Status::SUCCESS;
 }
 
+inline void gptq_batch_accumulate_packed_rows_8x8(
+    float32x4_t (&group_sum)[GPTQ_BATCH_MAX_ROWS][2],
+    const float32x4_t (&qvalue)[2],
+    float32x4_t activation_lo,
+    float32x4_t activation_hi
+) {
+    // qvalue 是连续 8 个输出通道；activation_lo/hi 是连续 8 行输入。
+    // lane 编号全部为编译期立即数，固定更新 8x8 输出 tile。
+    for (int vec = 0; vec < 2; ++vec) {
+        group_sum[0][vec] = vfmaq_laneq_f32(
+            group_sum[0][vec], qvalue[vec], activation_lo, 0);
+        group_sum[1][vec] = vfmaq_laneq_f32(
+            group_sum[1][vec], qvalue[vec], activation_lo, 1);
+        group_sum[2][vec] = vfmaq_laneq_f32(
+            group_sum[2][vec], qvalue[vec], activation_lo, 2);
+        group_sum[3][vec] = vfmaq_laneq_f32(
+            group_sum[3][vec], qvalue[vec], activation_lo, 3);
+        group_sum[4][vec] = vfmaq_laneq_f32(
+            group_sum[4][vec], qvalue[vec], activation_hi, 0);
+        group_sum[5][vec] = vfmaq_laneq_f32(
+            group_sum[5][vec], qvalue[vec], activation_hi, 1);
+        group_sum[6][vec] = vfmaq_laneq_f32(
+            group_sum[6][vec], qvalue[vec], activation_hi, 2);
+        group_sum[7][vec] = vfmaq_laneq_f32(
+            group_sum[7][vec], qvalue[vec], activation_hi, 3);
+    }
+}
+
+inline void gptq_batch_compute_packed_a_tile_8x8(
+    const fp16_t* packed_x,
+    const GPTQInt8Weight& w,
+    int panel,
+    int channel_offset,
+    float* panel_out
+) {
+    constexpr int Vecs = 2;
+    for (int row = 0; row < GPTQ_BATCH_MAX_ROWS; ++row) {
+        for (int vec = 0; vec < Vecs; ++vec) {
+            vst1q_f32(
+                panel_out + (size_t)row * NR_F16 + channel_offset + vec * 4,
+                vdupq_n_f32(0.0f));
+        }
+    }
+
+    const int K_pad = ((w.K + 7) / 8) * 8;
+    const int8_t* qpack = w.qweight_pack.ptr<int8_t>();
+    const fp16_t* spack = w.scales_pack.ptr<fp16_t>();
+    const int8_t* zpack = w.zeros_pack.data ? w.zeros_pack.ptr<int8_t>() : nullptr;
+
+    for (int group = 0; group < w.num_groups; ++group) {
+        float32x4_t group_sum[GPTQ_BATCH_MAX_ROWS][Vecs];
+        for (int row = 0; row < GPTQ_BATCH_MAX_ROWS; ++row) {
+            for (int vec = 0; vec < Vecs; ++vec) {
+                group_sum[row][vec] = vdupq_n_f32(0.0f);
+            }
+        }
+        float32x4_t xsum_lo = vdupq_n_f32(0.0f);
+        float32x4_t xsum_hi = vdupq_n_f32(0.0f);
+
+        const int k_begin = group * w.group_size;
+        const int k_end = std::min(k_begin + w.group_size, w.K);
+        for (int k_index wo= k_begin; k_index < k_end; ++k_index) {
+            // packed_x 的布局为 [row_tile, K, 8]，一次连续 Load 得到同一 k
+            // 对应的 8 行激活，替代原内核的多次跨行标量读取。
+            float16x8_t activation_f16 = vld1q_f16(packed_x + (size_t)k_index * 8);
+            float32x4_t activation_lo =
+                vcvt_f32_f16(vget_low_f16(activation_f16));
+            float32x4_t activation_hi =
+                vcvt_f32_f16(vget_high_f16(activation_f16));
+            xsum_lo = vaddq_f32(xsum_lo, activation_lo);
+            xsum_hi = vaddq_f32(xsum_hi, activation_hi);
+
+            const int8_t* q_ptr =
+                qpack + ((size_t)panel * K_pad + k_index) * NR_F16 + channel_offset;
+            float32x4_t qvalue[Vecs];
+            int16x8_t q8 = vmovl_s8(vld1_s8(q_ptr));
+            qvalue[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q8)));
+            qvalue[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q8)));
+            gptq_batch_accumulate_packed_rows_8x8(
+                group_sum, qvalue, activation_lo, activation_hi);
+        }
+
+        alignas(16) float xsum[8];
+        vst1q_f32(xsum, xsum_lo);
+        vst1q_f32(xsum + 4, xsum_hi);
+        const fp16_t* scale_ptr =
+            spack + ((size_t)panel * w.num_groups + group) * NR_F16 + channel_offset;
+        const int8_t* zero_ptr = zpack
+            ? zpack + ((size_t)panel * w.num_groups + group) * NR_F16 + channel_offset
+            : nullptr;
+        float32x4_t scale[Vecs];
+        float32x4_t zero[Vecs];
+        float16x8_t s = vld1q_f16(scale_ptr);
+        scale[0] = vcvt_f32_f16(vget_low_f16(s));
+        scale[1] = vcvt_f32_f16(vget_high_f16(s));
+        if (zero_ptr) {
+            int16x8_t z = vmovl_s8(vld1_s8(zero_ptr));
+            zero[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z)));
+            zero[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z)));
+        }
+        if (!zero_ptr) {
+            for (int vec = 0; vec < Vecs; ++vec) zero[vec] = vdupq_n_f32(0.0f);
+        }
+        for (int row = 0; row < GPTQ_BATCH_MAX_ROWS; ++row) {
+            float32x4_t xsum_vector = vdupq_n_f32(xsum[row]);
+            for (int vec = 0; vec < Vecs; ++vec) {
+                float* output =
+                    panel_out + (size_t)row * NR_F16 + channel_offset + vec * 4;
+                float32x4_t corrected =
+                    vmlsq_f32(group_sum[row][vec], zero[vec], xsum_vector);
+                float32x4_t total = vld1q_f32(output);
+                vst1q_f32(output, vfmaq_f32(total, corrected, scale[vec]));
+            }
+        }
+    }
+}
+
+// Packed A 已把不足 8 行的最后一个 tile 补零，因此 Packed 路径只需要
+// 一个固定 8x16 微内核，不再根据实际有效行数生成 1～8 行的动态分支。
+// 8x16 在内部拆成两个 8x8 subpanel，是为了控制 NEON 寄存器压力；
+// 这是固定微内核的实现细节，不是对输入行数再次分块。
+inline void gptq_batch_compute_packed_a_tile_8x16(
+    const fp16_t* packed_x,
+    const GPTQInt8Weight& w,
+    int panel,
+    float* panel_out
+) {
+    gptq_batch_compute_packed_a_tile_8x8(
+        packed_x, w, panel, 0, panel_out);
+    gptq_batch_compute_packed_a_tile_8x8(
+        packed_x, w, panel, 8, panel_out);
+}
+
+Status linear_gptq_int8_batch_packed_a_panel_range_neon(
+    const fp16_t* packed_x,
+    int rows,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    int panel_begin,
+    int panel_end
+) {
+    alignas(64) float panel_out[GPTQ_BATCH_MAX_ROWS * NR_F16];
+    const int mp = (rows + GPTQ_BATCH_MAX_ROWS - 1) / GPTQ_BATCH_MAX_ROWS;
+
+    // Weight-stationary tile 顺序：j 是 16 列的 Packed B panel，i 是
+    // 8 行的 Packed A tile。线程池把互不重叠的 Panel 区间分给 worker；
+    // worker 固定一个权重 Panel 后连续服务全部行 tile，提升权重缓存复用。
+    for (int j = panel_begin; j < panel_end; ++j) {
+        const int col_begin = j * NR_F16;
+        const int actual_n = std::min(NR_F16, w.N - col_begin);
+
+        for (int i = 0; i < mp; ++i) {
+            const int row_begin = i * GPTQ_BATCH_MAX_ROWS;
+            const int actual_m =
+                std::min(GPTQ_BATCH_MAX_ROWS, rows - row_begin);
+            const fp16_t* packed_tile =
+                packed_x + (size_t)i * w.K * GPTQ_BATCH_MAX_ROWS;
+
+            // 即使最后一个 row tile 只有 actual_m<8 个有效行，也完整计算
+            // padding 后的 8x16 tile；边界只在写回 C 时处理。
+            gptq_batch_compute_packed_a_tile_8x16(
+                packed_tile, w, j, panel_out);
+
+            for (int row = 0; row < actual_m; ++row) {
+                fp16_t* row_y =
+                    y + (size_t)(row_begin + row) * w.N + col_begin;
+                const float* row_panel = panel_out + (size_t)row * NR_F16;
+                for (int lane = 0; lane < actual_n; ++lane) {
+                    float value = row_panel[lane] +
+                        (bias ? (float)bias[col_begin + lane] : 0.0f);
+                    row_y[lane] = (fp16_t)value;
+                }
+            }
+        }
+    }
+    return Status::SUCCESS;
+}
+
 Status linear_gptq_int8_batch_panel_range_neon(
     const fp16_t* x,
     int rows,
@@ -1034,7 +1214,74 @@ void record_batch_shape(int rows, int np, int grain, int K) {
         (uint64_t)np * (uint64_t)K * 4u, std::memory_order_relaxed);
 }
 
+void record_packed_a_batch_shape(int rows, int np, int grain, int K) {
+    g_batch_kernel_calls.fetch_add(1, std::memory_order_relaxed);
+    g_batch_rows_total.fetch_add((uint64_t)rows, std::memory_order_relaxed);
+    g_batch_output_panel_tasks.fetch_add(
+        (uint64_t)((np + grain - 1) / grain), std::memory_order_relaxed);
+
+    // Packed 路径固定每个 8-row tile 执行两个 8-column subpanel，
+    // 包括最后由 Pack A 补零的 tile；统计必须反映真实固定计算量。
+    const uint64_t mp =
+        (uint64_t)((rows + GPTQ_BATCH_MAX_ROWS - 1) / GPTQ_BATCH_MAX_ROWS);
+    const uint64_t subpanels = mp * 2u;
+    g_batch_weight_vector_loads.fetch_add(
+        (uint64_t)np * (uint64_t)K * subpanels, std::memory_order_relaxed);
+    g_batch_dequant_vector_ops.fetch_add(
+        (uint64_t)np * (uint64_t)K * 4u, std::memory_order_relaxed);
+}
+
 } // namespace
+
+Status pack_gptq_batch_a_f16_neon(
+    const fp16_t* x,
+    int rows,
+    int K,
+    fp16_t* packed_x
+) {
+    if (!x || !packed_x || rows <= 0 || K <= 0) {
+        return Status::INVALID_ARGUMENT;
+    }
+    // 复用已有 8-row FP16 Pack A 布局：[ceil(rows/8), K, 8]。
+    // 最后一个不足 8 行的 tile 自动补零，因此微内核仍能安全执行整向量 Load。
+    pack_A_f16(x, packed_x, rows, K, K);
+    return Status::SUCCESS;
+}
+
+Status linear_gptq_int8_batch_packed_a_neon(
+    const fp16_t* packed_x,
+    int rows,
+    const GPTQInt8Weight& w,
+    fp16_t* y,
+    const fp16_t* bias,
+    void*,
+    size_t
+) {
+    if (!packed_x || !y || rows <= 0 ||
+        !w.qweight_pack.data || !w.scales_pack.data ||
+        w.K <= 0 || w.N <= 0 || w.has_g_idx) {
+        return Status::INVALID_ARGUMENT;
+    }
+
+    const int np = (w.N + NR_F16 - 1) / NR_F16;
+    record_packed_a_batch_shape(rows, np, GPTQ_BATCH_PANEL_GRAIN, w.K);
+    if (g_thread_pool == nullptr || g_thread_pool->num_threads() <= 1) {
+        return linear_gptq_int8_batch_packed_a_panel_range_neon(
+            packed_x, rows, w, y, bias, 0, np);
+    }
+
+    std::atomic<int> err_flag(0);
+    g_thread_pool->parallel_for(
+        0, np, GPTQ_BATCH_PANEL_GRAIN, [&](int panel_begin, int panel_end) {
+            Status status = linear_gptq_int8_batch_packed_a_panel_range_neon(
+                packed_x, rows, w, y, bias, panel_begin, panel_end);
+            if (status != Status::SUCCESS) {
+                err_flag.store(static_cast<int>(status), std::memory_order_relaxed);
+            }
+        });
+    const int error = err_flag.load(std::memory_order_relaxed);
+    return error == 0 ? Status::SUCCESS : static_cast<Status>(error);
+}
 
 Status linear_gptq_int8_batch_neon(
     const fp16_t* x,
@@ -1889,7 +2136,7 @@ size_t linear_gptq_int8_batch_argmax_workspace_bytes(
     int rows,
     const GPTQInt8Weight& w
 ) {
-    if (rows <= 1 || rows > GPTQ_BATCH_MAX_ROWS || w.N <= 0) return 0;
+    if (rows <= 1 || rows > GPTQ_BATCH_ARGMAX_MAX_ROWS || w.N <= 0) return 0;
     int np = (w.N + NR_F16 - 1) / NR_F16;
     int chunks = (np + GPTQ_BATCH_ARGMAX_GRAIN - 1) / GPTQ_BATCH_ARGMAX_GRAIN;
     return (size_t)chunks * rows * sizeof(ArgmaxResult);
@@ -1903,7 +2150,7 @@ Status linear_gptq_int8_decode_argmax_batch_neon(
     void* workspace,
     size_t workspace_bytes
 ) {
-    if (!x || !results || rows <= 0 || rows > GPTQ_BATCH_MAX_ROWS ||
+    if (!x || !results || rows <= 0 || rows > GPTQ_BATCH_ARGMAX_MAX_ROWS ||
         !w.qweight_pack.data || !w.scales_pack.data || w.K <= 0 || w.N <= 0 ||
         w.has_g_idx) {
         return Status::INVALID_ARGUMENT;

@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include "llm_engine/tensor.h"
 #include "backends/cpu/reference/math_ref.h"
-#include "backends/cpu/reference/math_ref.h"
 
 using namespace llm_engine;
 using namespace llm_engine::reference;
@@ -16,9 +15,12 @@ static void init_memory_pool() {
 
 TEST(MatmulTest, Basic2x2) {
     init_memory_pool();
-    Tensor A({2,2});
-    Tensor B({2,2});
-    Tensor C({2,2});
+    Tensor A({2,2}, DataType::FP32);
+    Tensor B({2,2}, DataType::FP32);
+    Tensor C({2,2}, DataType::FP32);
+    A.ensure_allocated();
+    B.ensure_allocated();
+    C.ensure_allocated();
 
     float* a = A.ptr<float>();
     float* b = B.ptr<float>();
@@ -43,9 +45,12 @@ TEST(MatmulTest, Basic2x2) {
 
 TEST(AddTest, BasicAdd) {
     init_memory_pool();     
-    Tensor A({4});
-    Tensor B({4});
-    Tensor C({4});
+    Tensor A({4}, DataType::FP32);
+    Tensor B({4}, DataType::FP32);
+    Tensor C({4}, DataType::FP32);
+    A.ensure_allocated();
+    B.ensure_allocated();
+    C.ensure_allocated();
 
     float* a=A.ptr<float>();
     float* b=B.ptr<float>();

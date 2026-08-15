@@ -24,9 +24,13 @@ TEST(TensorTest, StrideCompute) {
 
 TEST(TensorTest, MemoryAllocate) {
     init_memory_pool();
-    Tensor t({2,2});
+    Tensor t({2,2}, DataType::FP32);
+    EXPECT_EQ(t.data, nullptr);
+
+    t.ensure_allocated();
 
     ASSERT_NE(t.data, nullptr);
+    EXPECT_TRUE(t.owns_data);
 
     float* ptr = t.ptr<float>();
 

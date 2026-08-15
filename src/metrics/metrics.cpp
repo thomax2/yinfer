@@ -128,17 +128,28 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"paged_attention_calls\":" << m.paged_attention_calls
        << ",\"paged_attention_fallbacks\":" << m.paged_attention_fallbacks
        << ",\"paged_attention_compare_warnings\":" << m.paged_attention_compare_warnings
-       << ",\"continuous_batching_enabled\":" << (m.continuous_batching_enabled ? "true" : "false")
+       << ",\"scheduler_enabled\":" << (m.scheduler_enabled ? "true" : "false")
        << ",\"decode_batch_steps\":" << m.decode_batch_steps
        << ",\"decode_batch_size_sum\":" << m.decode_batch_size_sum
        << ",\"decode_batch_size_max\":" << m.decode_batch_size_max
        << ",\"decode_batch_size_avg\":" << m.decode_batch_size_avg
        << ",\"prefill_chunk_steps\":" << m.prefill_chunk_steps
        << ",\"prefill_scheduler_yield_count\":" << m.prefill_scheduler_yield_count
-       << ",\"scheduler_v2_steps\":" << m.scheduler_v2_steps
-       << ",\"scheduler_v2_decode_steps\":" << m.scheduler_v2_decode_steps
-       << ",\"scheduler_v2_prefill_steps\":" << m.scheduler_v2_prefill_steps
-       << ",\"active_decode_batch_size_at_finish\":" << m.active_decode_batch_size_at_finish
+       << ",\"scheduler_steps\":" << m.scheduler_steps
+       << ",\"scheduler_decode_steps\":" << m.scheduler_decode_steps
+       << ",\"scheduler_prefill_steps\":" << m.scheduler_prefill_steps
+       << ",\"decode_queue_size_at_finish\":" << m.decode_queue_size_at_finish
+       << ",\"mixed_batch_enabled\":" << (m.mixed_batch_enabled ? "true" : "false")
+       << ",\"mixed_batch_steps\":" << m.mixed_batch_steps
+       << ",\"mixed_batch_total_rows_sum\":" << m.mixed_batch_total_rows_sum
+       << ",\"mixed_batch_total_rows_max\":" << m.mixed_batch_total_rows_max
+       << ",\"mixed_batch_decode_rows\":" << m.mixed_batch_decode_rows
+       << ",\"mixed_batch_prefill_rows\":" << m.mixed_batch_prefill_rows
+       << ",\"mixed_batch_attention_segments\":" << m.mixed_batch_attention_segments
+       << ",\"mixed_batch_lm_head_rows\":" << m.mixed_batch_lm_head_rows
+       << ",\"mixed_batch_fallbacks\":" << m.mixed_batch_fallbacks
+       << ",\"mixed_batch_model_ms\":" << m.mixed_batch_model_ms
+       << ",\"mixed_batch_mode\":\"" << json_escape(m.mixed_batch_mode) << "\""
        << ",\"selective_decode_enabled\":" << (m.selective_decode_enabled ? "true" : "false")
        << ",\"selective_decode_steps\":" << m.selective_decode_steps
        << ",\"selective_decode_size_sum\":" << m.selective_decode_size_sum
@@ -166,18 +177,6 @@ std::string request_metrics_to_json(const RequestMetrics& m) {
        << ",\"selective_decode_workspace_reallocations\":"
        << m.selective_decode_workspace_reallocations
        << ",\"selective_decode_mode\":\"" << json_escape(m.selective_decode_mode) << "\""
-       << ",\"prefill_batching_enabled\":" << (m.prefill_batching_enabled ? "true" : "false")
-       << ",\"prefill_microbatch_steps\":" << m.prefill_microbatch_steps
-       << ",\"prefill_microbatch_size_sum\":" << m.prefill_microbatch_size_sum
-       << ",\"prefill_microbatch_size_max\":" << m.prefill_microbatch_size_max
-       << ",\"prefill_microbatch_size_avg\":" << m.prefill_microbatch_size_avg
-       << ",\"prefill_full_chunk_steps\":" << m.prefill_full_chunk_steps
-       << ",\"prefill_tail_chunk_steps\":" << m.prefill_tail_chunk_steps
-       << ",\"prefill_tail_wait_steps\":" << m.prefill_tail_wait_steps
-       << ",\"prefill_requeue_count\":" << m.prefill_requeue_count
-       << ",\"prefill_microbatch_items_total\":" << m.prefill_microbatch_items_total
-       << ",\"prefill_microbatch_tokens_total\":" << m.prefill_microbatch_tokens_total
-       << ",\"prefill_microbatch_executor\":\"" << json_escape(m.prefill_microbatch_executor) << "\""
        << ",\"queue_wait_ms\":" << m.queue_wait_ms
        << ",\"prefill_ms\":" << m.prefill_ms
        << ",\"batch_prefill_ms\":" << m.batch_prefill_ms

@@ -3,10 +3,28 @@
 #include "backends/cpu/arm_neon/neon_ops.h"
 #include "backends/cpu/arm_neon/kernel_common.h"
 
+#include <cstring>
+#include <stdexcept>
+
 namespace llm_engine {
 
 using namespace reference;
 using namespace arm_neon;
+
+namespace {
+
+Status copy_for_mutation(Tensor* input, Tensor* output) {
+    if (!input || !output || !input->data || !output->data ||
+        input->dtype != output->dtype || input->shape != output->shape) {
+        return Status::INVALID_ARGUMENT;
+    }
+    if (input->data != output->data) {
+        std::memcpy(output->data, input->data, input->bytes());
+    }
+    return Status::SUCCESS;
+}
+
+} // namespace
 /*                                   定义 node                                          */
 // 类名::函数名(参数列表) : 初始化列表
 MatmulNode::MatmulNode(Tensor* A, Tensor* B, Tensor* C) {
@@ -65,8 +83,11 @@ Status GemvNode::forward() {
 }
 
 GemvNode* ComputationGraph::add_gemv(Tensor* A, Tensor* B_T, Tensor* C) {
-    nodes.push_back(std::make_unique<GemvNode>(A, B_T, C));
-    return static_cast<GemvNode*>(nodes.back().get());
+    Tensor* resolved_a = latest_value(A);
+    Tensor* resolved_b = latest_value(B_T);
+    Tensor* output = prepare_output(C, {resolved_a, resolved_b});
+    return static_cast<GemvNode*>(add_node(
+        std::make_unique<GemvNode>(resolved_a, resolved_b, output)));
 }
 
 AddNode::AddNode(Tensor* A, Tensor* B, Tensor* C) {
@@ -77,7 +98,11 @@ AddNode::AddNode(Tensor* A, Tensor* B, Tensor* C) {
 Status AddNode::forward() {
     // 调用你手写的 NEON add 算子
     if (inputs[0]->dtype == DataType::FP16) {
+#if !defined(__aarch64__) && !defined(__arm__)
+        return Status::INVALID_ARGUMENT;
+#else
         add_f16_neon(*inputs[0], *inputs[1], *outputs[0]);
+#endif
     } else {
         add_neon(*inputs[0], *inputs[1], *outputs[0]);
     }
@@ -93,12 +118,16 @@ RMSNormNode::RMSNormNode(Tensor* X, Tensor* Weight, Tensor* Y, float eps) : eps(
 Status RMSNormNode::forward() {
     int n = inputs[0]->shape.back(); // 获取最后一个维度
     if (inputs[0]->dtype == DataType::FP16) {
+#if !defined(__aarch64__) && !defined(__arm__)
+        return Status::INVALID_ARGUMENT;
+#else
         arm_neon::rmsnorm_f16_neon(
             inputs[0]->ptr<fp16_t>(),
             inputs[1]->ptr<fp16_t>(),
             outputs[0]->ptr<fp16_t>(),
             n, eps
         );
+#endif
     } else {
         arm_neon::rmsnorm_neon(
             inputs[0]->ptr<float>(),
@@ -119,12 +148,16 @@ SwiGLUNode::SwiGLUNode(Tensor* Gate, Tensor* Up, Tensor* Y) {
 Status SwiGLUNode::forward() {
     int n = inputs[0]->size();
     if (inputs[0]->dtype == DataType::FP16) {
+#if !defined(__aarch64__) && !defined(__arm__)
+        return Status::INVALID_ARGUMENT;
+#else
         arm_neon::swiglu_f16_neon(
             inputs[0]->ptr<fp16_t>(),
             inputs[1]->ptr<fp16_t>(),
             outputs[0]->ptr<fp16_t>(),
             n
         );
+#endif
     } else {
         arm_neon::swiglu_neon(
             inputs[0]->ptr<float>(),
@@ -137,23 +170,32 @@ Status SwiGLUNode::forward() {
 }
 
 // --- RoPE ---
-RoPENode::RoPENode(Tensor* X, Tensor* Cos, Tensor* Sin) {
+RoPENode::RoPENode(Tensor* X, Tensor* Cos, Tensor* Sin, Tensor* Y) {
     inputs = {X, Cos, Sin};
-    outputs = {X}; // In-place 修改
+    outputs = {Y};
 }
 
 Status RoPENode::forward() {
-    int n = inputs[0]->shape.back();
-    if (inputs[0]->dtype == DataType::FP16) {
+    Tensor* input = inputs[0];
+    Tensor* output = outputs[0];
+    Status copy_status = copy_for_mutation(input, output);
+    if (copy_status != Status::SUCCESS) return copy_status;
+
+    int n = output->shape.back();
+    if (output->dtype == DataType::FP16) {
+#if !defined(__aarch64__) && !defined(__arm__)
+        return Status::INVALID_ARGUMENT;
+#else
         arm_neon::rope_f16_neon(
-            inputs[0]->ptr<fp16_t>(),
+            output->ptr<fp16_t>(),
             inputs[1]->ptr<fp16_t>(),
             inputs[2]->ptr<fp16_t>(),
             n
         );
+#endif
     } else {
         arm_neon::rope_neon(
-            inputs[0]->ptr<float>(),
+            output->ptr<float>(),
             inputs[1]->ptr<float>(),
             inputs[2]->ptr<float>(),
             n
@@ -162,8 +204,20 @@ Status RoPENode::forward() {
     return Status::SUCCESS;
 }
 
+std::vector<InplaceAliasCandidate> RoPENode::inplace_alias_candidates() const {
+    return {{0, 0}};
+}
+
+CopyBackNode::CopyBackNode(Tensor* source, Tensor* target) : target_(target) {
+    inputs = {source};
+}
+
+Status CopyBackNode::forward() {
+    return copy_for_mutation(inputs[0], target_);
+}
+
 QwenBlockNode::QwenBlockNode(
-    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* hidden_states, Tensor* output_hidden_states, Tensor* norm1_weight,
     Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
     Tensor* w_q_pack, Tensor* w_k_pack, Tensor* w_v_pack, Tensor* w_o_pack,
     Tensor* b_q, Tensor* b_k, Tensor* b_v,
@@ -199,11 +253,11 @@ QwenBlockNode::QwenBlockNode(
     inputs.push_back(w_up_pack);
     inputs.push_back(w_down_pack);
 
-    outputs.push_back(hidden_states);
+    outputs.push_back(output_hidden_states);
 }
 
 QwenBlockNode::QwenBlockNode(
-    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* hidden_states, Tensor* output_hidden_states, Tensor* norm1_weight,
     Tensor* w_q, Tensor* w_k, Tensor* w_v, Tensor* w_o,
     Tensor* b_q, Tensor* b_k, Tensor* b_v,
     Tensor* cos, Tensor* sin,
@@ -231,13 +285,17 @@ QwenBlockNode::QwenBlockNode(
     inputs.push_back(w_up);          // inputs[13]
     inputs.push_back(w_down);        // inputs[14]
 
-    // 因为 QwenBlock 是原地修改 (In-place) 计算，输出同样是 hidden_states
-    outputs.push_back(hidden_states);
+    outputs.push_back(output_hidden_states);
 }
 
 Status QwenBlockNode::forward() {
+    Tensor* input_hidden_states = inputs[0];
+    Tensor* output_hidden_states = outputs[0];
+    Status copy_status = copy_for_mutation(input_hidden_states, output_hidden_states);
+    if (copy_status != Status::SUCCESS) return copy_status;
+
     if (weights) {
-        Tensor* hidden_states = inputs[0];
+        Tensor* hidden_states = output_hidden_states;
         Tensor* norm1_weight = inputs[1];
         Tensor* b_q = inputs[2];
         Tensor* b_k = inputs[3];
@@ -285,7 +343,7 @@ Status QwenBlockNode::forward() {
     }
 
     // 1. 解包 Inputs (顺序与构造函数中 push_back 的顺序一致)
-    Tensor* hidden_states = inputs[0];
+    Tensor* hidden_states = output_hidden_states;
     Tensor* norm1_weight  = inputs[1];
     Tensor* w_q = inputs[2]; Tensor* w_k = inputs[3]; Tensor* w_v = inputs[4]; Tensor* w_o = inputs[5];
     Tensor* w_q_pack = nullptr; Tensor* w_k_pack = nullptr; Tensor* w_v_pack = nullptr; Tensor* w_o_pack = nullptr;
@@ -384,15 +442,21 @@ void QwenBlockNode::set_external_workspace(void* workspace, size_t bytes) {
     external_workspace_bytes = bytes;
 }
 
+std::vector<InplaceAliasCandidate> QwenBlockNode::inplace_alias_candidates() const {
+    return {{0, 0}};
+}
+
 
 /*                                       创建 tensor                                         */
 Tensor* ComputationGraph::create_tensor(
     const std::vector<int>& shape,
     DataType dtype
 ) {
-    // 创建一个 unique_ptr<Tensor> ,所有权属于 tensors, 当ComputationGraph被销毁时，所有的Tensor也会被自动销毁。
+    ensure_building();
     tensors.push_back(std::make_unique<Tensor>(shape, dtype));
-    return tensors.back().get();
+    Tensor* tensor = tensors.back().get();
+    register_tensor(tensor);
+    return tensor;
 }
 
 Tensor* ComputationGraph::create_tensor_from_ptr(
@@ -400,12 +464,117 @@ Tensor* ComputationGraph::create_tensor_from_ptr(
     void* data,
     DataType dtype
 ) {
+    ensure_building();
     auto t = std::make_unique<Tensor>(shape, dtype);
-    // 假设你的 Tensor 类里有 data 和 owns_data 成员
-    t->data = data; 
-    t->owns_data = false; // 极其关键：告诉引擎不要去 free 它！
+    t->data = data;
+    t->owns_data = false;
     tensors.push_back(std::move(t));
-    return tensors.back().get();
+    Tensor* tensor = tensors.back().get();
+    register_tensor(tensor);
+    return tensor;
+}
+
+void ComputationGraph::ensure_building() const {
+    if (mutation_fixups_materialized_) {
+        throw std::runtime_error("cannot mutate a computation graph after it has been compiled");
+    }
+}
+
+void ComputationGraph::register_tensor(Tensor* tensor) {
+    mutation_root_[tensor] = tensor;
+    latest_value_[tensor] = tensor;
+}
+
+Tensor* ComputationGraph::mutation_root(Tensor* tensor) const {
+    auto it = mutation_root_.find(tensor);
+    return it == mutation_root_.end() ? tensor : it->second;
+}
+
+Tensor* ComputationGraph::latest_value(Tensor* tensor) const {
+    if (!tensor) return nullptr;
+    Tensor* root = mutation_root(tensor);
+    auto it = latest_value_.find(root);
+    return it == latest_value_.end() ? tensor : it->second;
+}
+
+Tensor* ComputationGraph::create_mutation_version(Tensor* tensor) {
+    ensure_building();
+    Tensor* current = latest_value(tensor);
+    if (!current) {
+        throw std::invalid_argument("cannot functionalize a null tensor");
+    }
+
+    Tensor* root = mutation_root(tensor);
+    if (latest_value_.find(root) == latest_value_.end()) {
+        mutation_root_[root] = root;
+        latest_value_[root] = root;
+    }
+    if (latest_value_[root] == root) {
+        mutation_roots_in_order_.push_back(root);
+    }
+
+    auto version = std::make_unique<Tensor>(current->shape, current->dtype, current->device);
+    Tensor* output = version.get();
+    tensors.push_back(std::move(version));
+    mutation_root_[output] = root;
+    latest_value_[root] = output;
+    mutation_versions_.insert(output);
+    return output;
+}
+
+bool ComputationGraph::is_mutation_version(Tensor* tensor) const {
+    return mutation_versions_.count(tensor) != 0;
+}
+
+Tensor* ComputationGraph::prepare_output(
+    Tensor* requested,
+    const std::vector<Tensor*>& inputs
+) {
+    if (!requested) {
+        throw std::invalid_argument("graph node output cannot be null");
+    }
+
+    Tensor* current = latest_value(requested);
+    Tensor* requested_root = mutation_root(requested);
+    bool overwrites_live_value = produced_values_.count(current) != 0 || current != requested;
+    for (Tensor* input : inputs) {
+        if (input && mutation_root(input) == requested_root) {
+            overwrites_live_value = true;
+            break;
+        }
+    }
+    return overwrites_live_value ? create_mutation_version(requested) : requested;
+}
+
+void ComputationGraph::register_node_outputs(GraphNode* node) {
+    for (Tensor* output : node->outputs) {
+        if (!output) {
+            throw std::invalid_argument("graph node output cannot be null");
+        }
+        produced_values_.insert(output);
+    }
+}
+
+GraphNode* ComputationGraph::add_node(std::unique_ptr<GraphNode> node) {
+    ensure_building();
+    if (!node) {
+        throw std::invalid_argument("cannot add a null graph node");
+    }
+    GraphNode* result = node.get();
+    register_node_outputs(result);
+    nodes.push_back(std::move(node));
+    return result;
+}
+
+void ComputationGraph::materialize_mutation_fixups() {
+    if (mutation_fixups_materialized_) return;
+    for (Tensor* root : mutation_roots_in_order_) {
+        Tensor* current = latest_value(root);
+        if (current != root && root->data != nullptr) {
+            nodes.push_back(std::make_unique<CopyBackNode>(current, root));
+        }
+    }
+    mutation_fixups_materialized_ = true;
 }
 
 /*                                      添加 node                                          */
@@ -414,10 +583,11 @@ MatmulNode* ComputationGraph::add_matmul(
     Tensor* B,
     Tensor* C
 ) {
-    nodes.push_back(std::make_unique<MatmulNode>(A, B, C));
-
-    // static_cast 把通用的基类指针，变回具体的子类指针。
-    return static_cast<MatmulNode*>(nodes.back().get());
+    Tensor* resolved_a = latest_value(A);
+    Tensor* resolved_b = latest_value(B);
+    Tensor* output = prepare_output(C, {resolved_a, resolved_b});
+    return static_cast<MatmulNode*>(add_node(
+        std::make_unique<MatmulNode>(resolved_a, resolved_b, output)));
 }
 
 AddNode* ComputationGraph::add_add(
@@ -425,8 +595,11 @@ AddNode* ComputationGraph::add_add(
     Tensor* B,
     Tensor* C
 ) {
-    nodes.push_back(std::make_unique<AddNode>(A, B, C));
-    return static_cast<AddNode*>(nodes.back().get());
+    Tensor* resolved_a = latest_value(A);
+    Tensor* resolved_b = latest_value(B);
+    Tensor* output = prepare_output(C, {resolved_a, resolved_b});
+    return static_cast<AddNode*>(add_node(
+        std::make_unique<AddNode>(resolved_a, resolved_b, output)));
 }
 
 RMSNormNode* ComputationGraph::add_rmsnorm(
@@ -435,28 +608,36 @@ RMSNormNode* ComputationGraph::add_rmsnorm(
     Tensor* Y, 
     float eps
 ) {
-    nodes.push_back(std::make_unique<RMSNormNode>(X, Weight, Y, eps));
-    return static_cast<RMSNormNode*>(nodes.back().get());
+    Tensor* resolved_x = latest_value(X);
+    Tensor* resolved_weight = latest_value(Weight);
+    Tensor* output = prepare_output(Y, {resolved_x, resolved_weight});
+    return static_cast<RMSNormNode*>(add_node(
+        std::make_unique<RMSNormNode>(resolved_x, resolved_weight, output, eps)));
 }
 
 SwiGLUNode* ComputationGraph::add_swiglu(Tensor* Gate,
     Tensor* Up, 
     Tensor* Y
 ) {
-    nodes.push_back(std::make_unique<SwiGLUNode>(Gate, Up, Y));
-    return static_cast<SwiGLUNode*>(nodes.back().get());
+    Tensor* resolved_gate = latest_value(Gate);
+    Tensor* resolved_up = latest_value(Up);
+    Tensor* output = prepare_output(Y, {resolved_gate, resolved_up});
+    return static_cast<SwiGLUNode*>(add_node(
+        std::make_unique<SwiGLUNode>(resolved_gate, resolved_up, output)));
 }
 
-RoPENode* ComputationGraph::add_rope(Tensor* X, 
+RoPENode* ComputationGraph::add_rope(Tensor* X,
     Tensor* Cos,
     Tensor* Sin
 ) {
-    nodes.push_back(std::make_unique<RoPENode>(X, Cos, Sin));
-    return static_cast<RoPENode*>(nodes.back().get());
+    Tensor* input = latest_value(X);
+    Tensor* output = create_mutation_version(X);
+    return static_cast<RoPENode*>(add_node(std::make_unique<RoPENode>(
+        input, latest_value(Cos), latest_value(Sin), output)));
 }
 
 QwenBlockNode::QwenBlockNode(
-    Tensor* hidden_states, Tensor* norm1_weight,
+    Tensor* hidden_states, Tensor* output_hidden_states, Tensor* norm1_weight,
     Tensor* b_q, Tensor* b_k, Tensor* b_v,
     Tensor* cos, Tensor* sin,
     Tensor* norm2_weight,
@@ -467,7 +648,7 @@ QwenBlockNode::QwenBlockNode(
       rms_norm_eps(eps), layer_id(l_id), current_pos_ptr(pos_ptr), kv_cache(cache)
 {
     inputs = {hidden_states, norm1_weight, b_q, b_k, b_v, cos, sin, norm2_weight};
-    outputs = {hidden_states};
+    outputs = {output_hidden_states};
 }
 
 QwenBlockNode* ComputationGraph::add_qwen_block(
@@ -479,15 +660,16 @@ QwenBlockNode* ComputationGraph::add_qwen_block(
     KVCache* cache, int l_id, int* pos_ptr,
     arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
 ) {
-    nodes.push_back(std::make_unique<QwenBlockNode>(
-        hidden_states, norm1_weight,
-        b_q, b_k, b_v,
-        cos, sin,
-        norm2_weight,
+    Tensor* input = latest_value(hidden_states);
+    Tensor* output = create_mutation_version(hidden_states);
+    return static_cast<QwenBlockNode*>(add_node(std::make_unique<QwenBlockNode>(
+        input, output, latest_value(norm1_weight),
+        latest_value(b_q), latest_value(b_k), latest_value(b_v),
+        latest_value(cos), latest_value(sin),
+        latest_value(norm2_weight),
         weights,
         cache, l_id, pos_ptr, a_conf, f_conf, eps
-    ));
-    return static_cast<QwenBlockNode*>(nodes.back().get());
+    )));
 }
 
 
@@ -503,18 +685,18 @@ QwenBlockNode* ComputationGraph::add_qwen_block(
     KVCache* cache, int l_id, int* pos_ptr,
     arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
 ) {
-    nodes.push_back(std::make_unique<QwenBlockNode>(
-        hidden_states, norm1_weight,
-        w_q, w_k, w_v, w_o,
-        w_q_pack, w_k_pack, w_v_pack, w_o_pack,
-        b_q, b_k, b_v,
-        cos, sin, norm2_weight,
-        w_gate, w_up, w_down,
-        w_gate_pack, w_up_pack, w_down_pack,
+    Tensor* input = latest_value(hidden_states);
+    Tensor* output = create_mutation_version(hidden_states);
+    return static_cast<QwenBlockNode*>(add_node(std::make_unique<QwenBlockNode>(
+        input, output, latest_value(norm1_weight),
+        latest_value(w_q), latest_value(w_k), latest_value(w_v), latest_value(w_o),
+        latest_value(w_q_pack), latest_value(w_k_pack), latest_value(w_v_pack), latest_value(w_o_pack),
+        latest_value(b_q), latest_value(b_k), latest_value(b_v),
+        latest_value(cos), latest_value(sin), latest_value(norm2_weight),
+        latest_value(w_gate), latest_value(w_up), latest_value(w_down),
+        latest_value(w_gate_pack), latest_value(w_up_pack), latest_value(w_down_pack),
         cache, l_id, pos_ptr, a_conf, f_conf, eps
-    ));
-
-    return static_cast<QwenBlockNode*>(nodes.back().get());
+    )));
 }
 
 QwenBlockNode* ComputationGraph::add_qwen_block(
@@ -527,15 +709,16 @@ QwenBlockNode* ComputationGraph::add_qwen_block(
     KVCache* cache, int l_id, int* pos_ptr,
     arm_neon::AttentionConfig a_conf, arm_neon::FFNConfig f_conf, float eps
 ) {
-    nodes.push_back(std::make_unique<QwenBlockNode>(
-        hidden_states, norm1_weight,
-        w_q, w_k, w_v, w_o, b_q, b_k, b_v,
-        cos, sin, norm2_weight, w_gate, w_up, w_down,
+    Tensor* input = latest_value(hidden_states);
+    Tensor* output = create_mutation_version(hidden_states);
+    return static_cast<QwenBlockNode*>(add_node(std::make_unique<QwenBlockNode>(
+        input, output, latest_value(norm1_weight),
+        latest_value(w_q), latest_value(w_k), latest_value(w_v), latest_value(w_o),
+        latest_value(b_q), latest_value(b_k), latest_value(b_v),
+        latest_value(cos), latest_value(sin), latest_value(norm2_weight),
+        latest_value(w_gate), latest_value(w_up), latest_value(w_down),
         cache, l_id, pos_ptr, a_conf, f_conf, eps
-    ));
-
-    // 完美对齐你的架构：把通用的基类指针变回具体的子类指针并返回
-    return static_cast<QwenBlockNode*>(nodes.back().get());
+    )));
 }
 
 }

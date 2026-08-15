@@ -369,8 +369,8 @@ bool HttpSseServer::handle_health(int fd) {
        << ",\"model_loaded\":true"
        << ",\"service_running\":" << (service_.is_running() ? "true" : "false")
        << ",\"scheduler_enabled\":true"
-       << ",\"paged_kv\":" << (env_flag("LLM_PAGED_KV") ? "true" : "false")
-       << ",\"session_cache\":" << (env_flag("LLM_ENABLE_SESSION_CACHE") ? "true" : "false")
+       << ",\"paged_kv\":true"
+       << ",\"session_cache\":true"
        << ",\"prefix_cache\":" << (env_flag("LLM_ENABLE_PREFIX_CACHE") ? "true" : "false")
        << ",\"http_server\":true"
        << ",\"uptime_sec\":" << uptime

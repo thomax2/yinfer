@@ -48,9 +48,7 @@ REQUEST_FIELDS = [
     "jsonl_first_token_ms", "jsonl_total_ms", "jsonl_tokens_per_second",
     "jsonl_paged_attention_calls", "jsonl_paged_attention_fallbacks",
     "jsonl_decode_batch_size_avg", "jsonl_decode_batch_size_max",
-    "jsonl_prefill_microbatch_size_avg",
-    "jsonl_prefill_microbatch_size_max",
-    "jsonl_prefill_microbatch_executor", "jsonl_final_status",
+    "jsonl_final_status",
     "jsonl_selective_decode_enabled", "jsonl_selective_decode_steps",
     "jsonl_selective_decode_size_avg", "jsonl_selective_decode_size_max",
     "jsonl_selective_decode_linear_batch_rows",
@@ -86,8 +84,6 @@ SUMMARY_FIELDS = [
     "prefix_cached_tokens_total", "prefix_cached_blocks_total",
     "paged_attention_calls", "paged_attention_fallbacks",
     "decode_batch_size_max", "avg_decode_batch_size",
-    "prefill_batching_enabled", "prefill_microbatch_size_max",
-    "avg_prefill_microbatch_size", "prefill_microbatch_tokens_total",
     "selective_decode_enabled", "selective_decode_size_max",
     "avg_selective_decode_size", "selective_decode_steps_total",
     "selective_decode_linear_batch_rows_total",
@@ -533,74 +529,20 @@ class BenchmarkRunner:
 
     def mode_env(self, mode, port, metrics_path):
         env = self.common_env(port, metrics_path)
-        if mode in (
-            "paged_session",
-            "paged_attention",
-            "prefix_cache",
-            "continuous_batching",
-            "prefill_batching",
-            "selective_decode_off",
-            "selective_decode_on",
-            "selective_decode",
-            "full_stack",
-        ):
-            env.update({"LLM_PAGED_KV": "1", "LLM_ENABLE_SESSION_CACHE": "1"})
-        if mode in (
-            "paged_attention",
-            "prefix_cache",
-            "continuous_batching",
-            "prefill_batching",
-            "selective_decode_off",
-            "selective_decode_on",
-            "selective_decode",
-            "full_stack",
-        ):
-            env["LLM_ENABLE_PAGED_ATTENTION"] = "1"
-        if mode in ("prefix_cache", "full_stack"):
+        if mode == "prefix_cache":
             env.update({
                 "LLM_ENABLE_PREFIX_CACHE": "1",
                 "LLM_OPENAI_STATELESS": "1",
                 "LLM_HTTP_PREFIX_CACHE_FRIENDLY": "1",
             })
-        if mode in (
-            "continuous_batching",
-            "prefill_batching",
-            "selective_decode_off",
-            "selective_decode_on",
-            "selective_decode",
-            "full_stack",
-        ):
-            env.update({
-                "LLM_ENABLE_CONTINUOUS_BATCHING": "1",
-                "LLM_CONT_BATCH_MAX_ACTIVE_DECODE": "8",
-                "LLM_CONT_BATCH_DECODE_FIRST": "1",
-                "LLM_CONT_BATCH_PREFILL_WHEN_DECODE_EMPTY": "1",
-                "LLM_CONT_BATCH_PREFILL_AFTER_DECODE": "0",
-            })
-        if mode == "selective_decode_off":
-            env["LLM_ENABLE_SELECTIVE_BATCH_DECODE"] = "0"
-        if mode in ("selective_decode_on", "selective_decode", "full_stack"):
-            env.update({
-                "LLM_ENABLE_SELECTIVE_BATCH_DECODE": "1",
-                "LLM_SELECTIVE_DECODE_MAX_BATCH": str(max(1, self.args.selective_decode_max_batch)),
-                "LLM_SELECTIVE_DECODE_MIN_BATCH": str(max(1, self.args.selective_decode_min_batch)),
-                "LLM_SELECTIVE_DECODE_GREEDY_ONLY": "1",
-                "LLM_SELECTIVE_DECODE_ALLOW_SAMPLING": "0",
-                "LLM_SELECTIVE_DECODE_FALLBACK": "1",
-                "LLM_SELECTIVE_DECODE_COMPARE": "0",
-            })
-        if mode in ("prefill_batching", "full_stack"):
-            env.update({
-                "LLM_ENABLE_PREFILL_BATCHING": "1",
-                "LLM_PREFILL_MICROBATCH_MAX_REQUESTS": "4",
-                "LLM_PREFILL_MICROBATCH_CHUNK_SIZE": "8",
-                "LLM_PREFILL_MICROBATCH_EXECUTOR": "conservative",
-                "LLM_PREFILL_MICROBATCH_AFTER_DECODE": "0",
-            })
+        env.update({
+            "LLM_PREFILL_CHUNK_SIZE": "8",
+            "LLM_SELECTIVE_DECODE_MAX_BATCH": str(max(1, self.args.selective_decode_max_batch)),
+            "LLM_SELECTIVE_DECODE_MIN_BATCH": str(max(1, self.args.selective_decode_min_batch)),
+        })
         if self.args.engine_debug:
             env.update({
-                "LLM_CONT_BATCH_DEBUG": "1",
-                "LLM_PREFILL_BATCH_DEBUG": "1",
+                "LLM_DEBUG_SCHEDULER": "1",
                 "LLM_DEBUG_PREFIX_CACHE": "1",
                 "LLM_DEBUG_PAGED_ATTENTION": "1",
                 "LLM_SELECTIVE_DECODE_DEBUG": "1",
@@ -867,9 +809,6 @@ class BenchmarkRunner:
                 "jsonl_paged_attention_fallbacks": item.get("paged_attention_fallbacks", ""),
                 "jsonl_decode_batch_size_avg": item.get("decode_batch_size_avg", ""),
                 "jsonl_decode_batch_size_max": item.get("decode_batch_size_max", ""),
-                "jsonl_prefill_microbatch_size_avg": item.get("prefill_microbatch_size_avg", ""),
-                "jsonl_prefill_microbatch_size_max": item.get("prefill_microbatch_size_max", ""),
-                "jsonl_prefill_microbatch_executor": item.get("prefill_microbatch_executor", ""),
                 "jsonl_selective_decode_enabled": item.get("selective_decode_enabled", ""),
                 "jsonl_selective_decode_steps": item.get("selective_decode_steps", ""),
                 "jsonl_selective_decode_size_avg": item.get("selective_decode_size_avg", ""),
@@ -997,10 +936,6 @@ class BenchmarkRunner:
             "paged_attention_fallbacks": server_metrics.get("paged_attention_fallbacks", 0),
             "decode_batch_size_max": server_metrics.get("decode_batch_size_max", 0),
             "avg_decode_batch_size": server_metrics.get("avg_decode_batch_size", 0),
-            "prefill_batching_enabled": server_metrics.get("prefill_batching_enabled", False),
-            "prefill_microbatch_size_max": server_metrics.get("prefill_microbatch_size_max", 0),
-            "avg_prefill_microbatch_size": server_metrics.get("avg_prefill_microbatch_size", 0),
-            "prefill_microbatch_tokens_total": server_metrics.get("prefill_microbatch_tokens_total", 0),
             "selective_decode_enabled": server_metrics.get("selective_decode_enabled", False),
             "selective_decode_size_max": server_metrics.get("selective_decode_size_max", 0),
             "avg_selective_decode_size": server_metrics.get("avg_selective_decode_size", 0),
@@ -1082,7 +1017,7 @@ class BenchmarkRunner:
         selective_fallbacks = to_int(summary.get("selective_decode_fallbacks_total"), 0)
         selective_steps = to_int(summary.get("selective_decode_steps_total"), 0)
 
-        if summary.get("scenario") == "selective_decode_on":
+        if summary.get("scenario") == "selective_decode":
             if concurrency >= 2 and not selective_enabled:
                 valid = False
                 warnings.append("selective_decode_enabled=false")
@@ -1132,16 +1067,6 @@ class BenchmarkRunner:
                 warnings.append(
                     f"selective_decode_fallbacks_high={selective_fallbacks}/{selective_steps}"
                 )
-        elif summary.get("scenario") == "selective_decode_off":
-            if selective_enabled:
-                valid = False
-                warnings.append("selective_decode_enabled=true_in_off_mode")
-            if selective_size_max not in (0, 0.0):
-                valid = False
-                warnings.append(f"selective_decode_size_max={selective_size_max}_in_off_mode")
-            if concurrency >= 2 and decode_batch_size_max < 2:
-                valid = False
-                warnings.append(f"decode_batch_size_max={decode_batch_size_max}<2")
 
         if records and all(r.get("match_method") == "none" for r in records):
             warnings.append("jsonl_metrics_not_matched")
@@ -1214,33 +1139,13 @@ class BenchmarkRunner:
                     for i in range(conc)
                 ]
                 self.run_server_scenario(
-                    "continuous-batching", "v2_off", "paged_attention", rep, conc, reqs, True
-                )
-                self.run_server_scenario(
-                    "continuous-batching", "v2_on", "continuous_batching", rep, conc, reqs, True
-                )
-
-    def run_prefill_batching(self):
-        for rep in range(self.args.repeats):
-            for conc in self.args.concurrency_values:
-                reqs = [
-                    self.request_for_topic(TOPICS[i % len(TOPICS)], "long", 64)
-                    for i in range(conc)
-                ]
-                self.run_server_scenario(
-                    "prefill-batching", "prefill_batch_off",
-                    "continuous_batching", rep, conc, reqs, True
-                )
-                self.run_server_scenario(
-                    "prefill-batching", "prefill_batch_on",
-                    "prefill_batching", rep, conc, reqs, True
+                    "continuous-batching", "scheduler", "scheduler", rep, conc, reqs, True
                 )
 
     def run_selective_decode(self):
         self.expected_scenarios = (
             len(self.args.concurrency_values) *
-            max(0, int(self.args.repeats)) *
-            2
+            max(0, int(self.args.repeats))
         )
         self.progress(
             "selective-decode plan",
@@ -1260,12 +1165,8 @@ class BenchmarkRunner:
                     for i in range(conc)
                 ]
                 self.run_server_scenario(
-                    "selective-decode", "selective_decode_off",
-                    "selective_decode_off", rep, conc, reqs, True
-                )
-                self.run_server_scenario(
-                    "selective-decode", "selective_decode_on",
-                    "selective_decode_on", rep, conc, reqs, True
+                    "selective-decode", "selective_decode",
+                    "scheduler", rep, conc, reqs, True
                 )
             self.progress(f"selective-decode repeat {rep + 1}/{self.args.repeats} done")
 
@@ -1277,23 +1178,14 @@ class BenchmarkRunner:
                 req = self.request_for_topic("鲁迅", "long", 64)
                 self.args.prompt_repeat = old
                 self.run_server_scenario(
-                    "paged-attention", f"paged_attention_off_ctx{context_repeat}",
-                    "paged_session", rep, 1, [req], True
-                )
-                self.run_server_scenario(
-                    "paged-attention", f"paged_attention_on_ctx{context_repeat}",
-                    "paged_attention", rep, 1, [req], True
+                    "paged-attention", f"paged_attention_ctx{context_repeat}",
+                    "scheduler", rep, 1, [req], True
                 )
 
     def run_full(self):
         modes = [
-            ("service_baseline", "baseline_service"),
-            ("paged_session", "paged_session"),
-            ("paged_attention", "paged_attention"),
+            ("scheduler", "scheduler"),
             ("prefix_cache", "prefix_cache"),
-            ("continuous_batching", "continuous_batching"),
-            ("selective_decode", "selective_decode"),
-            ("full_stack", "full_stack"),
         ]
         conc = self.args.concurrency_values[0] if self.args.concurrency_values else 4
         reqs = []
@@ -1316,7 +1208,7 @@ class BenchmarkRunner:
         if self.args.suite == "all":
             suites = [
                 "smoke", "prefix-cache", "continuous-batching",
-                "prefill-batching", "selective-decode", "paged-attention", "full",
+                "selective-decode", "paged-attention", "full",
             ]
         for suite in suites:
             if suite == "smoke":
@@ -1325,8 +1217,6 @@ class BenchmarkRunner:
                 self.run_prefix_cache()
             elif suite == "continuous-batching":
                 self.run_continuous_batching()
-            elif suite == "prefill-batching":
-                self.run_prefill_batching()
             elif suite == "selective-decode":
                 self.run_selective_decode()
             elif suite == "paged-attention":
@@ -1376,7 +1266,7 @@ class BenchmarkRunner:
             "suite", "scenario", "mode", "repeat", "concurrency",
             "success_count", "fail_count", "p95_client_ttft_ms",
             "aggregate_output_tok_s", "decode_batch_size_max",
-            "selective_decode_size_max", "prefill_microbatch_size_max",
+            "selective_decode_size_max",
             "paged_attention_fallbacks",
         ]
         lines.append("| " + " | ".join(cols) + " |")
@@ -1401,7 +1291,7 @@ class BenchmarkRunner:
         lines.append("## Notes")
         lines.append("- Python client timing includes HTTP, socket, JSON parsing and SSE parsing overhead.")
         lines.append("- stream=false has no real client-side TTFT; the script leaves TTFT empty for it.")
-        lines.append("- Prefill batching currently validates scheduler-level conservative executor behavior, not operator-level batch prefill speedup.")
+        lines.append("- CPU Prefill is chunked per request; cross-request Prefill microbatching is intentionally not implemented.")
         lines.append("- Client records and JSONL request metrics are matched by completion order as a best effort.")
         lines.append("")
         lines.append("## Recommended Commands")
@@ -1418,21 +1308,11 @@ class BenchmarkRunner:
                 lines.append(f"- Prefix cache: warm requests cached {hit} tokens in `{best['metrics_jsonl_path']}`.")
             else:
                 lines.append(f"- Prefix cache: no cached tokens observed; inspect `{best['metrics_jsonl_path']}` and `{best['raw_log_path']}`.")
-        cont = [s for s in self.summaries if s["scenario"] == "v2_on"]
+        cont = [s for s in self.summaries if s["scenario"] == "scheduler"]
         if cont:
             best = max(cont, key=lambda x: int(x.get("decode_batch_size_max") or 0))
             lines.append(f"- Continuous batching: max decode batch size observed = {best.get('decode_batch_size_max', 0)}.")
-        prefill = [s for s in self.summaries if s["scenario"] == "prefill_batch_on"]
-        if prefill:
-            best = max(prefill, key=lambda x: int(x.get("prefill_microbatch_size_max") or 0))
-            lines.append(
-                "- Prefill batching: "
-                f"max microbatch size = {best.get('prefill_microbatch_size_max', 0)}, "
-                f"avg = {fmt(best.get('avg_prefill_microbatch_size'))}, "
-                f"tokens = {best.get('prefill_microbatch_tokens_total', 0)}; "
-                "executor=conservative."
-            )
-        selective = [s for s in self.summaries if s["scenario"] == "selective_decode_on"]
+        selective = [s for s in self.summaries if s["scenario"] == "selective_decode"]
         if selective:
             best = max(selective, key=lambda x: int(x.get("selective_decode_size_max") or 0))
             lines.append(
@@ -1455,110 +1335,24 @@ class BenchmarkRunner:
         if not rows:
             return []
 
-        lines = []
-        lines.append("## Selective Batch Decode Summary")
-        lines.append("")
-        lines.append("### Experiment Settings")
-        lines.append(f"- threads: `{self.args.threads}`")
-        lines.append(f"- taskset: `{self.args.taskset or ''}`")
-        lines.append(f"- max_new_tokens: `{self.args.max_new_tokens}`")
-        lines.append(f"- concurrency: `{','.join(str(x) for x in self.args.concurrency_values)}`")
-        lines.append(f"- selective_decode_max_batch: `{self.args.selective_decode_max_batch}`")
-        lines.append(f"- selective_decode_min_batch: `{self.args.selective_decode_min_batch}`")
-        lines.append(f"- prompt type: `{self.args.decode_heavy_prompt}`")
-        lines.append("")
-
-        valid = [s for s in rows if s.get("valid_effective_run") is True]
-        invalid = [s for s in rows if s.get("valid_effective_run") is False]
-        lines.append("### Validity")
-        lines.append(f"- valid scenarios: `{len(valid)}`")
-        lines.append(f"- invalid scenarios: `{len(invalid)}`")
-        for row in invalid:
-            lines.append(
-                "- invalid: "
-                f"scenario=`{row.get('scenario')}` "
-                f"repeat=`{row.get('repeat')}` "
-                f"concurrency=`{row.get('concurrency')}` "
-                f"warnings=`{row.get('validity_warnings')}`"
-            )
-        lines.append("")
-
-        lines.append("### On/Off Comparison")
+        lines = ["## Selective Batch Decode Summary", ""]
         cols = [
-            "concurrency", "off_tok_s", "on_tok_s", "speedup_pct",
-            "off_p95_total_ms", "on_p95_total_ms",
+            "concurrency", "aggregate_output_tok_s", "p95_client_total_ms",
             "selective_decode_size_max", "avg_selective_decode_size",
-            "gptq_batch_kernel_calls", "row_gemv_fallbacks",
-            "full_logits_written", "hotpath_allocations",
-            "paged_attention_fallbacks",
+            "gptq_batch_kernel_calls", "paged_attention_fallbacks",
         ]
         lines.append("| " + " | ".join(cols) + " |")
         lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
-
-        by_key = {}
         for row in rows:
-            key = (row.get("repeat"), row.get("concurrency"))
-            by_key.setdefault(key, {})[row.get("scenario")] = row
-        for (_rep, conc), pair in sorted(by_key.items(), key=lambda x: (to_int(x[0][0]), to_int(x[0][1]))):
-            off = pair.get("selective_decode_off")
-            on = pair.get("selective_decode_on")
-            if not off or not on:
-                continue
-            off_tps = to_float(off.get("aggregate_output_tok_s"))
-            on_tps = to_float(on.get("aggregate_output_tok_s"))
-            speedup = None
-            if off_tps and off_tps > 0 and on_tps is not None:
-                speedup = (on_tps / off_tps - 1.0) * 100.0
-            vals = [
-                conc,
-                fmt(off_tps),
-                fmt(on_tps),
-                fmt(speedup),
-                fmt(off.get("p95_client_total_ms")),
-                fmt(on.get("p95_client_total_ms")),
-                fmt(on.get("selective_decode_size_max")),
-                fmt(on.get("avg_selective_decode_size")),
-                fmt(on.get("gptq_batch_kernel_calls")),
-                fmt(on.get("gptq_batch_row_gemv_fallbacks")),
-                fmt(on.get("gptq_batch_full_logits_elements_written")),
-                fmt(on.get("selective_decode_hotpath_allocations")),
-                fmt(on.get("paged_attention_fallbacks")),
-            ]
-            lines.append("| " + " | ".join(str(v) for v in vals) + " |")
+            lines.append("| " + " | ".join(fmt(row.get(c)) for c in cols) + " |")
         lines.append("")
-
-        lines.append("### Interpretation")
-        best_speedup = None
-        best_pair = None
-        for key, pair in by_key.items():
-            if to_int(key[1], 1) < 2:
-                continue
-            off = pair.get("selective_decode_off")
-            on = pair.get("selective_decode_on")
-            if not off or not on:
-                continue
-            off_tps = to_float(off.get("aggregate_output_tok_s"))
-            on_tps = to_float(on.get("aggregate_output_tok_s"))
-            if off_tps and off_tps > 0 and on_tps is not None:
-                speedup = (on_tps / off_tps - 1.0) * 100.0
-                if best_speedup is None or speedup > best_speedup:
-                    best_speedup = speedup
-                    best_pair = (key, speedup)
-        lines.append("- concurrency=1 usually has little or no selective batching benefit.")
-        lines.append("- concurrency>=2 with avg_selective_decode_size>1 is the effective selective batching case.")
-        if best_pair:
-            (_rep, conc), speedup = best_pair
-            if speedup >= 0:
-                lines.append(f"- Best observed selective decode speedup: {fmt(speedup)}% at concurrency={conc}.")
-            else:
-                lines.append(
-                    "- Selective decode was slower in every effective concurrency case; inspect the "
-                    "kernel benchmark before attributing the result to scheduling or attention."
-                )
         lines.append(
-            "- Selective Batch Decode is not batch attention. It batches token-independent operators "
-            "such as QKV/O/FFN/LM Head, while attention remains per-sequence page-aware to avoid "
-            "padding and mask waste from different KV lengths."
+            "- Scheduler mode always enables Selective Decode; batches smaller than two "
+            "or unsupported sampling requests automatically use the single-request fallback."
+        )
+        lines.append(
+            "- Attention remains per sequence because requests have different KV lengths; "
+            "token-independent Linear/FFN/LM Head work is batched."
         )
         return lines
 
@@ -1637,7 +1431,7 @@ def build_arg_parser():
         "--suite",
         default="smoke",
         choices=[
-            "smoke", "prefix-cache", "continuous-batching", "prefill-batching",
+            "smoke", "prefix-cache", "continuous-batching",
             "selective-decode", "paged-attention", "full", "all",
         ],
     )
@@ -1675,8 +1469,6 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     if args.suite == "continuous-batching":
         default_conc = [1, 2, 4, 8]
-    elif args.suite == "prefill-batching":
-        default_conc = [2, 4, 8]
     elif args.suite == "selective-decode":
         default_conc = [2, 4, 8]
     elif args.suite == "full":

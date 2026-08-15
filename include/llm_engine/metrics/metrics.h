@@ -40,17 +40,30 @@ struct RequestMetrics {
     int64_t paged_attention_fallbacks = 0;
     int64_t paged_attention_compare_warnings = 0;
 
-    bool continuous_batching_enabled = false;
+    bool scheduler_enabled = false;
     int decode_batch_steps = 0;
     int decode_batch_size_sum = 0;
     int decode_batch_size_max = 0;
     double decode_batch_size_avg = 0.0;
     int prefill_chunk_steps = 0;
     int prefill_scheduler_yield_count = 0;
-    int scheduler_v2_steps = 0;
-    int scheduler_v2_decode_steps = 0;
-    int scheduler_v2_prefill_steps = 0;
-    int active_decode_batch_size_at_finish = 0;
+    int scheduler_steps = 0;
+    int scheduler_decode_steps = 0;
+    int scheduler_prefill_steps = 0;
+    int decode_queue_size_at_finish = 0;
+
+    // Prefill + Decode 混批指标。total_rows 是本轮统一线性层实际处理的 token 行数。
+    bool mixed_batch_enabled = false;
+    int mixed_batch_steps = 0;
+    int mixed_batch_total_rows_sum = 0;
+    int mixed_batch_total_rows_max = 0;
+    int mixed_batch_decode_rows = 0;
+    int mixed_batch_prefill_rows = 0;
+    int mixed_batch_attention_segments = 0;
+    int mixed_batch_lm_head_rows = 0;
+    int mixed_batch_fallbacks = 0;
+    double mixed_batch_model_ms = 0.0;
+    std::string mixed_batch_mode = "none";
 
     bool selective_decode_enabled = false;
     int selective_decode_steps = 0;
@@ -75,19 +88,6 @@ struct RequestMetrics {
     uint64_t selective_decode_hotpath_allocations = 0;
     uint64_t selective_decode_workspace_reallocations = 0;
     std::string selective_decode_mode = "none";
-
-    bool prefill_batching_enabled = false;
-    int prefill_microbatch_steps = 0;
-    int prefill_microbatch_size_sum = 0;
-    int prefill_microbatch_size_max = 0;
-    double prefill_microbatch_size_avg = 0.0;
-    int prefill_full_chunk_steps = 0;
-    int prefill_tail_chunk_steps = 0;
-    int prefill_tail_wait_steps = 0;
-    int prefill_requeue_count = 0;
-    int prefill_microbatch_items_total = 0;
-    int prefill_microbatch_tokens_total = 0;
-    std::string prefill_microbatch_executor = "none";
 
     double queue_wait_ms = 0.0;
     double prefill_ms = 0.0;

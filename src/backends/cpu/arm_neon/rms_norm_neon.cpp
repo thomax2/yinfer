@@ -59,10 +59,44 @@ void rmsnorm_f16_neon(
     int n,
     float eps
 ) {
+    // Part 1：用 4 组独立的 FP32 累加器计算平方和。
+    // 每轮处理 32 个 FP16 元素，减少循环控制开销，也避免单条累加依赖链
+    // 限制 Cortex-A76 等乱序核心对 FP16->FP32 转换和 FMA 的并行调度。
     float32x4_t sum0 = vdupq_n_f32(0.0f);
     float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
 
     int i = 0;
+    for (; i <= n - 32; i += 32) {
+        // 分组加载并立即转换、累加，避免同时保留 4 个 FP16 向量造成
+        // 不必要的寄存器压力；4 条独立累加链仍可提供足够的指令级并行。
+        float16x8_t hx = vld1q_f16(x + i);
+        float32x4_t lo = vcvt_f32_f16(vget_low_f16(hx));
+        float32x4_t hi = vcvt_f32_f16(vget_high_f16(hx));
+        sum0 = vfmaq_f32(sum0, lo, lo);
+        sum1 = vfmaq_f32(sum1, hi, hi);
+
+        hx = vld1q_f16(x + i + 8);
+        lo = vcvt_f32_f16(vget_low_f16(hx));
+        hi = vcvt_f32_f16(vget_high_f16(hx));
+        sum2 = vfmaq_f32(sum2, lo, lo);
+        sum3 = vfmaq_f32(sum3, hi, hi);
+
+        hx = vld1q_f16(x + i + 16);
+        lo = vcvt_f32_f16(vget_low_f16(hx));
+        hi = vcvt_f32_f16(vget_high_f16(hx));
+        sum0 = vfmaq_f32(sum0, lo, lo);
+        sum1 = vfmaq_f32(sum1, hi, hi);
+
+        hx = vld1q_f16(x + i + 24);
+        lo = vcvt_f32_f16(vget_low_f16(hx));
+        hi = vcvt_f32_f16(vget_high_f16(hx));
+        sum2 = vfmaq_f32(sum2, lo, lo);
+        sum3 = vfmaq_f32(sum3, hi, hi);
+    }
+
+    // 处理不足 32、但仍可由一个 128-bit NEON 向量覆盖的部分。
     for (; i <= n - 8; i += 8) {
         float16x8_t hx = vld1q_f16(x + i);
         float32x4_t lo = vcvt_f32_f16(vget_low_f16(hx));
@@ -71,7 +105,9 @@ void rmsnorm_f16_neon(
         sum1 = vfmaq_f32(sum1, hi, hi);
     }
 
-    float sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+    float32x4_t sum01 = vaddq_f32(sum0, sum1);
+    float32x4_t sum23 = vaddq_f32(sum2, sum3);
+    float sum = vaddvq_f32(vaddq_f32(sum01, sum23));
     for (; i < n; ++i) {
         float v = (float)x[i];
         sum += v * v;
@@ -81,6 +117,33 @@ void rmsnorm_f16_neon(
     float16x8_t hscale = vdupq_n_f16((fp16_t)scale);
 
     i = 0;
+    // Part 2：每轮归一化并写回 32 个 FP16 元素，降低循环控制开销，
+    // 同时给处理器提供更多相互独立的 Load/Multiply/Store 指令。
+    for (; i <= n - 32; i += 32) {
+        float16x8_t hx0 = vld1q_f16(x + i);
+        float16x8_t hw0 = vld1q_f16(weight + i);
+        float16x8_t hx1 = vld1q_f16(x + i + 8);
+        float16x8_t hw1 = vld1q_f16(weight + i + 8);
+        float16x8_t hx2 = vld1q_f16(x + i + 16);
+        float16x8_t hw2 = vld1q_f16(weight + i + 16);
+        float16x8_t hx3 = vld1q_f16(x + i + 24);
+        float16x8_t hw3 = vld1q_f16(weight + i + 24);
+
+        vst1q_f16(
+            y + i,
+            vmulq_f16(vmulq_f16(hx0, hscale), hw0));
+        vst1q_f16(
+            y + i + 8,
+            vmulq_f16(vmulq_f16(hx1, hscale), hw1));
+        vst1q_f16(
+            y + i + 16,
+            vmulq_f16(vmulq_f16(hx2, hscale), hw2));
+        vst1q_f16(
+            y + i + 24,
+            vmulq_f16(vmulq_f16(hx3, hscale), hw3));
+    }
+
+    // 处理不足 32、但仍可由一个 128-bit NEON 向量覆盖的部分。
     for (; i <= n - 8; i += 8) {
         float16x8_t hx = vld1q_f16(x + i);
         float16x8_t hw = vld1q_f16(weight + i);

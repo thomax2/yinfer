@@ -31,25 +31,6 @@ enum class RequestStatus {
     FAILED
 };
 
-struct PrefillChunkItem {
-    RequestId request_id = 0;
-    SessionId session_id = 0;
-    int prompt_begin = 0;
-    int prompt_end = 0;
-    int token_count = 0;
-    int seq_history_pos_begin = 0;
-    int seq_history_pos_end = 0;
-    bool is_tail = false;
-};
-
-struct PrefillMicroBatch {
-    std::vector<PrefillChunkItem> items;
-    int target_chunk_size = 0;
-    int full_chunks = 0;
-    int tail_chunks = 0;
-    bool contains_tail = false;
-};
-
 struct RequestState {
     RequestId id = 0;
     SessionId session_id = 0;
@@ -75,19 +56,9 @@ struct RequestState {
     uint64_t finish_time_us = 0;
     bool first_token_emitted = false;
     bool metrics_emitted = false;
-    bool scheduler_v2 = false;
     bool queued_waiting = false;
     bool queued_prefill = false;
-    bool queued_decode_ready = false;
-    bool active_decode = false;
-    int prefill_microbatch_steps = 0;
-    int prefill_microbatch_size_sum = 0;
-    int prefill_microbatch_size_max = 0;
-    int prefill_full_chunk_steps = 0;
-    int prefill_tail_chunk_steps = 0;
-    int prefill_tail_wait_steps = 0;
-    int prefill_requeue_count = 0;
-    bool prefill_blocked_for_batch = false;
+    bool queued_decode = false;
     std::mt19937_64 rng;
 };
 
@@ -134,43 +105,23 @@ private:
     bool debug_session_enabled() const;
     bool debug_prefix_enabled() const;
     bool debug_scheduler_enabled() const;
-    bool debug_cont_batch_enabled() const;
-    bool debug_cont_batch_verbose_enabled() const;
-    bool debug_prefill_batch_enabled() const;
-    bool debug_prefill_batch_verbose_enabled() const;
-    bool debug_chunked_prefill_enabled() const;
     void apply_prefix_cache(SequenceState& seq, const std::vector<int>& prompt_tokens);
-    bool step_once_legacy();
-    bool step_once_continuous();
-    void schedule_next_request();
-    void admit_waiting_requests_v2();
+    bool step_once_scheduled();
+    void admit_waiting_requests();
+    bool run_mixed_batch_step();
+    bool has_sampling_work() const;
     bool run_decode_batch_step();
     bool run_decode_batch_step_conservative();
     bool run_selective_decode_batch_step();
     bool build_selective_decode_batch(std::vector<RequestId>* selected);
     bool run_decode_post_emit_conservative(RequestState& request, SequenceState& seq, int token_id);
-    bool run_prefill_chunk_step();
-    bool run_prefill_microbatch_step();
-    PrefillMicroBatch build_prefill_microbatch();
-    bool execute_prefill_microbatch_conservative(const PrefillMicroBatch& batch);
-    bool execute_prefill_microbatch_true_batch(const PrefillMicroBatch& batch);
-    bool make_prefill_chunk_item(RequestState& request, PrefillChunkItem* out);
-    void update_prefill_microbatch_metrics(
-        RequestState& request,
-        const PrefillMicroBatch& batch,
-        const PrefillChunkItem& item);
-    void requeue_prefill_request(RequestId id);
-    bool request_has_prefill_remaining(const RequestState& request) const;
+    bool run_prefill_step();
     void transition_prefill_complete(RequestState& request);
     void add_to_prefill_queue(RequestState& request);
-    void add_to_decode_ready_queue(RequestState& request);
-    void activate_decode_requests();
-    void remove_from_active_decode(RequestId id);
-    void remove_request_from_all_v2_queues(RequestId id);
-    void cleanup_terminal_requests_v2();
-    void step_prefill(RequestState& request);
+    void add_to_decode_queue(RequestState& request);
+    void remove_request_from_all_queues(RequestId id);
+    void cleanup_terminal_requests();
     void step_decode(RequestState& request);
-    void run_legacy_request(RequestState& request);
     void fail_request(RequestState& request, const std::string& error);
     void finish_request(RequestState& request);
     void emit_metrics_once(RequestState& request);
@@ -190,46 +141,22 @@ private:
     bool session_cache_enabled_ = false;
     bool prefix_cache_enabled_ = false;
     bool scheduler_enabled_ = false;
-    bool chunked_prefill_enabled_ = false;
-    bool chunked_prefill_strict_ = false;
-    bool continuous_batching_enabled_ = false;
-    bool cont_batch_decode_first_ = true;
-    bool cont_batch_prefill_when_decode_empty_ = true;
-    bool cont_batch_prefill_after_decode_ = false;
-    bool cont_batch_conservative_executor_ = true;
-    bool prefill_batching_enabled_ = false;
-    int prefill_microbatch_max_requests_ = 4;
-    int prefill_microbatch_chunk_size_ = 8;
-    int prefill_microbatch_min_requests_ = 2;
-    bool prefill_microbatch_allow_tail_ = true;
-    int prefill_microbatch_tail_max_wait_steps_ = 2;
-    int prefill_microbatch_scan_limit_ = 32;
-    bool prefill_microbatch_after_decode_ = false;
-    bool prefill_microbatch_when_decode_empty_ = true;
-    std::string prefill_microbatch_executor_ = "conservative";
-    bool prefill_microbatch_strict_ = false;
     bool selective_decode_enabled_ = false;
     int selective_decode_max_batch_ = 8;
     int selective_decode_min_batch_ = 2;
-    bool selective_decode_greedy_only_ = true;
-    bool selective_decode_allow_sampling_ = false;
-    bool selective_decode_fallback_ = true;
-    bool selective_decode_compare_ = false;
     bool selective_decode_debug_ = false;
-    bool selective_decode_debug_verbose_ = false;
-    int max_active_decode_requests_ = 8;
-    int cont_batch_max_prefill_chunks_per_step_ = 1;
-    int prefill_step_tokens_ = 1;
-    int prefill_chunk_size_ = 1;
-    RequestId active_request_id_ = 0;
+    int prefill_chunk_size_ = 64;
+    int max_batched_tokens_ = 64;
+    int max_prefill_tokens_with_decode_ = 0;
     std::unique_ptr<KVCacheManager> kv_manager_;
     std::unique_ptr<PrefixCache> prefix_cache_;
     std::deque<RequestId> waiting_queue_;
     std::deque<RequestId> prefill_queue_;
-    std::deque<RequestId> decode_ready_queue_;
-    std::vector<RequestId> active_decode_requests_;
+    std::deque<RequestId> decode_queue_;
     struct SelectiveDecodeScratch;
     std::unique_ptr<SelectiveDecodeScratch> selective_decode_scratch_;
+    struct MixedBatchScratch;
+    std::unique_ptr<MixedBatchScratch> mixed_batch_scratch_;
     std::unordered_map<RequestId, RequestState> requests_;
     std::unordered_map<SessionId, SequenceState> sessions_;
 };

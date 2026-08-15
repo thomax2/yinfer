@@ -302,3 +302,109 @@ TEST(NeonTest, SoftmaxAccuracy) {
         EXPECT_NEAR(out_neon_ptr[i], out_ref_ptr[i], 1e-3);
     }
 }
+
+// Paged Prefill 第一阶段：完整 Score + 显式 causal mask。
+// 使用跨两个物理页且逻辑页顺序被打乱的数据，验证 Multi-Query 路径与
+// “逐 Query 调用现有 Paged Decode Kernel”的数值结果一致。
+TEST(NeonTest, PagedPrefillMultiQueryMatchesDecodeReference) {
+    constexpr int query_rows = 5;      // 覆盖 4-row tile 和尾部 active_rows=1
+    constexpr int start_position = 14;
+    constexpr int seq_len = start_position + query_rows;
+    constexpr int block_size = 16;
+    constexpr int physical_blocks = 2;
+    constexpr int num_layers = 1;
+    constexpr int num_kv_heads = 1;
+    constexpr int num_rep = 2;
+    constexpr int head_dim = 8;
+    constexpr int q_row_stride = num_rep * head_dim;
+
+    // Logical block 0/1 分别映射到 Physical block 1/0，确保内核真正查表。
+    const int block_table[2] = {1, 0};
+    const size_t page_elements =
+        (size_t)physical_blocks * num_layers * num_kv_heads *
+        block_size * head_dim;
+    std::vector<fp16_t> k_pages(page_elements, (fp16_t)0);
+    std::vector<fp16_t> v_pages(page_elements, (fp16_t)0);
+    std::vector<fp16_t> q((size_t)query_rows * q_row_stride);
+
+    auto page_ptr = [&](std::vector<fp16_t>& pages, int physical_block) {
+        return pages.data() + (size_t)physical_block * block_size * head_dim;
+    };
+    for (int token = 0; token < seq_len; ++token) {
+        const int logical_block = token / block_size;
+        const int offset = token % block_size;
+        fp16_t* k = page_ptr(k_pages, block_table[logical_block]) +
+            (size_t)offset * head_dim;
+        fp16_t* v = page_ptr(v_pages, block_table[logical_block]) +
+            (size_t)offset * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            k[d] = (fp16_t)(0.01f * (token + 1) + 0.002f * d);
+            v[d] = (fp16_t)(0.015f * (token + 1) - 0.001f * d);
+        }
+    }
+    for (int row = 0; row < query_rows; ++row) {
+        for (int i = 0; i < q_row_stride; ++i) {
+            q[(size_t)row * q_row_stride + i] =
+                (fp16_t)(0.02f * (row + 1) + 0.003f * i);
+        }
+    }
+
+    std::vector<fp16_t> actual((size_t)query_rows * q_row_stride, (fp16_t)0);
+    std::vector<fp16_t> online((size_t)query_rows * q_row_stride, (fp16_t)0);
+    std::vector<fp16_t> expected((size_t)query_rows * q_row_stride, (fp16_t)0);
+    std::vector<fp16_t> score((size_t)query_rows * num_rep * seq_len);
+    std::vector<fp16_t> reference_score((size_t)num_rep * seq_len);
+    std::vector<fp16_t> k_tile((size_t)head_dim * 16);
+    std::vector<float> online_out_acc((size_t)4 * head_dim);
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+
+    ASSERT_EQ(
+        arm_neon::attention_prefill_paged_f16_neon_public(
+            q.data(), actual.data(), query_rows, start_position,
+            q_row_stride, num_rep, head_dim, scale,
+            k_pages.data(), v_pages.data(), block_table, 2, block_size,
+            0, 0, num_layers, num_kv_heads, physical_blocks,
+            score.data(), score.size(), k_tile.data(), k_tile.size()),
+        Status::SUCCESS);
+
+    // 第二阶段 Online Softmax 使用相同的 Paged KV 与乱序 Block Table，
+    // 但不接收完整 Score Workspace；这里只提供一个 K Tile 和 4 行 FP32 O。
+    ASSERT_EQ(
+        arm_neon::attention_prefill_paged_online_f16_neon_public(
+            q.data(), online.data(), query_rows, start_position,
+            q_row_stride, num_rep, head_dim, scale,
+            k_pages.data(), v_pages.data(), block_table, 2, block_size,
+            0, 0, num_layers, num_kv_heads, physical_blocks,
+            k_tile.data(), k_tile.size(),
+            online_out_acc.data(), online_out_acc.size()),
+        Status::SUCCESS);
+
+    for (int row = 0; row < query_rows; ++row) {
+        const int visible = start_position + row + 1;
+        arm_neon::attention_decode_score_paged_f16_neon_public(
+            q.data() + (size_t)row * q_row_stride,
+            reference_score.data(), num_rep, visible, head_dim, scale,
+            k_pages.data(), block_table, 2, block_size, 0, 0,
+            num_layers, num_kv_heads, physical_blocks);
+        ASSERT_EQ(
+            arm_neon::softmax_f16_inplace_neon(
+                reference_score.data(), num_rep, visible),
+            Status::SUCCESS);
+        ASSERT_EQ(
+            arm_neon::attention_decode_value_paged_f16_neon_public(
+                reference_score.data(),
+                expected.data() + (size_t)row * q_row_stride,
+                num_rep, visible, head_dim, v_pages.data(), block_table, 2,
+                block_size, 0, 0, num_layers, num_kv_heads, physical_blocks),
+            Status::SUCCESS);
+    }
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        EXPECT_NEAR((float)actual[i], (float)expected[i], 2e-2f)
+            << "paged prefill mismatch at element " << i;
+        EXPECT_NEAR((float)online[i], (float)expected[i], 2e-2f)
+            << "online paged prefill mismatch at element " << i;
+        EXPECT_NEAR((float)online[i], (float)actual[i], 2e-2f)
+            << "online/dense paged prefill mismatch at element " << i;
+    }
+}
